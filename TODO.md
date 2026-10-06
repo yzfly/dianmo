@@ -18,14 +18,15 @@
 | 8 | 2026-10-06 | 不用 Codex 做的那版（`%LOCALAPPDATA%\SurfaceTouchKeyboard`），**从零开始** | 🔄 |
 | 9 | 2026-10-06 | 交互做成**手机输入法的体验** | 🔄 见 DESIGN.md |
 | 10 | 2026-10-06 | Surface 性能有限：打包完清理构建产物；输入法本身要轻、要快 | 📌 约束：低优先级构建、不留常驻编译进程、打包后清理；空闲时 CPU≈0 |
-| 11 | 2026-10-06 | 用好 **Windows 自带的语音输入** | 📌 语音键调起系统语音输入（Win+H）；离线模型以后再考虑 |
+| 11 | 2026-10-06 | 用好 **Windows 自带的语音输入** | 📌 语音键调起系统语音输入（Win+H）；Surface 已装中文语音组件、在线语音识别已开启；离线模型以后再考虑 |
 | 12 | 2026-10-06 | 服务器空间有限，主构建环境放在 Surface 上 | ✅ 构建在 Surface 上（现为 Rust 工具链，见 #14）；服务器只放代码 |
 | 13 | 2026-10-06 | 用户说的每件事都统一记到本文件；综合理解需求，做好设计 | ✅ 本文件 + DESIGN.md |
 | 14 | 2026-10-06 | 不一定用 .NET，Rust 能不能写？ | ✅ 改用 Rust（内存小、无运行时、启动快，更符合 #10）；Surface 已删 .NET、装 Rust（GNU 工具链，不装 VS） |
 | 15 | 2026-10-06 | 技术栈要好好调研，用好的技术栈 | ✅ 定稿见 DESIGN.md §3：Win32+Direct2D/DirectWrite（windows 0.62）；近期 SendInput 上屏、长期加 TSF 客户端；librime 1.17 动态加载 + rime-ice；Win+H 语音；Surface 用 gnullvm+llvm-mingw 工具链（冒烟测试通过） |
+| 16 | 2026-10-06 | 做完后让用户在 Surface 上试用 | 🔄 引擎 / 平台层 / 界面三个模块并行开发中，集成并实测后通知用户 |
 
 ## 待清理 / 收尾
 
-- [ ] Codex 那版原型 `%LOCALAPPDATA%\SurfaceTouchKeyboard` 及其桌面图标：点墨可用后，问用户是否删除
+- [x] Codex 那版原型（`%LOCALAPPDATA%\SurfaceTouchKeyboard`、Codex 工作区 `outputs\SurfaceTouchKeyboard`、桌面图标）：用户同意，2026-10-06 已删
 - [ ] 计划任务 `DianmoGui`（scripts/surface/gui.sh 用）和 `C:\Users\wecode\claude`：开发结束后删除（旧的 `ClaudeShot` 已删）
 - [ ] R2 `share/surface-setup-v3.ps1`（含隧道钥匙）：2026-10-13 链接过期后删除
