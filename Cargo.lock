@@ -64,6 +64,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dianmo"
+version = "0.1.0"
+dependencies = [
+ "dianmo-core",
+ "dianmo-rime",
+ "dianmo-ui",
+ "dianmo-win",
+ "windows",
+]
+
+[[package]]
 name = "dianmo-core"
 version = "0.1.0"
 
@@ -91,6 +102,7 @@ dependencies = [
  "dianmo-core",
  "dianmo-ui",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

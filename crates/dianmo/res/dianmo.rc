@@ -1,0 +1,28 @@
+// Resources embedded into dianmo.exe by build.rs (llvm-windres from llvm-mingw).
+#pragma code_page(65001)
+1 ICON "dianmo.ico"
+
+1 VERSIONINFO
+FILEVERSION     DIANMO_VER_MAJOR,DIANMO_VER_MINOR,DIANMO_VER_PATCH,0
+PRODUCTVERSION  DIANMO_VER_MAJOR,DIANMO_VER_MINOR,DIANMO_VER_PATCH,0
+FILEOS          0x40004
+FILETYPE        0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080404B0"
+    BEGIN
+      VALUE "CompanyName",      "yzfly"
+      VALUE "FileDescription",  "点墨 · 触屏输入法"
+      VALUE "FileVersion",      DIANMO_VER_STR
+      VALUE "InternalName",     "dianmo"
+      VALUE "OriginalFilename", "dianmo.exe"
+      VALUE "ProductName",      "点墨 Dianmo"
+      VALUE "ProductVersion",   DIANMO_VER_STR
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0804, 0x04B0
+  END
+END

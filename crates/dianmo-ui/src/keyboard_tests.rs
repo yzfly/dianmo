@@ -527,7 +527,27 @@ fn toggle_key_and_theme() {
     assert_eq!(h.tap("toggle"), vec![input(Action::ToggleChinese)]);
     h.tap("layout");
     let tile = h.v.keys.iter().find(|k| k.action == KeyAction::ToggleTheme).unwrap().cell;
-    h.tap_at((tile.x + tile.w / 2.0, tile.y + tile.h / 2.0));
+    let acts = h.tap_at((tile.x + tile.w / 2.0, tile.y + tile.h / 2.0));
+    assert_eq!(h.v.theme(), ThemeKind::Dark);
+    assert_eq!(acts, vec![UiAction::ThemeChanged(ThemeKind::Dark)]);
+}
+
+#[test]
+fn host_helpers_panels_height_downcast() {
+    let mut h = H::new();
+    let base = h.v.preferred_height(W);
+    h.v.set_height_scale(1.2);
+    assert!((h.v.preferred_height(W) - base * 1.2).abs() < 0.01);
+    h.v.set_height_scale(9.0);
+    assert_eq!(h.v.height_scale(), 1.5);
+    assert!(h.v.show_numbers());
+    assert_eq!(h.v.panel, Panel::Numbers);
+    assert!(!h.v.show_numbers());
+    assert!(h.v.show_letters());
+    assert_eq!(h.v.panel, Panel::Keys);
+    let view: &mut dyn View = &mut h.v;
+    let kv = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()).expect("downcast");
+    kv.set_theme(ThemeKind::Dark);
     assert_eq!(h.v.theme(), ThemeKind::Dark);
 }
 
@@ -725,4 +745,13 @@ fn end_to_end_typing() {
     let a2 = h.tap("k");
     run(&mut h, a);
     assert_eq!(run(&mut h, a2), "拟好，Ok");
+}
+
+#[test]
+fn fullwidth_punctuation_is_optically_centred() {
+    let r = Rect::new(0.0, 0.0, 100.0, 50.0);
+    let moved = crate::draw::punct_centered("，", r, 20.0);
+    assert!(moved.x > r.x && moved.y < r.y);
+    assert_eq!(crate::draw::punct_centered("？", r, 20.0), r);
+    assert_eq!(crate::draw::punct_centered("，，", r, 20.0), r);
 }

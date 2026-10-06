@@ -1,0 +1,35 @@
+[package]
+name = "dianmo"
+description = "点墨 Dianmo: phone-style touch keyboard for Chinese input on Windows tablets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "dianmo"
+path = "src/main.rs"
+
+[features]
+default = ["rime"]
+# Use librime (rime.dll) when present. Without it the keyboard runs with the built-in
+# letters-only engine (useful while the engine is being developed).
+rime = ["dep:dianmo-rime"]
+
+[dependencies]
+dianmo-core = { path = "../dianmo-core" }
+dianmo-ui = { path = "../dianmo-ui" }
+dianmo-win = { path = "../dianmo-win" }
+dianmo-rime = { path = "../dianmo-rime", optional = true }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+]

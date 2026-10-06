@@ -146,6 +146,8 @@ pub struct KeyboardView {
     pub(crate) spellings: Vec<String>,
     pub(crate) touches: Vec<Touch>,
     now: u64,
+    /// Multiplier on the preferred height (user setting).
+    height_scale: f32,
 }
 
 impl Default for KeyboardView {
@@ -183,6 +185,7 @@ impl KeyboardView {
             spellings: Vec::new(),
             touches: Vec::new(),
             now: 0,
+            height_scale: 1.0,
         };
         v.rebuild();
         v
@@ -199,6 +202,31 @@ impl KeyboardView {
         if self.panel == Panel::Menu {
             self.rebuild();
         }
+    }
+
+    /// Scales the preferred height (user setting, clamped to 0.7..=1.5). The host re-docks the
+    /// window after changing it.
+    pub fn set_height_scale(&mut self, scale: f32) {
+        self.height_scale = if scale.is_finite() { scale.clamp(0.7, 1.5) } else { 1.0 };
+    }
+
+    pub fn height_scale(&self) -> f32 {
+        self.height_scale
+    }
+
+    /// Opens the number pad (e.g. when a numeric field gets focus). Returns true if it changed.
+    pub fn show_numbers(&mut self) -> bool {
+        let changed = self.panel != Panel::Numbers;
+        self.set_panel(Panel::Numbers);
+        changed
+    }
+
+    /// Back to the letter keys from any panel (number pad, symbols, menu, candidate grid).
+    /// Returns true if it changed.
+    pub fn show_letters(&mut self) -> bool {
+        let changed = self.panel != Panel::Keys;
+        self.set_panel(Panel::Keys);
+        changed
     }
 
     /// The letter layout currently shown (or that the keyboard returns to).
@@ -818,6 +846,7 @@ impl KeyboardView {
             KeyAction::ToggleTheme => {
                 let next = if self.theme_kind == ThemeKind::Dark { ThemeKind::Light } else { ThemeKind::Dark };
                 self.set_theme(next);
+                r.actions.push(UiAction::ThemeChanged(next));
             }
             KeyAction::T9One => input(r, Action::Char(if self.composing() { '\'' } else { '1' })),
         }
@@ -897,7 +926,7 @@ impl View for KeyboardView {
     }
 
     fn preferred_height(&self, width: f32) -> f32 {
-        layout::preferred_height(width)
+        layout::preferred_height(width) * self.height_scale
     }
 
     fn paint(&mut self, canvas: &mut dyn Canvas) {
@@ -1031,6 +1060,10 @@ impl View for KeyboardView {
         self.column_scroll.reset();
         self.rebuild();
         self.finish(Response::repaint())
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 }
 

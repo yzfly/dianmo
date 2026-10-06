@@ -7,6 +7,7 @@
 use dianmo_core::{Action, Schema, Snapshot};
 
 use crate::canvas::Canvas;
+use crate::theme::ThemeKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerPhase {
@@ -42,6 +43,9 @@ pub enum UiAction {
     WantMoreCandidates { start: usize, count: usize },
     /// T9: host fetches `Engine::t9_spellings` and passes them to [`View::set_t9_spellings`].
     WantT9Spellings,
+    /// The user switched the colour theme from the layout menu (already applied to the view).
+    /// The host only needs to remember it (settings).
+    ThemeChanged(ThemeKind),
 }
 
 /// What the host should do after an event.
@@ -83,4 +87,9 @@ pub trait View {
     fn set_input_state(&mut self, state: InputState) -> Response;
     fn set_more_candidates(&mut self, start: usize, candidates: Vec<dianmo_core::Candidate>) -> Response;
     fn set_t9_spellings(&mut self, spellings: Vec<String>) -> Response;
+    /// Lets the app reach the concrete view behind `&mut dyn View` (e.g. `KeyboardView::set_theme`
+    /// from a tray command). Views that don't need it keep the default.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }

@@ -200,7 +200,7 @@ impl KeyboardView {
             if i > 0 {
                 c.fill_rect(Rect::new(face.x + face.w * 0.2, y, face.w * 0.6, 1.0), 0.0, th.divider);
             }
-            c.text(item, cell, self.style(size, th.text));
+            c.text(item, punct_centered(item, cell, size), self.style(size, th.text));
         }
         c.pop_clip();
     }
@@ -229,7 +229,7 @@ impl KeyboardView {
             let color = if pressed == Some(i) { th.key_pressed } else { th.key };
             c.fill_rect(Rect::new(face.x, face.y + 1.2 * s, face.w, face.h), m.radius, th.shadow);
             c.fill_rect(face, m.radius, color);
-            c.text(sym, face, self.style(size, th.text));
+            c.text(sym, punct_centered(sym, face, size), self.style(size, th.text));
         }
         c.pop_clip();
     }
@@ -296,7 +296,8 @@ impl KeyboardView {
             let main = Rect::new(face.x, face.y + face.h * 0.36, face.w, face.h * 0.52);
             c.text(&k.label, main, TextStyle { bold: false, ..self.style(size, fg) });
         } else {
-            c.text(&k.label, Rect::new(face.x, face.y - 1.0 * s, face.w, face.h), self.style(size, fg));
+            let r = Rect::new(face.x, face.y - 1.0 * s, face.w, face.h);
+            c.text(&k.label, punct_centered(&k.label, r, size), self.style(size, fg));
         }
         if let Some(corner) = &k.corner {
             let cw = 24.0 * s;
@@ -420,7 +421,8 @@ impl KeyboardView {
         self.bubble_body(c, r);
         let n = text.chars().count().max(1) as f32;
         let size = if n <= 1.0 { 40.0 * s } else { (36.0 * s * 1.6 / n).clamp(16.0 * s, 26.0 * s) };
-        c.text(text, Rect::new(r.x, r.y - 1.0 * s, r.w, r.h), self.style(size, if accent { th.accent } else { th.text }));
+        let tr = punct_centered(text, Rect::new(r.x, r.y - 1.0 * s, r.w, r.h), size);
+        c.text(text, tr, self.style(size, if accent { th.accent } else { th.text }));
     }
 
     fn draw_popup(&self, c: &mut dyn Canvas, alts: &[String], sel: usize, popup: Rect, cell_w: f32) {
@@ -435,7 +437,18 @@ impl KeyboardView {
             }
             let n = a.chars().count().max(1) as f32;
             let size = if n <= 1.0 { 28.0 * s } else { (28.0 * s * 1.5 / n).clamp(14.0 * s, 22.0 * s) };
-            c.text(a, cell, self.style(size, if selected { th.on_accent } else { th.text }));
+            c.text(a, punct_centered(a, cell, size), self.style(size, if selected { th.on_accent } else { th.text }));
         }
+    }
+}
+
+/// Full-width punctuation whose ink sits in the lower-left quarter of the em box (，。、．) looks
+/// off-centre on a key when the advance is centred. Phone keyboards centre the ink; so do we by
+/// shifting the text rect (measured on Microsoft YaHei UI on the Surface).
+pub(crate) fn punct_centered(text: &str, r: Rect, size: f32) -> Rect {
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some('，' | '。' | '、' | '．'), None) => Rect::new(r.x + 0.24 * size, r.y - 0.24 * size, r.w, r.h),
+        _ => r,
     }
 }
