@@ -50,4 +50,4 @@
 
 - [x] Codex 那版原型（`%LOCALAPPDATA%\SurfaceTouchKeyboard`、Codex 工作区 `outputs\SurfaceTouchKeyboard`、桌面图标）：用户同意，2026-10-06 已删
 - [ ] 计划任务 `DianmoGui`（scripts/surface/gui.sh 用）和 `C:\Users\wecode\claude`：开发结束后删除（旧的 `ClaudeShot` 已删）
-- [ ] R2 `share/surface-setup-v3.ps1`（含隧道钥匙）：2026-10-13 链接过期后删除
+- [ ] R2 上的一次性 Surface 安装脚本（含隧道钥匙）：2026-10-13 链接过期后删除

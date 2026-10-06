@@ -3,3 +3,7 @@
 !docs/**/*.png
 !crates/dianmo-win/examples/res/*.png
 /dist
+
+# Personal remote-debug setup (contains server details); kept locally, never published
+scripts/surface/surface-setup.ps1
+scripts/surface/build-setup.py
