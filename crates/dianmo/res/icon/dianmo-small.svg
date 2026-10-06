@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- 点墨 Dianmo icon, simplified for 16–32px (tray, small shell icons): full-bleed tile,
+       no sheen or shadow, bigger solid-white brush dot. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2F7BF8"/>
+      <stop offset="0.5" stop-color="#7447F2"/>
+      <stop offset="1" stop-color="#DC4096"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.08" cy="0.04" r="0.55">
+      <stop offset="0" stop-color="#22CCEE" stop-opacity="0.7"/>
+      <stop offset="1" stop-color="#22CCEE" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#glow)"/>
+  <path transform="translate(512 518) scale(1.2) translate(-551 -524)" fill="#FFFFFF"
+        d="M286 190 C368 244 412 322 402 410 C394 484 316 556 330 668 C346 800 520 852 654 784 C792 712 806 532 694 412 C600 310 440 214 286 190 Z"/>
+</svg>

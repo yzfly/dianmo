@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- 点墨 Dianmo app icon (master, 32px and up): a calligraphic 「丶」 brush dot on a
+       blue → violet → magenta tile with a cyan glow. Small sizes use dianmo-small.svg. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3D7BFA"/>
+      <stop offset="0.5" stop-color="#7B4DF5"/>
+      <stop offset="1" stop-color="#E8489C"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.1" cy="0.06" r="0.6">
+      <stop offset="0" stop-color="#2DD4F0" stop-opacity="0.8"/>
+      <stop offset="1" stop-color="#2DD4F0" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="0.55" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0.2" y1="0.1" x2="0.8" y2="0.95">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#ECE9FF"/>
+    </linearGradient>
+    <path id="dot" d="M296 196 C368 244 408 322 398 410 C390 484 316 556 330 668 C346 800 520 852 654 784 C792 712 806 532 694 412 C600 310 440 222 296 196 Z"/>
+  </defs>
+  <rect x="48" y="48" width="928" height="928" rx="208" fill="url(#bg)"/>
+  <rect x="48" y="48" width="928" height="928" rx="208" fill="url(#glow)"/>
+  <rect x="48" y="48" width="928" height="928" rx="208" fill="url(#sheen)"/>
+  <g fill="#2A0F6E">
+    <use href="#dot" transform="translate(6 14)" fill-opacity="0.10"/>
+    <use href="#dot" transform="translate(12 28)" fill-opacity="0.08"/>
+    <use href="#dot" transform="translate(18 42)" fill-opacity="0.06"/>
+    <use href="#dot" transform="translate(24 56)" fill-opacity="0.04"/>
+  </g>
+  <use href="#dot" fill="url(#ink)"/>
+</svg>

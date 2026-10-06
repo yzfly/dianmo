@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Alternative concept 「键帽·墨滴」: a white keycap carrying a gradient ink drop. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#14C8F0"/>
+      <stop offset="0.55" stop-color="#4F6BF5"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.95" cy="0.95" r="0.5">
+      <stop offset="0" stop-color="#EC4899" stop-opacity="0.7"/>
+      <stop offset="1" stop-color="#EC4899" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3B82F6"/>
+      <stop offset="0.6" stop-color="#7C3AED"/>
+      <stop offset="1" stop-color="#E64598"/>
+    </linearGradient>
+    <linearGradient id="cap" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#EEF1FF"/>
+    </linearGradient>
+  </defs>
+  <rect x="48" y="48" width="928" height="928" rx="208" fill="url(#bg)"/>
+  <rect x="48" y="48" width="928" height="928" rx="208" fill="url(#glow)"/>
+  <rect x="232" y="268" width="560" height="560" rx="130" fill="#1E1B6B" fill-opacity="0.35"/>
+  <rect x="232" y="224" width="560" height="560" rx="130" fill="url(#cap)"/>
+  <path d="M512 326 C560 392 630 464 630 546 A118 118 0 1 1 394 546 C394 464 464 392 512 326 Z" fill="url(#ink)"/>
+</svg>
