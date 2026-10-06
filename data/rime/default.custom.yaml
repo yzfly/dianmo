@@ -1,0 +1,10 @@
+# 点墨 Dianmo: only the three schemas the keyboard offers are deployed.
+# Copied next to rime-ice's default.yaml by scripts/rime/fetch.ps1.
+patch:
+  schema_list:
+    - schema: rime_ice             # 全拼
+    - schema: double_pinyin_flypy  # 小鹤双拼
+    - schema: t9                   # 九宫格
+  # The keyboard pulls candidates through the candidate-list iterator; the page size only
+  # matters for librime's own menu, keep it small.
+  menu/page_size: 9

@@ -1,0 +1,18 @@
+[package]
+name = "dianmo-rime"
+description = "Dianmo conversion engine: librime 1.17 loaded at runtime (rime.dll) + rime-ice schemas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dianmo-core = { path = "../dianmo-core" }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+]
