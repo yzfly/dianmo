@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont as _};
 use dianmo_core::{Action, Candidate, Schema, Snapshot};
+use dianmo_ui::settings::{
+    EngineStatus, LayoutChoice, Level, OnboardingView, Page, SettingsModel, SettingsView, Status, UpdateState,
+    VoiceEngines,
+};
 use dianmo_ui::{
     Align, Canvas, ClipItem, Color, Font, InputState, KeyboardConfig, KeyboardView, PointerEvent, PointerPhase, Rect,
     TextStyle, ThemeKind, UiAction, View,
@@ -44,6 +48,9 @@ struct SkiaCanvas<'a> {
     fonts: &'a Fonts,
     clips: Vec<Rect>,
     mask: Option<Mask>,
+    /// Text size multiplier: 1.0 = ab_glyph's PxScale (line height = size, the keyboard scenes
+    /// were tuned with it); `em_exact()` makes 1 em = size like DirectWrite (settings scenes).
+    em: f32,
 }
 
 fn color(c: Color) -> tiny_skia::Color {
@@ -92,7 +99,7 @@ fn intersect(a: Rect, b: Rect) -> Rect {
 impl<'a> SkiaCanvas<'a> {
     fn new(w: f32, h: f32, fonts: &'a Fonts) -> Self {
         let pm = Pixmap::new((w * SCALE).ceil() as u32, (h * SCALE).ceil() as u32).unwrap();
-        Self { pm, fonts, clips: Vec::new(), mask: None }
+        Self { pm, fonts, clips: Vec::new(), mask: None, em: 1.0 }
     }
 
     fn clip_rect(&self) -> Option<Rect> {
@@ -123,8 +130,14 @@ impl<'a> SkiaCanvas<'a> {
         if main.glyph_id(ch).0 != 0 { main } else { &self.fonts.fallback }
     }
 
+    fn em_exact(mut self) -> Self {
+        let f = &self.fonts.regular;
+        self.em = f.height_unscaled() / f.units_per_em().unwrap_or(1000.0);
+        self
+    }
+
     fn text_width(&self, text: &str, style: &TextStyle) -> f32 {
-        let px = style.size * SCALE;
+        let px = style.size * SCALE * self.em;
         text.chars()
             .map(|ch| {
                 let f = self.font_for(ch, style.bold);
@@ -296,6 +309,92 @@ impl<'a> SkiaCanvas<'a> {
                     &[(0.0, -0.42), (0.42, 0.02), (0.18, 0.02), (0.18, 0.38), (-0.18, 0.38), (-0.18, 0.02), (-0.42, 0.02), (0.0, -0.42)],
                 );
             }
+            // ---- Settings window glyphs (approximations).
+            "\u{E713}" => {
+                // Gear: circle with eight teeth.
+                let (x, y) = p(0.0, 0.0);
+                pb.push_circle(x, y, 0.28 * s * SCALE);
+                pb.push_circle(x, y, 0.1 * s * SCALE);
+                for i in 0..8 {
+                    let a = i as f32 * std::f32::consts::PI / 4.0;
+                    line(&mut pb, &[(0.28 * a.cos(), 0.28 * a.sin()), (0.42 * a.cos(), 0.42 * a.sin())]);
+                }
+            }
+            "\u{E8D2}" => {
+                // Font: a capital A with a short underline.
+                line(&mut pb, &[(-0.32, 0.35), (0.0, -0.4), (0.32, 0.35)]);
+                line(&mut pb, &[(-0.18, 0.08), (0.18, 0.08)]);
+            }
+            "\u{E946}" => {
+                let (x, y) = p(0.0, 0.0);
+                pb.push_circle(x, y, 0.42 * s * SCALE);
+                line(&mut pb, &[(0.0, -0.05), (0.0, 0.22)]);
+                line(&mut pb, &[(0.0, -0.2), (0.0, -0.19)]);
+            }
+            "\u{E73E}" => line(&mut pb, &[(-0.35, 0.0), (-0.1, 0.25), (0.38, -0.25)]),
+            "\u{E8A7}" => {
+                // Open in new window: box with an arrow out of the corner.
+                line(&mut pb, &[(0.05, -0.35), (-0.35, -0.35), (-0.35, 0.35), (0.35, 0.35), (0.35, -0.05)]);
+                line(&mut pb, &[(-0.02, 0.02), (0.38, -0.38)]);
+                line(&mut pb, &[(0.12, -0.38), (0.38, -0.38), (0.38, -0.12)]);
+            }
+            "\u{E77B}" => {
+                // Contact: head and shoulders.
+                let (x, y) = p(0.0, -0.15);
+                pb.push_circle(x, y, 0.18 * s * SCALE);
+                let (x0, y0) = p(-0.36, 0.42);
+                pb.move_to(x0, y0);
+                let (c1, c2) = p(0.0, -0.1);
+                let (x1, y1) = p(0.36, 0.42);
+                pb.quad_to(c1, c2, x1, y1);
+            }
+            "\u{E774}" => {
+                // Globe.
+                let (x, y) = p(0.0, 0.0);
+                pb.push_circle(x, y, 0.42 * s * SCALE);
+                line(&mut pb, &[(-0.42, 0.0), (0.42, 0.0)]);
+                line(&mut pb, &[(0.0, -0.42), (0.0, 0.42)]);
+                if let Some(path) = rounded(Rect::new(cx - 0.2 * s, cy - 0.42 * s, 0.4 * s, 0.84 * s), 0.2 * s) {
+                    self.stroke_path(&path, lw, style.color);
+                }
+            }
+            "\u{E8A5}" => {
+                // Document.
+                line(&mut pb, &[(-0.3, -0.42), (0.12, -0.42), (0.3, -0.24), (0.3, 0.42), (-0.3, 0.42), (-0.3, -0.42)]);
+                line(&mut pb, &[(-0.15, -0.05), (0.15, -0.05)]);
+                line(&mut pb, &[(-0.15, 0.15), (0.15, 0.15)]);
+            }
+            "\u{ED15}" => {
+                // Feedback: speech bubble.
+                line(&mut pb, &[(-0.4, -0.35), (0.4, -0.35), (0.4, 0.2), (-0.05, 0.2), (-0.25, 0.4), (-0.25, 0.2), (-0.4, 0.2), (-0.4, -0.35)]);
+            }
+            "\u{E9D9}" => {
+                // Diagnostic: pulse line.
+                line(&mut pb, &[(-0.45, 0.0), (-0.2, 0.0), (-0.08, -0.3), (0.08, 0.3), (0.2, 0.0), (0.45, 0.0)]);
+            }
+            "\u{E838}" => {
+                // Folder.
+                line(&mut pb, &[(-0.42, -0.3), (-0.1, -0.3), (0.0, -0.18), (0.42, -0.18), (0.42, 0.34), (-0.42, 0.34), (-0.42, -0.3)]);
+            }
+            "\u{E7BE}" => {
+                // Education: mortarboard.
+                line(&mut pb, &[(-0.45, -0.1), (0.0, -0.32), (0.45, -0.1), (0.0, 0.12), (-0.45, -0.1)]);
+                line(&mut pb, &[(-0.25, 0.0), (-0.25, 0.25), (0.25, 0.25), (0.25, 0.0)]);
+            }
+            "\u{E8BD}" => {
+                // Message: rounded bubble.
+                if let Some(path) = rounded(Rect::new(cx - 0.42 * s, cy - 0.34 * s, 0.84 * s, 0.6 * s), 0.18 * s) {
+                    self.stroke_path(&path, lw, style.color);
+                }
+                line(&mut pb, &[(-0.2, 0.26), (-0.3, 0.42), (0.0, 0.26)]);
+            }
+            "\u{E7F8}" => {
+                // Device: laptop.
+                if let Some(path) = rounded(Rect::new(cx - 0.34 * s, cy - 0.32 * s, 0.68 * s, 0.48 * s), 0.05 * s) {
+                    self.stroke_path(&path, lw, style.color);
+                }
+                line(&mut pb, &[(-0.45, 0.3), (0.45, 0.3)]);
+            }
             _ => {
                 let (x, y) = p(0.0, 0.0);
                 pb.push_circle(x, y, 0.3 * s * SCALE);
@@ -342,7 +441,7 @@ impl Canvas for SkiaCanvas<'_> {
             Align::Center => rect.x + (rect.w - width) / 2.0,
             Align::End => rect.x + rect.w - width,
         };
-        let px = style.size * SCALE;
+        let px = style.size * SCALE * self.em;
         let main = if style.bold { &self.fonts.bold } else { &self.fonts.regular };
         let sf = main.as_scaled(PxScale::from(px));
         // Centre the line box like DirectWrite (ascent + descent), using YaHei-like metrics.
@@ -392,6 +491,18 @@ impl Canvas for SkiaCanvas<'_> {
     fn pop_clip(&mut self) {
         self.clips.pop();
         self.rebuild_mask();
+    }
+
+    fn image(&mut self, name: &str, rect: Rect) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/res").join(format!("{name}.png"));
+        let Ok(img) = Pixmap::load_png(&path) else { return };
+        let k = (rect.w / img.width() as f32).min(rect.h / img.height() as f32) * SCALE;
+        let (w, h) = (img.width() as f32 * k, img.height() as f32 * k);
+        let x = rect.x * SCALE + (rect.w * SCALE - w) / 2.0;
+        let y = rect.y * SCALE + (rect.h * SCALE - h) / 2.0;
+        let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
+        let mask = self.mask.clone();
+        self.pm.draw_pixmap(0, 0, img.as_ref(), &paint, Transform::from_row(k, 0.0, 0.0, k, x, y), mask.as_ref());
     }
 }
 
@@ -490,6 +601,10 @@ fn main() {
     let out = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "ui-preview".into()));
     std::fs::create_dir_all(&out).unwrap();
     let fonts = Fonts::new();
+    settings_scenes(&fonts, &out);
+    if std::env::args().nth(2).as_deref() == Some("settings") {
+        return;
+    }
     let w = 1440.0;
     let light = ThemeKind::Light;
     let dark = ThemeKind::Dark;
@@ -675,4 +790,129 @@ fn main() {
     s.tap("clipclose");
     s.tap("select");
     s.render(&fonts, &out, "53-portrait-select-bar");
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Settings window, about page, onboarding (TODO #33)
+// ---------------------------------------------------------------------------------------------
+
+fn render_view(v: &mut dyn View, w: f32, h: f32, fonts: &Fonts, out: &Path, name: &str) {
+    v.resize(w, h);
+    let mut c = SkiaCanvas::new(w, h, fonts).em_exact();
+    v.paint(&mut c);
+    let path = out.join(format!("{name}.png"));
+    c.pm.save_png(&path).unwrap();
+    println!("{}", path.display());
+}
+
+fn demo_model() -> SettingsModel {
+    SettingsModel {
+        admin_task: Status::ok("已注册，管理员窗口里也能打字"),
+        dictionary: Status::ok("雾凇拼音 2026.09 · 已加载 · 约 50 万词"),
+        user_words: Some(1284),
+        engines: VoiceEngines {
+            wetype: EngineStatus {
+                available: true,
+                detail: "已安装 2.1.3.18".into(),
+                note: "点墨以管理员权限运行时通过辅助进程调用".into(),
+                download_url: None,
+            },
+            doubao: EngineStatus { available: false, detail: "未检测到豆包语音".into(), ..Default::default() },
+            system: EngineStatus { available: true, detail: "Windows 自带，随时可用".into(), ..Default::default() },
+        },
+        clip_count: 36,
+        pinned_clips: vec![
+            ClipItem { id: 1, text: "hello@example.com".into(), pinned: true },
+            ClipItem { id: 2, text: "上海市徐汇区漕溪北路 88 号 5 楼".into(), pinned: true },
+        ],
+        version: "0.3.0".into(),
+        build_date: "2026-10-06".into(),
+        update: UpdateState::UpToDate,
+        ..SettingsModel::default()
+    }
+}
+
+fn settings_scenes(fonts: &Fonts, out: &Path) {
+    let (w, h) = (960.0, 680.0);
+    let light = ThemeKind::Light;
+    let dark = ThemeKind::Dark;
+    let page = |p: Page, kind: ThemeKind, m: SettingsModel| {
+        let mut v = SettingsView::new(m, kind);
+        v.resize(w, h);
+        v.set_page(p);
+        v
+    };
+    for (p, name) in [
+        (Page::General, "settings-general"),
+        (Page::Keyboard, "settings-keyboard"),
+        (Page::Input, "settings-input"),
+        (Page::Voice, "settings-voice"),
+        (Page::Clipboard, "settings-clipboard"),
+        (Page::About, "about"),
+    ] {
+        render_view(&mut page(p, light, demo_model()), w, h, fonts, out, name);
+        render_view(&mut page(p, dark, demo_model()), w, h, fonts, out, &format!("{name}-dark"));
+    }
+    // Scrolled pages (the rest of the content).
+    for (p, name) in [(Page::General, "settings-general-scrolled"), (Page::Keyboard, "settings-keyboard-scrolled"), (Page::Input, "settings-input-scrolled"), (Page::About, "about-scrolled")] {
+        let mut v = page(p, light, demo_model());
+        v.wheel(600.0, 400.0, 10000.0);
+        render_view(&mut v, w, h, fonts, out, name);
+    }
+
+    // States: admin task missing (fix button), inline confirmation, update available, download.
+    let mut m = demo_model();
+    m.admin_task = Status::warn("计划任务未注册，管理员窗口里键盘不能打字");
+    let mut v = page(Page::General, light, m);
+    v.wheel(600.0, 400.0, 10000.0);
+    let (x, y) = v.element_center("恢复默认").unwrap();
+    v.pointer(PointerEvent { id: 1, phase: PointerPhase::Down, x, y, time_ms: 10 });
+    v.pointer(PointerEvent { id: 1, phase: PointerPhase::Up, x, y, time_ms: 40 });
+    render_view(&mut v, w, h, fonts, out, "settings-general-fix-confirm");
+
+    let mut m = demo_model();
+    m.update = UpdateState::Available {
+        version: "0.4.0".into(),
+        notes: "· 新增设置窗口、关于页和新手引导\n· 九宫格支持英文\n· 修复管理员窗口里偶尔不弹出键盘".into(),
+    };
+    render_view(&mut page(Page::About, light, m.clone()), w, h, fonts, out, "about-update");
+    m.update = UpdateState::Downloading(0.42);
+    render_view(&mut page(Page::About, dark, m), w, h, fonts, out, "about-downloading-dark");
+
+    let mut m = demo_model();
+    m.engines.wetype = EngineStatus {
+        available: false,
+        detail: "未检测到微信输入法".into(),
+        note: String::new(),
+        download_url: Some("https://z.weixin.qq.com/".into()),
+    };
+    m.voice_engine = dianmo_ui::settings::VoiceEngineChoice::System;
+    render_view(&mut page(Page::Voice, light, m), w, h, fonts, out, "settings-voice-missing");
+
+    // Narrow window: tabs on top.
+    let mut v = page(Page::Input, light, demo_model());
+    render_view(&mut v, 560.0, 820.0, fonts, out, "settings-narrow");
+    let mut v = page(Page::General, dark, demo_model());
+    render_view(&mut v, 560.0, 820.0, fonts, out, "settings-narrow-dark");
+
+    // Onboarding.
+    let (ow, oh) = (760.0, 560.0);
+    for kind in [light, dark] {
+        let mut o = OnboardingView::new(SettingsModel { layout: LayoutChoice::Pinyin, ..demo_model() }, kind);
+        o.resize(ow, oh);
+        for i in 0..dianmo_ui::settings::ONBOARDING_PAGES {
+            o.set_page(i);
+            let suffix = if kind == dark { "-dark" } else { "" };
+            render_view(&mut o, ow, oh, fonts, out, &format!("onboarding-{}{suffix}", i + 1));
+        }
+    }
+    // Mid-swipe between card 1 and 2.
+    let mut o = OnboardingView::new(demo_model(), light);
+    o.resize(ow, oh);
+    o.pointer(PointerEvent { id: 1, phase: PointerPhase::Down, x: 600.0, y: 300.0, time_ms: 10 });
+    o.pointer(PointerEvent { id: 1, phase: PointerPhase::Move, x: 400.0, y: 300.0, time_ms: 30 });
+    o.pointer(PointerEvent { id: 1, phase: PointerPhase::Move, x: 300.0, y: 300.0, time_ms: 50 });
+    render_view(&mut o, ow, oh, fonts, out, "onboarding-swipe");
+    let _ = Level::Ok;
 }

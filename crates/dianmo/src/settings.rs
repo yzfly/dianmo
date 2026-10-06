@@ -31,6 +31,18 @@ pub struct Settings {
     pub edit_area: bool,
     /// The 电脑键盘 (pass-through PC keyboard) layout was showing last time.
     pub pc_keyboard: bool,
+    /// Voice engine: `wetype` (微信输入法, default) | `doubao_ime` (豆包输入法) | `doubao` (third-party
+    /// 豆包语音) | `system` (Win+H).
+    /// Kept as the setting string; `voice::VoiceEngine::from_setting` parses it.
+    pub voice_engine: String,
+    /// 豆包语音's exe (empty = look in the usual places).
+    pub voice_doubao_exe: String,
+    /// Voice mode: the floating ball starts/stops voice input; the keyboard doesn't pop up for
+    /// text fields (long-press the ball or use the tray).
+    pub voice_mode: bool,
+    /// Floating ball position: (on the right edge, centre height as a fraction of the work area).
+    /// `None` until the user moves it.
+    pub ball: Option<(bool, f32)>,
     /// System touch keyboard settings to restore on exit: `(EnableDesktopModeAutoInvoke,
     /// TouchKeyboardTapInvoke)`. `Some` while Dianmo runs (or after it crashed).
     pub saved_tabtip: Option<(SavedDword, SavedDword)>,
@@ -48,6 +60,10 @@ impl Default for Settings {
             auto_show: true,
             edit_area: true,
             pc_keyboard: false,
+            voice_engine: "wetype".to_owned(),
+            voice_doubao_exe: String::new(),
+            voice_mode: false,
+            ball: None,
             saved_tabtip: None,
         }
     }
@@ -90,6 +106,7 @@ impl Settings {
     pub fn parse(text: &str) -> Settings {
         let mut s = Settings::default();
         let (mut saved_a, mut saved_b) = (None, None);
+        let (mut ball_edge, mut ball_y) = (None, None);
         for line in text.lines() {
             let line = line.trim().trim_start_matches('\u{feff}');
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -112,6 +129,22 @@ impl Settings {
                 "auto_show" => s.auto_show = parse_bool(v).unwrap_or(s.auto_show),
                 "edit_area" => s.edit_area = parse_bool(v).unwrap_or(s.edit_area),
                 "pc_keyboard" => s.pc_keyboard = parse_bool(v).unwrap_or(s.pc_keyboard),
+                "voice_engine" => {
+                    let v = v.to_ascii_lowercase();
+                    if matches!(v.as_str(), "wetype" | "doubao_ime" | "doubao" | "system") {
+                        s.voice_engine = v;
+                    }
+                }
+                "voice_doubao_exe" => s.voice_doubao_exe = v.to_owned(),
+                "voice_mode" => s.voice_mode = parse_bool(v).unwrap_or(s.voice_mode),
+                "ball_edge" => {
+                    ball_edge = match v {
+                        "left" => Some(false),
+                        "right" => Some(true),
+                        _ => None,
+                    }
+                }
+                "ball_y" => ball_y = v.parse::<f32>().ok().filter(|y| y.is_finite()).map(|y| y.clamp(0.0, 1.0)),
                 "height" => {
                     if let Ok(h) = v.parse::<f32>()
                         && h.is_finite()
@@ -126,6 +159,9 @@ impl Settings {
         }
         if let (Some(a), Some(b)) = (saved_a, saved_b) {
             s.saved_tabtip = Some((a, b));
+        }
+        if let (Some(right), Some(y)) = (ball_edge, ball_y) {
+            s.ball = Some((right, y));
         }
         s
     }
@@ -142,6 +178,15 @@ impl Settings {
         let _ = writeln!(out, "edit_area={}", self.edit_area);
         let _ = writeln!(out, "pc_keyboard={}", self.pc_keyboard);
         let _ = writeln!(out, "height={}", self.height);
+        let _ = writeln!(out, "voice_engine={}", self.voice_engine);
+        if !self.voice_doubao_exe.is_empty() {
+            let _ = writeln!(out, "voice_doubao_exe={}", self.voice_doubao_exe);
+        }
+        let _ = writeln!(out, "voice_mode={}", self.voice_mode);
+        if let Some((right, y)) = self.ball {
+            let _ = writeln!(out, "ball_edge={}", if right { "right" } else { "left" });
+            let _ = writeln!(out, "ball_y={y:.4}");
+        }
         if let Some((a, b)) = self.saved_tabtip {
             out.push_str("# 点墨运行期间替换掉的系统触摸键盘设置，退出时恢复\n");
             let _ = writeln!(out, "saved_desktop_mode_auto_invoke={}", fmt_saved(a));
@@ -182,6 +227,10 @@ mod tests {
             auto_show: false,
             edit_area: false,
             pc_keyboard: true,
+            voice_engine: "doubao".to_owned(),
+            voice_doubao_exe: r"C:\Tools\DouBaoVoice 1.2.exe".to_owned(),
+            voice_mode: true,
+            ball: Some((true, 0.25)),
             saved_tabtip: Some((None, Some(1))),
         };
         assert_eq!(Settings::parse(&s.serialize()), s);
@@ -204,6 +253,15 @@ mod tests {
         // Half a saved pair is ignored.
         assert_eq!(Settings::parse("saved_desktop_mode_auto_invoke=0\n").saved_tabtip, None);
         assert_eq!(Settings::parse("height=NaN").height, 1.0);
+        assert_eq!(s.voice_engine, "wetype", "default engine");
+        assert_eq!(Settings::parse("voice_engine=System").voice_engine, "system");
+        assert_eq!(Settings::parse("voice_engine=bogus").voice_engine, "wetype");
+        assert_eq!(Settings::parse("voice_engine=doubao_ime").voice_engine, "doubao_ime");
+        assert!(!s.voice_mode);
+        assert!(Settings::parse("voice_mode=on").voice_mode);
+        assert_eq!(s.ball, None);
+        assert_eq!(Settings::parse("ball_edge=left\nball_y=7").ball, Some((false, 1.0)));
+        assert_eq!(Settings::parse("ball_y=0.3").ball, None, "both keys needed");
     }
 
     #[test]

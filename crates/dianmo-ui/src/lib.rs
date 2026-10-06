@@ -10,11 +10,13 @@ mod keyboard;
 mod pc;
 pub mod layout;
 mod scroll;
+pub mod settings;
 pub mod theme;
 
 pub use canvas::{Align, Canvas, Color, Font, Rect, TextStyle};
 pub use clip::clip_preview;
 pub use keyboard::{KeyboardConfig, KeyboardView, MORE_BATCH};
 pub use layout::{Layout, SymTab};
-pub use theme::{Theme, ThemeKind};
+pub use settings::{OnboardingView, SettingsAction, SettingsModel, SettingsView};
+pub use theme::{SettingsTheme, Theme, ThemeKind};
 pub use view::{ClipItem, InputState, PointerEvent, PointerPhase, Response, UiAction, View};

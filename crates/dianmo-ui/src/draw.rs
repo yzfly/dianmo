@@ -75,7 +75,7 @@ impl KeyboardView {
             self.draw_strip(c);
         } else if self.clip_bar_shown() {
             self.draw_clip_bar(c);
-        } else if self.pc {
+        } else if self.pc && !self.voice_mode {
             let st = self.style(13.0 * self.bar_s(), th.text_faint);
             c.text("电脑键盘 · 按键直通，由当前应用的输入法处理", Rect::new(0.0, 0.0, m.w, m.bar_h), st);
         }
@@ -90,6 +90,23 @@ impl KeyboardView {
                     Rect::new(k.cell.x + (k.cell.w - d) / 2.0, k.cell.y + (k.cell.h - d) / 2.0, d, d)
                 };
                 c.fill_rect(r, d / 2.0, th.flat_pressed);
+            }
+            if k.action == KeyAction::VoiceBall {
+                // 「退出语音模式」 (voice mode): a filled accent pill, the most visible thing here.
+                let h = m.bar_h * 0.72;
+                let r = Rect::new(k.cell.x + 3.0 * bs, k.cell.y + (k.cell.h - h) / 2.0, k.cell.w - 6.0 * bs, h);
+                c.fill_rect(r, h / 2.0, if pressed { th.accent_pressed } else { th.accent });
+                let st = TextStyle { bold: true, ..self.style(16.0 * bs, th.on_accent) };
+                c.text(&k.label, r, st);
+                continue;
+            }
+            if k.action == KeyAction::Voice && self.voice_active {
+                // Recording: a red disc behind a white microphone.
+                let d = m.bar_h * 0.72;
+                let r = Rect::new(k.cell.x + (k.cell.w - d) / 2.0, k.cell.y + (k.cell.h - d) / 2.0, d, d);
+                c.fill_rect(r, d / 2.0, if pressed { RECORDING_PRESSED } else { RECORDING });
+                c.text(&k.label, k.cell, self.icon_style(19.0 * s * k.scale / 0.78, Color::rgb(255, 255, 255)));
+                continue;
             }
             let color = if matches!(k.action, KeyAction::ExpandCandidates | KeyAction::CollapseCandidates) {
                 th.text
@@ -413,7 +430,11 @@ impl KeyboardView {
             c.stroke_rect(face.inset(1.0 * s), m.radius * 1.5, 2.0 * s, th.accent);
         }
         let glyph = Rect::new(face.x, face.y + face.h * 0.12, face.w, face.h * 0.5);
-        c.text(&k.label, glyph, TextStyle { bold: true, ..self.style(34.0 * s, fg) });
+        if k.icon {
+            c.text(&k.label, glyph, self.icon_style(30.0 * s, fg));
+        } else {
+            c.text(&k.label, glyph, TextStyle { bold: true, ..self.style(34.0 * s, fg) });
+        }
         if let Some(sub) = &k.sub {
             let r = Rect::new(face.x, face.y + face.h * 0.62, face.w, face.h * 0.26);
             c.text(sub, r, self.style(15.0 * s, if k.selected { th.accent } else { th.text_secondary }));
@@ -643,6 +664,10 @@ impl KeyboardView {
         c.text(text, r, st);
     }
 }
+
+/// The microphone key while voice input runs (same red in both themes).
+const RECORDING: Color = Color::rgb(0xE5, 0x48, 0x4D);
+const RECORDING_PRESSED: Color = Color::rgb(0xC2, 0x36, 0x3B);
 
 /// Full-width punctuation whose ink sits in the lower-left quarter of the em box (，。、．) looks
 /// off-centre on a key when the advance is centred. Phone keyboards centre the ink; so do we by

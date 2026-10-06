@@ -1,25 +1,30 @@
 //! The application behind the keyboard window: input controller + settings + system glue.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dianmo_core::{Action, Engine, InputController, Schema};
 use dianmo_ui::{InputState, KeyboardView, Response, ThemeKind, UiAction, View};
 use dianmo_win::tabtip::SystemKeyboardSettings;
 use dianmo_win::{
-    App, FieldKind, FocusEvent, FocusWatcher, HostControl, SendInputSink, TrayItem, now_ms, start_focus_watcher,
-    start_voice_typing,
+    App, BallEdge, BallEvent, BallState, FieldKind, FocusEvent, FocusWatcher, HostControl, HostProxy, SendInputSink,
+    TrayItem, now_ms, start_focus_watcher,
 };
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
 #[cfg(feature = "rime")]
 use crate::basic::BasicEngine;
+use crate::bubble;
 use crate::clipboard::{self, ClipEvent, ClipStore, ClipboardWatcher};
 use crate::engine::AnyEngine;
 use crate::log;
 use crate::platform;
 use crate::settings::Settings;
+use crate::voice::{Voice, VoiceEngine, VoiceState};
 
 pub struct DianmoApp {
     ctl: InputController<AnyEngine, SendInputSink>,
@@ -49,6 +54,63 @@ pub struct DianmoApp {
     clip_updates: u64,
     /// A password field has focus: clipboard changes are not recorded.
     password_focus: bool,
+    /// Voice input through the selected engine (TODO #27 / #29).
+    voice: Voice,
+    /// The voice state last shown (mic keys, ball, failure toast).
+    voice_shown: VoiceState,
+    /// The ball currently shows the listening halo.
+    ball_listening: bool,
+    /// The 300 ms poll timer is armed (only while `voice.needs_poll()`).
+    voice_timer: bool,
+    /// Clipboard changes until then are the voice engine's result or our restore of the user's
+    /// clipboard: not recorded in the history.
+    voice_clip_quiet_until: Option<Instant>,
+    /// Why each engine (`VoiceEngine::ALL` order) can't be used; checked in the background.
+    voice_unavailable: [Option<String>; ENGINES],
+    /// The voice-mode hint (「点一下说话，长按展开键盘」) was shown in this run.
+    voice_hint_shown: bool,
+}
+
+const ENGINES: usize = VoiceEngine::ALL.len();
+
+/// Voice engine availability, from the background check.
+struct VoiceAvail([Option<String>; ENGINES]);
+
+/// Fired by the voice poll timer (a one-shot `SetTimer` on the keyboard window).
+struct VoiceTick;
+
+/// Posted to ourselves when the ball appears in voice mode: keep it out, show the hint.
+struct VoiceIntro;
+
+const VOICE_POLL_MS: u32 = 300;
+const VOICE_TIMER_ID: usize = 0xD1A0;
+/// After a voice session, clipboard changes are attributed to it for this long (WeType copies its
+/// result up to ~2.5 s after stopping; DoubaoVoice pastes 1–3 s after; we restore the user's
+/// clipboard after that).
+const VOICE_CLIP_QUIET: Duration = Duration::from_secs(3);
+/// Voice mode: how long the ball stays fully out of the screen edge after entering voice mode,
+/// and how long the hint next to it stays.
+const VOICE_INTRO_MS: u32 = 10_000;
+const VOICE_HINT: &str = "点一下说话，长按展开键盘";
+/// A failure message next to the ball (keyboard hidden).
+const VOICE_FAIL_BUBBLE_MS: u32 = 5_000;
+
+thread_local! {
+    static VOICE_TIMER_PROXY: Cell<Option<HostProxy>> = const { Cell::new(None) };
+}
+
+unsafe extern "system" fn voice_timer_proc(hwnd: HWND, _msg: u32, id: usize, _time: u32) {
+    unsafe {
+        let _ = KillTimer(Some(hwnd), id);
+    }
+    if let Some(p) = VOICE_TIMER_PROXY.with(|p| p.get()) {
+        p.post(VoiceTick);
+    }
+}
+
+/// Test hook: `DIANMO_NO=clipboard,ball,focus` leaves those parts off (memory measurements).
+pub fn disabled(part: &str) -> bool {
+    std::env::var("DIANMO_NO").is_ok_and(|v| v.split(',').any(|p| p.trim() == part))
 }
 
 /// Posted to ourselves [`COPY_CHECK_MS`] after a 复制 button: the clipboard update count then.
@@ -94,6 +156,12 @@ impl DianmoApp {
         if !settings.chinese {
             ctl.handle(Action::ToggleChinese);
         }
+        let mut voice = Voice::new(VoiceEngine::from_setting(&settings.voice_engine).unwrap_or(VoiceEngine::WeType));
+        voice.set_log(log::write);
+        // A failing engine only says why: Windows voice typing (Win+H) is the user's own choice
+        // in the tray, never a fallback (its panel kept popping up, 2026-10-06).
+        voice.set_fallback(false);
+        voice.set_doubao_exe(Some(PathBuf::from(&settings.voice_doubao_exe)));
         Self {
             ctl,
             settings,
@@ -121,6 +189,13 @@ impl DianmoApp {
             clip_watch: None,
             clip_updates: 0,
             password_focus: false,
+            voice,
+            voice_shown: VoiceState::Idle,
+            ball_listening: false,
+            voice_timer: false,
+            voice_clip_quiet_until: None,
+            voice_unavailable: Default::default(),
+            voice_hint_shown: false,
         }
     }
 
@@ -139,6 +214,13 @@ impl DianmoApp {
     }
 
     fn on_clip_event(&mut self, ev: ClipEvent, view: &mut dyn View, host: &mut HostControl) -> Response {
+        if !matches!(ev, ClipEvent::PasteFailed(_)) && self.voice_clip_quiet() {
+            // The engine's result going through the clipboard, or our restore of the user's
+            // clipboard afterwards: neither belongs in the history (and the restored content
+            // is what the paste preview already shows).
+            log!("clipboard change during voice input: not recorded");
+            return Response::none();
+        }
         let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) else { return Response::none() };
         match ev {
             ClipEvent::Text(text) => {
@@ -301,6 +383,7 @@ impl DianmoApp {
         match ready.0 {
             Ok(engine) => {
                 log!("librime {} started in {} ms", engine.rime_version(), ready.1);
+                log_memory("librime started");
                 self.pending_rime = Some(engine);
                 self.swap_in_rime(view)
             }
@@ -355,12 +438,22 @@ impl App for DianmoApp {
             kv.set_edit_area(self.settings.edit_area);
             kv.set_pc_keyboard(self.settings.pc_keyboard);
             kv.set_clips(self.clips.items().to_vec());
+            kv.set_voice_mode(self.settings.voice_mode);
         }
-        self.start_clipboard(host);
+        if !disabled("clipboard") {
+            self.start_clipboard(host);
+        }
         #[cfg(feature = "rime")]
         self.start_rime(host);
-        self.set_focus_watch(self.settings.auto_show, host);
+        self.set_focus_watch(self.settings.auto_show && !disabled("focus"), host);
+        VOICE_TIMER_PROXY.with(|p| p.set(Some(host.proxy())));
+        self.check_voice_engines(host);
+        log!("voice engine {}, voice mode {}", self.voice.engine().as_setting(), self.settings.voice_mode);
+        if self.settings.voice_mode && !host.is_visible() {
+            host.proxy().post(VoiceIntro);
+        }
         self.refresh_tray(host);
+        log_memory("started");
         Response::repaint()
     }
 
@@ -383,7 +476,25 @@ impl App for DianmoApp {
     }
 
     fn on_visibility_changed(&mut self, visible: bool, view: &mut dyn View, host: &mut HostControl) -> Response {
+        let mut voice = Response::none();
+        if !visible && !self.settings.voice_mode && self.voice_running() {
+            // The mic key belongs to the keyboard: collapsing it ends the session, no result.
+            // (In voice mode the ball runs voice input while the keyboard is hidden.)
+            self.voice.cancel();
+            voice = self.voice_sync(view, host);
+        }
+        log!("keyboard {}", if visible { "shown" } else { "hidden" });
         if visible {
+            bubble::hide();
+        } else if self.settings.voice_mode && !self.voice_hint_shown {
+            // The ball is appearing: the first time in voice mode in this run, keep it out of the
+            // edge and say how it works. Posted: the ball's window reaches its place only after
+            // the host has finished hiding the keyboard.
+            host.proxy().post(VoiceIntro);
+        }
+        if visible {
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            FIRST.call_once(|| log_memory("keyboard shown"));
             dump_keymap(view);
             self.manual_show_at = if std::mem::take(&mut self.showing_for_focus) { None } else { Some(Instant::now()) };
         } else {
@@ -397,13 +508,216 @@ impl App for DianmoApp {
         self.refresh_tray(host);
         if !visible && self.ctl.is_composing() {
             // The target is probably gone; don't leave a stale composition behind.
-            return self.input(Action::ClearComposition, view);
+            return merge(voice, self.input(Action::ClearComposition, view));
         }
-        Response::none()
+        voice
     }
 
     fn on_tray_command(&mut self, id: u32, view: &mut dyn View, host: &mut HostControl) -> Response {
         self.tray_command(id, view, host)
+    }
+
+    fn on_ball(&mut self, event: BallEvent, view: &mut dyn View, host: &mut HostControl) -> Response {
+        let r = match event {
+            // Voice mode: the ball is the voice button.
+            BallEvent::Tap if self.settings.voice_mode => self.voice_toggle(view, host),
+            BallEvent::Tap | BallEvent::LongPress => {
+                bubble::hide();
+                host.show();
+                Response::none()
+            }
+            BallEvent::Moved(p) => {
+                self.settings.ball = Some((p.edge == BallEdge::Right, p.y_frac));
+                self.save();
+                Response::none()
+            }
+        };
+        self.refresh_tray(host);
+        r
+    }
+}
+
+/// Combines two responses (the later timer request wins).
+fn merge(mut a: Response, b: Response) -> Response {
+    a.repaint |= b.repaint;
+    a.actions.extend(b.actions);
+    if b.timer_ms.is_some() {
+        a.timer_ms = b.timer_ms;
+    }
+    a
+}
+
+/// Logs the process's private bytes (commit charge) — for the memory budget (DESIGN §5).
+pub fn log_memory(stage: &str) {
+    // The kernel32 export (psapi.dll's GetProcessMemoryInfo would add an import).
+    use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS_EX { cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) }.as_bool();
+    if ok {
+        log!(
+            "memory ({stage}): private {:.1} MB, working set {:.1} MB",
+            c.PrivateUsage as f64 / 1048576.0,
+            c.WorkingSetSize as f64 / 1048576.0
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Voice input (TODO #27 / #29): mic key, voice ball, engine selection
+// ---------------------------------------------------------------------------------------------
+
+impl DianmoApp {
+    /// A session is running or finishing (the engine may still touch the clipboard).
+    fn voice_running(&self) -> bool {
+        self.voice.needs_poll() || self.voice.state().is_active()
+    }
+
+    fn voice_clip_quiet(&self) -> bool {
+        self.voice_running() || self.voice_clip_quiet_until.is_some_and(|t| Instant::now() < t)
+    }
+
+    /// The mic key or the voice-mode ball: start or stop voice input.
+    fn voice_toggle(&mut self, view: &mut dyn View, host: &mut HostControl) -> Response {
+        // The engine types into the target app: nothing of ours may be half-composed there.
+        // (The view already released its latched modifiers.)
+        let r = if self.ctl.is_composing() { self.input(Action::ClearComposition, view) } else { Response::none() };
+        bubble::hide();
+        // A repeated failure gets its toast again.
+        self.voice_shown = VoiceState::Idle;
+        let st = self.voice.toggle();
+        log!("voice toggle ({}) -> {}", self.voice.engine().as_setting(), voice_state_name(&st));
+        let r = merge(r, self.voice_sync(view, host));
+        if !self.voice.state().is_active() {
+            // Ended (or failed): availability may have changed (engine closed, crashed).
+            self.check_voice_engines(host);
+        }
+        r
+    }
+
+    /// Shows the voice state on the mic keys and the ball, a toast for a new failure, and keeps
+    /// the poll timer running while the engine needs it.
+    fn voice_sync(&mut self, view: &mut dyn View, host: &mut HostControl) -> Response {
+        let st = self.voice.state();
+        let listening = matches!(st, VoiceState::Starting | VoiceState::Listening);
+        if listening != self.ball_listening {
+            self.ball_listening = listening;
+            host.set_ball_state(if listening { BallState::Listening } else { BallState::Idle });
+        }
+        let mut r = Response::none();
+        if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
+            r.repaint = kv.set_voice_active(listening);
+            if let VoiceState::Failed(msg) = &st
+                && self.voice_shown != st
+            {
+                if host.is_visible() {
+                    r = merge(r, kv.show_toast(msg, now_ms()));
+                } else {
+                    // Voice ball: the reason goes next to the ball.
+                    bubble::keep_ball_out(VOICE_FAIL_BUBBLE_MS);
+                    bubble::show(msg, VOICE_FAIL_BUBBLE_MS);
+                }
+            }
+        }
+        if self.voice.needs_poll() {
+            self.arm_voice_timer(host);
+        }
+        self.voice_clip_quiet_until = Some(Instant::now() + VOICE_CLIP_QUIET);
+        if st != self.voice_shown && !matches!(st, VoiceState::Failed(_)) {
+            log!("voice: {}", voice_state_name(&st));
+        }
+        self.voice_shown = st;
+        r
+    }
+
+    fn arm_voice_timer(&mut self, host: &mut HostControl) {
+        if self.voice_timer {
+            return;
+        }
+        let hwnd = HWND(host.proxy().hwnd() as *mut _);
+        let id = unsafe { SetTimer(Some(hwnd), VOICE_TIMER_ID, VOICE_POLL_MS, Some(voice_timer_proc)) };
+        self.voice_timer = id != 0;
+        if id == 0 {
+            log!("voice: SetTimer failed; polling stops");
+        }
+    }
+
+    fn on_voice_tick(&mut self, view: &mut dyn View, host: &mut HostControl) -> Response {
+        self.voice_timer = false;
+        let was_active = self.voice.state().is_active();
+        self.voice.poll();
+        let r = self.voice_sync(view, host);
+        if was_active && !self.voice.state().is_active() {
+            self.check_voice_engines(host);
+        }
+        r
+    }
+
+    fn set_voice_engine(&mut self, e: VoiceEngine, view: &mut dyn View, host: &mut HostControl) -> Response {
+        self.voice.set_engine(e); // cancels a running session
+        if self.settings.voice_engine != e.as_setting() {
+            self.settings.voice_engine = e.as_setting().to_owned();
+            self.save();
+        }
+        log!("voice engine -> {}", e.as_setting());
+        self.check_voice_engines(host);
+        self.voice_sync(view, host)
+    }
+
+    /// Turns voice mode on (and shrinks into the voice ball) or off (the keyboard stays as it is;
+    /// the ball goes back to showing the keyboard).
+    fn set_voice_mode(&mut self, on: bool, view: &mut dyn View, host: &mut HostControl) -> Response {
+        if self.settings.voice_mode != on {
+            self.settings.voice_mode = on;
+            self.save();
+            log!("voice mode {on}");
+            // Each time voice mode is turned on, the ball explains itself once more.
+            self.voice_hint_shown = !on;
+        }
+        let repaint = view
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<KeyboardView>())
+            .is_some_and(|kv| kv.set_voice_mode(on));
+        if on && host.is_visible() {
+            // Shrink into the voice ball (the hint follows in `on_visibility_changed`).
+            host.hide();
+        } else if on {
+            host.proxy().post(VoiceIntro);
+        } else {
+            bubble::hide();
+        }
+        if repaint { Response::repaint() } else { Response::none() }
+    }
+
+    /// Voice mode with the ball showing: keep the ball out of the screen edge for a while and say
+    /// how it works (once per run, and again each time voice mode is turned on).
+    fn voice_intro(&mut self) {
+        if self.voice_hint_shown {
+            return;
+        }
+        let out = bubble::keep_ball_out(VOICE_INTRO_MS);
+        let shown = bubble::show(VOICE_HINT, VOICE_INTRO_MS);
+        log!("voice mode hint (ball kept out: {out}, hint shown: {shown})");
+        self.voice_hint_shown = out || shown;
+    }
+
+    /// Checks which engines are usable on a short-lived thread (registry reads and a process
+    /// snapshot); the result updates the tray menu.
+    fn check_voice_engines(&mut self, host: &mut HostControl) {
+        let proxy = host.proxy();
+        let _ = std::thread::Builder::new().name("dianmo-voice-check".into()).stack_size(256 * 1024).spawn(move || {
+            proxy.post(VoiceAvail(VoiceEngine::ALL.map(Voice::why_unavailable)));
+        });
+    }
+}
+
+fn voice_state_name(s: &VoiceState) -> &'static str {
+    match s {
+        VoiceState::Idle => "idle",
+        VoiceState::Starting => "starting",
+        VoiceState::Listening => "listening",
+        VoiceState::Finishing => "finishing",
+        VoiceState::Failed(_) => "failed",
     }
 }
 
@@ -416,15 +730,29 @@ impl DianmoApp {
             Ok(ev) => return self.on_clip_event(*ev, view, host),
             Err(e) => e,
         };
+        if event.is::<VoiceTick>() {
+            return self.on_voice_tick(view, host);
+        }
+        if event.is::<VoiceIntro>() {
+            if self.settings.voice_mode && !host.is_visible() {
+                self.voice_intro();
+            }
+            return Response::none();
+        }
+        let event = match event.downcast::<VoiceAvail>() {
+            Ok(a) => {
+                self.voice_unavailable = a.0;
+                return Response::none();
+            }
+            Err(e) => e,
+        };
         if let Some(CopyCheck(n)) = event.downcast_ref::<CopyCheck>() {
             // 复制 did not change the clipboard: nothing was selected, so offer selection mode.
-            if *n == self.clip_updates && self.clip_watch.is_some() && host.is_visible() {
-                if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
-                    if kv.enter_select_mode() {
+            if *n == self.clip_updates && self.clip_watch.is_some() && host.is_visible()
+                && let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>())
+                    && kv.enter_select_mode() {
                         return Response::repaint();
                     }
-                }
-            }
             return Response::none();
         }
         #[cfg(feature = "rime")]
@@ -434,6 +762,7 @@ impl DianmoApp {
         };
         if let Some(h) = event.downcast_ref::<HideLater>() {
             if h.0 == self.focus_seq && host.is_visible() {
+                log!("auto-hide: touched outside a text field");
                 host.hide();
             }
         } else if event.is::<ShowAgain>() {
@@ -453,11 +782,11 @@ impl DianmoApp {
                 let spellings = self.ctl.engine_mut().t9_spellings();
                 view.set_t9_spellings(spellings)
             }
-            UiAction::Voice => {
-                if !start_voice_typing() {
-                    log!("voice typing (Win+H) could not be sent");
-                }
-                Response::none()
+            UiAction::Voice => self.voice_toggle(view, host),
+            // The 语音球 tile, or 「退出语音模式」 / 「退出语音球」 while in voice mode.
+            UiAction::VoiceBall => {
+                let on = !self.settings.voice_mode;
+                self.set_voice_mode(on, view, host)
             }
             UiAction::Hide => {
                 host.hide();
@@ -525,7 +854,7 @@ fn dump_keymap(view: &mut dyn View) {
         "redo", "selectall", "copy", "paste", "cut", "delword", "clear", "pc", "symbols", "numbers", "pcmode", "pcback",
         "prtsc", "select", "clipboard", "clipclose", "clearclips", "back", "sel_left", "sel_right", "sel_wordleft",
         "sel_wordright", "sel_up", "sel_down", "sel_home", "sel_end", "sel_copy", "sel_cut", "sel_paste", "sel_delete",
-        "sel_done", "clip0", "clip1", "clip2", "clip3", "F1", "F4", "F5", "`", "-", "=", "[", "]", "\\", ";", "'", "/",
+        "sel_done", "voiceball", "exitvoice", "t9_1", "t9_2", "t9_3", "t9_4", "t9_5", "t9_6", "t9_7", "t9_8", "t9_9", "clip0", "clip1", "clip2", "clip3", "F1", "F4", "F5", "`", "-", "=", "[", "]", "\\", ";", "'", "/",
         ".",
     ];
     let letters: Vec<String> = ('a'..='z').chain('0'..='9').map(String::from).collect();
@@ -539,6 +868,10 @@ fn dump_keymap(view: &mut dyn View) {
 
 impl Drop for DianmoApp {
     fn drop(&mut self) {
+        if self.voice.state().is_active() {
+            // Don't leave the engine listening after 点墨 is gone.
+            self.voice.cancel();
+        }
         self.focus = None;
         self.clip_watch = None;
         #[cfg(feature = "rime")]
@@ -576,6 +909,8 @@ mod tray_id {
     pub const AUTO_SHOW: u32 = 11;
     pub const AUTOSTART: u32 = 12;
     pub const EDIT_AREA: u32 = 13;
+    pub const VOICE_MODE: u32 = 14;
+    pub const VOICE_ENGINE_BASE: u32 = 40; // + index into VoiceEngine::ALL
     pub const HEIGHT_BASE: u32 = 20; // + index into HEIGHTS
     pub const ABOUT: u32 = 30;
 }
@@ -594,11 +929,27 @@ impl DianmoApp {
             .enumerate()
             .map(|(i, (h, label))| cmd(tray_id::HEIGHT_BASE + i as u32, label, (self.settings.height - h).abs() < 0.01))
             .collect();
+        let voice_engines = VoiceEngine::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| {
+                let name = e.label();
+                let label = match &self.voice_unavailable[i] {
+                    None => name.to_owned(),
+                    Some(why) if ["没有安装", "找不到", "没有配置"].iter().any(|w| why.contains(w)) => format!("{name}（未安装）"),
+                    Some(_) => format!("{name}（未运行）"),
+                };
+                cmd(tray_id::VOICE_ENGINE_BASE + i as u32, &label, self.voice.engine() == e)
+            })
+            .collect();
         vec![
             cmd(tray_id::PINYIN, "全拼", schema == Schema::Pinyin && !self.settings.pc_keyboard),
             cmd(tray_id::SHUANGPIN, "小鹤双拼", schema == Schema::Shuangpin && !self.settings.pc_keyboard),
             cmd(tray_id::T9, "九宫格", schema == Schema::T9 && !self.settings.pc_keyboard),
             cmd(tray_id::PC, "电脑键盘（按键直通）", self.settings.pc_keyboard),
+            TrayItem::Separator,
+            TrayItem::Submenu { label: "语音引擎".to_owned(), items: voice_engines },
+            cmd(tray_id::VOICE_MODE, "语音模式（悬浮球点一下说话）", self.settings.voice_mode),
             TrayItem::Separator,
             cmd(tray_id::DARK, "深色主题", self.settings.theme == ThemeKind::Dark),
             TrayItem::Submenu { label: "键盘高度".to_owned(), items: heights },
@@ -673,7 +1024,8 @@ impl DianmoApp {
                         self.numbers_for_field = false;
                     }
                 }
-                if by_touch && !host.is_visible() {
+                // Voice mode: only the ball; the keyboard comes from a long press or the tray.
+                if by_touch && !host.is_visible() && !self.settings.voice_mode {
                     self.showing_for_focus = true;
                     host.show();
                 }
@@ -712,6 +1064,14 @@ impl DianmoApp {
             tray_id::AUTOSTART => {
                 self.set_autostart(!self.settings.autostart);
                 Response::none()
+            }
+            tray_id::VOICE_MODE => {
+                let on = !self.settings.voice_mode;
+                self.set_voice_mode(on, view, host)
+            }
+            id if (tray_id::VOICE_ENGINE_BASE..tray_id::VOICE_ENGINE_BASE + ENGINES as u32).contains(&id) => {
+                let e = VoiceEngine::ALL[(id - tray_id::VOICE_ENGINE_BASE) as usize];
+                self.set_voice_engine(e, view, host)
             }
             tray_id::EDIT_AREA => {
                 self.settings.edit_area = !self.settings.edit_area;

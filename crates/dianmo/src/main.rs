@@ -20,6 +20,8 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 mod basic;
+#[cfg(windows)]
+mod bubble;
 mod clipboard;
 #[cfg(windows)]
 mod elevate;
@@ -49,7 +51,7 @@ mod win {
     use std::time::{Duration, Instant};
 
     use dianmo_ui::{KeyboardConfig, KeyboardView};
-    use dianmo_win::HostOptions;
+    use dianmo_win::{BallEdge, BallPos, HostOptions};
 
     use crate::app::{DianmoApp, RimeSetup, restore_system_keyboard, take_over_system_keyboard};
     use crate::basic::BasicEngine;
@@ -133,7 +135,15 @@ mod win {
             #[allow(unreachable_patterns)]
             _ => "点墨 · 触屏输入法".to_owned(),
         };
-        let opts = HostOptions { start_visible: !hidden, appbar: settings.appbar, tray_tip, ..HostOptions::default() };
+        let ball_pos = settings.ball.map(|(right, y_frac)| BallPos { edge: if right { BallEdge::Right } else { BallEdge::Left }, y_frac });
+        let opts = HostOptions {
+            start_visible: !hidden,
+            appbar: settings.appbar,
+            tray_tip,
+            ball_pos,
+            edge_handle: !crate::app::disabled("ball"),
+            ..HostOptions::default()
+        };
         let _instance_window = platform::create_instance_window().map_err(|e| log!("instance window: {e}"));
         let app = DianmoApp::new(AnyEngine::Basic(engine), rime, settings, settings_path);
         log!("window starting {} ms after launch", t0.elapsed().as_millis());

@@ -10,7 +10,8 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 use dianmo_ui::{PointerEvent, PointerPhase, Response, UiAction, View};
 use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -43,6 +44,7 @@ use crate::canvas::Renderer;
 use crate::clock::now_ms;
 use crate::handle::{BallEvent, BallPos, BallState, EdgeHandle};
 use crate::tray::{self, Choice, Tray, TrayItem};
+use crate::window::{self, AppWindow, PendingWindow, WindowId, WindowOptions};
 
 pub(crate) const WM_APP_CMD: u32 = WM_APP + 1;
 const WM_APP_EVENT: u32 = WM_APP + 2;
@@ -61,14 +63,29 @@ const CMD_LAYOUT: usize = 5;
 const CMD_SYNC_SIZE: usize = 6;
 const CMD_APPBAR_TOGGLE: usize = 7;
 const CMD_REPAINT: usize = 8;
+/// Drop app windows destroyed while the host was busy (`window::reap`).
+const CMD_REAP: usize = 9;
 
 const TIMER_ID: usize = 1;
+/// Fires once the keyboard has been hidden for [`TRIM_AFTER_MS`]: the renderer's device and
+/// surfaces are released (memory) until it is shown again.
+const TIMER_TRIM: usize = 2;
+const TRIM_AFTER_MS: u32 = 5000;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const WM_TABLET_QUERYSYSTEMGESTURESTATUS: u32 = 0x02CC;
 const POINTER_MESSAGE_FLAG_INCONTACT: usize = 0x4;
 const POINTER_MESSAGE_FLAG_CANCELED: usize = 0x8000;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+/// The keyboard window (for [`post_reap`]); 0 when there is none.
+static KEYBOARD: AtomicIsize = AtomicIsize::new(0);
+
+pub(crate) fn post_reap() {
+    let hwnd = KEYBOARD.load(Ordering::Relaxed);
+    if hwnd != 0 {
+        post_cmd(HWND(hwnd as *mut _), CMD_REAP);
+    }
+}
 
 /// Host configuration.
 #[derive(Clone, Debug)]
@@ -95,6 +112,9 @@ pub struct HostOptions {
     /// App items for the tray menu, shown above the built-in ones. Change at runtime with
     /// [`HostControl::set_tray_menu`]; choices arrive in [`App::on_tray_command`].
     pub tray_menu: Vec<TrayItem>,
+    /// Extra directory searched for `<name>.png` by `Canvas::image`, after the exe's RCDATA
+    /// resources and `res\` next to the exe.
+    pub image_dir: Option<PathBuf>,
 }
 
 impl Default for HostOptions {
@@ -109,6 +129,7 @@ impl Default for HostOptions {
             hardware_gpu: false,
             tray_menu: Vec::new(),
             ball_pos: None,
+            image_dir: None,
         }
     }
 }
@@ -154,21 +175,55 @@ pub trait App {
         let _ = (id, view, host);
         Response::none()
     }
+
+    /// Handles one action from the view of app window `id` (opened with
+    /// [`HostControl::open_window`]); `view` is that window's view. The returned response
+    /// applies to that window (repaint / timer / nested actions, which come back here). To change
+    /// the keyboard view from here use [`HostControl::update_keyboard`].
+    fn on_window_action(&mut self, id: WindowId, action: UiAction, view: &mut dyn View, host: &mut HostControl) -> Response {
+        let _ = (id, action, view, host);
+        Response::none()
+    }
+
+    /// App window `id` is gone: closed by the user (title-bar ×, Alt+F4), by
+    /// [`HostControl::close_window`], or it could not be created. Its view was already dropped.
+    fn on_window_closed(&mut self, id: WindowId) {
+        let _ = id;
+    }
 }
 
-#[derive(Debug, Default)]
-struct Requests {
+/// Deferred work on a view (see [`HostControl::update_keyboard`]).
+type ViewUpdate = Box<dyn FnOnce(&mut dyn View) -> Response>;
+
+#[derive(Default)]
+pub(crate) struct Requests {
     visible: Option<bool>,
     appbar: Option<bool>,
     quit: bool,
     ball_state: Option<BallState>,
     /// Applied by `Host::process` itself (no window operations involved).
     tray_menu: Option<Vec<TrayItem>>,
+    keyboard_updates: Vec<ViewUpdate>,
+    window_updates: Vec<(WindowId, ViewUpdate)>,
+    /// App windows (applied outside the borrow, in this order).
+    opens: Vec<PendingWindow>,
+    closes: Vec<WindowId>,
+    titles: Vec<(WindowId, String)>,
+    dark: Vec<(WindowId, Option<bool>)>,
+    focus: Vec<WindowId>,
 }
 
 impl Requests {
     fn is_empty(&self) -> bool {
-        self.visible.is_none() && self.appbar.is_none() && !self.quit && self.ball_state.is_none()
+        self.visible.is_none()
+            && self.appbar.is_none()
+            && !self.quit
+            && self.ball_state.is_none()
+            && self.opens.is_empty()
+            && self.closes.is_empty()
+            && self.titles.is_empty()
+            && self.dark.is_empty()
+            && self.focus.is_empty()
     }
 }
 
@@ -180,6 +235,8 @@ pub struct HostControl {
     fullscreen: bool,
     req: Requests,
     proxy: HostProxy,
+    /// App windows open as of this callback (including ones opened in it, minus closed ones).
+    windows: Vec<WindowId>,
 }
 
 impl HostControl {
@@ -239,6 +296,67 @@ impl HostControl {
     pub fn set_ball_state(&mut self, state: BallState) {
         self.req.ball_state = Some(state);
     }
+
+    /// Opens an app window (settings, about, onboarding) showing `view`, centred on the monitor
+    /// of the last pointer position, activated and in front. The window is created right after
+    /// the callback returns; the id is valid at once (for [`Self::window_open`],
+    /// [`Self::update_window`], ...). Its view's actions go to [`App::on_window_action`].
+    pub fn open_window(&mut self, view: Box<dyn View>, opts: WindowOptions) -> WindowId {
+        let id = window::next_id();
+        self.req.opens.push(PendingWindow { id, view, opts });
+        self.windows.push(id);
+        id
+    }
+
+    /// Closes app window `id` (its view is dropped; [`App::on_window_closed`] follows). A
+    /// window opened in this same callback is simply never created (no `on_window_closed`).
+    pub fn close_window(&mut self, id: WindowId) {
+        self.windows.retain(|&w| w != id);
+        if let Some(i) = self.req.opens.iter().position(|p| p.id == id) {
+            self.req.opens.remove(i);
+        } else {
+            self.req.closes.push(id);
+        }
+    }
+
+    /// Whether app window `id` is open (including requests made in this callback).
+    pub fn window_open(&self, id: WindowId) -> bool {
+        self.windows.contains(&id)
+    }
+
+    /// Ids of the open app windows.
+    pub fn windows(&self) -> &[WindowId] {
+        &self.windows
+    }
+
+    /// Brings app window `id` to the front (restoring it if minimised) and activates it.
+    pub fn focus_window(&mut self, id: WindowId) {
+        self.req.focus.push(id);
+    }
+
+    pub fn set_window_title(&mut self, id: WindowId, title: impl Into<String>) {
+        self.req.titles.push((id, title.into()));
+    }
+
+    /// Dark title bar for window `id`: `None` follows the Windows app theme.
+    pub fn set_window_dark(&mut self, id: WindowId, dark: Option<bool>) {
+        self.req.dark.push((id, dark));
+    }
+
+    /// Runs `f` on the keyboard view right after this callback (e.g. a theme chosen in the
+    /// settings window). Its response is handled like a keyboard view response (actions go to
+    /// [`App::on_action`]). `f` must not assume a concrete view type without checking
+    /// ([`View::as_any_mut`]).
+    pub fn update_keyboard(&mut self, f: impl FnOnce(&mut dyn View) -> Response + 'static) {
+        self.req.keyboard_updates.push(Box::new(f));
+    }
+
+    /// Runs `f` on the view of app window `id` right after this callback (e.g. the layout was
+    /// changed from the tray while settings are open); its response is handled like that
+    /// window's view response. Nothing happens if the window is closed.
+    pub fn update_window(&mut self, id: WindowId, f: impl FnOnce(&mut dyn View) -> Response + 'static) {
+        self.req.window_updates.push((id, Box::new(f)));
+    }
 }
 
 /// Thread-safe handle to the host (`Send + Sync + Copy`). Messages are posted to the UI thread.
@@ -287,13 +405,13 @@ impl HostProxy {
     }
 }
 
-struct Host {
+pub(crate) struct Host {
     hwnd: HWND,
     tray_hwnd: HWND,
     view: Box<dyn View>,
-    app: Box<dyn App>,
+    pub(crate) app: Box<dyn App>,
     renderer: Renderer,
-    opts: HostOptions,
+    pub(crate) opts: HostOptions,
     visible: bool,
     appbar_on: bool,
     appbar: AppBar,
@@ -312,6 +430,16 @@ struct Host {
     /// The tray window is registered as a (zero-size) AppBar to receive `ABN_FULLSCREENAPP`
     /// even while the keyboard itself isn't an AppBar.
     notifier: bool,
+    /// Open app windows (settings, about, onboarding).
+    pub(crate) windows: Vec<AppWindow>,
+}
+
+/// Whose view a response came from: decides where repaint/timer go and which App method gets
+/// the actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Target {
+    Keyboard,
+    Window(WindowId),
 }
 
 thread_local! {
@@ -320,7 +448,7 @@ thread_local! {
 
 /// Runs `f` on the host state; `None` if there is no host or it is already borrowed (a message
 /// dispatched re-entrantly while a callback is running).
-fn with<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
+pub(crate) fn with<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
     HOST.with(|cell| {
         let mut guard = cell.try_borrow_mut().ok()?;
         guard.as_mut().map(f)
@@ -428,9 +556,11 @@ pub fn run_with(view: Box<dyn View>, app: Box<dyn App>, opts: HostOptions) -> Re
             None,
         )?;
         SetWindowLongPtrW(tray_hwnd, GWLP_USERDATA, hwnd.0 as isize);
+        KEYBOARD.store(hwnd.0 as isize, Ordering::Relaxed);
+        crate::canvas::set_image_dir(opts.image_dir.clone());
 
         let dpi = monitor_dpi(hwnd);
-        let renderer = Renderer::new(hwnd, opts.hardware_gpu)?;
+        let renderer = Renderer::new(hwnd, opts.hardware_gpu, true)?;
         let tray = opts.tray.then(|| Tray::new(tray_hwnd, WM_APP_TRAY, &opts.tray_tip, dpi));
         let handle = if opts.edge_handle { EdgeHandle::new(hwnd, opts.ball_pos.unwrap_or_default()).ok() } else { None };
         let start_visible = opts.start_visible;
@@ -458,6 +588,7 @@ pub fn run_with(view: Box<dyn View>, app: Box<dyn App>, opts: HostOptions) -> Re
                 fullscreen: false,
                 demoted: false,
                 notifier,
+                windows: Vec::new(),
             })
         });
 
@@ -501,24 +632,84 @@ impl Host {
         self.dpi as f32 / 96.0
     }
 
-    fn control(&self) -> HostControl {
+    pub(crate) fn control(&self) -> HostControl {
         HostControl {
             visible: self.visible,
             appbar: self.appbar_on,
             fullscreen: self.fullscreen,
             req: Requests::default(),
             proxy: HostProxy { hwnd: self.hwnd.0 as isize },
+            windows: self.windows.iter().map(|w| w.id).collect(),
         }
     }
 
-    /// Executes a response: actions go to the app (their responses are merged in turn), then
-    /// repaint and timer requests are honoured. Returns the app's host requests.
-    fn process(&mut self, mut ctl: HostControl, first: Response) -> Requests {
-        self.process_inner(&mut ctl, first);
+    /// Executes a keyboard view response: actions go to the app (their responses are merged in
+    /// turn), then repaint and timer requests are honoured. Returns the app's host requests.
+    fn process(&mut self, ctl: HostControl, first: Response) -> Requests {
+        self.process_for(ctl, Target::Keyboard, first)
+    }
+
+    /// [`Self::process`] for a response from `target`'s view, then the deferred view updates
+    /// ([`HostControl::update_keyboard`] / [`HostControl::update_window`]) and their responses.
+    pub(crate) fn process_for(&mut self, mut ctl: HostControl, target: Target, first: Response) -> Requests {
+        let mut work = VecDeque::from([(target, first)]);
+        let mut budget = 64;
+        while let Some((target, r)) = work.pop_front() {
+            match target {
+                Target::Keyboard => self.process_inner(&mut ctl, r),
+                Target::Window(id) => self.process_window(&mut ctl, id, r),
+            }
+            budget -= 1;
+            if budget == 0 {
+                break;
+            }
+            for f in std::mem::take(&mut ctl.req.keyboard_updates) {
+                work.push_back((Target::Keyboard, f(&mut *self.view)));
+            }
+            for (id, f) in std::mem::take(&mut ctl.req.window_updates) {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                    work.push_back((Target::Window(id), f(&mut *w.view)));
+                } else if let Some(p) = ctl.req.opens.iter_mut().find(|p| p.id == id) {
+                    // Not created yet: it gets resized and painted on creation anyway.
+                    let _ = f(&mut *p.view);
+                }
+            }
+        }
         if let Some(menu) = ctl.req.tray_menu.take() {
             self.tray_menu = menu;
         }
         ctl.req
+    }
+
+    fn process_window(&mut self, ctl: &mut HostControl, id: WindowId, first: Response) {
+        let mut repaint = first.repaint;
+        let mut timer = first.timer_ms;
+        let mut queue: VecDeque<UiAction> = first.actions.into();
+        let mut budget = 256;
+        while let Some(action) = queue.pop_front() {
+            budget -= 1;
+            let Some(w) = self.windows.iter_mut().find(|w| w.id == id) else { break };
+            if budget == 0 {
+                break;
+            }
+            let r = self.app.on_window_action(id, action, &mut *w.view, ctl);
+            repaint |= r.repaint;
+            if r.timer_ms.is_some() {
+                timer = r.timer_ms;
+            }
+            queue.extend(r.actions);
+        }
+        let Some(w) = self.windows.iter().find(|w| w.id == id) else { return };
+        if repaint {
+            window::invalidate(w.hwnd);
+        }
+        if let Some(ms) = timer {
+            window::set_timer(w.hwnd, ms);
+        }
+    }
+
+    fn window_hwnd(&self, id: WindowId) -> Option<HWND> {
+        self.windows.iter().find(|w| w.id == id).map(|w| w.hwnd)
     }
 
     fn process_inner(&mut self, ctl: &mut HostControl, first: Response) {
@@ -638,15 +829,48 @@ fn merge_requests(into: &mut Requests, r: Requests) {
     if r.ball_state.is_some() {
         into.ball_state = r.ball_state;
     }
+    into.opens.extend(r.opens);
+    into.closes.extend(r.closes);
+    into.titles.extend(r.titles);
+    into.dark.extend(r.dark);
+    into.focus.extend(r.focus);
+}
+
+/// Creates, closes and updates app windows (outside the borrow: these dispatch messages).
+fn apply_windows(req: &mut Requests) {
+    for p in std::mem::take(&mut req.opens) {
+        window::open(p);
+    }
+    for id in std::mem::take(&mut req.closes) {
+        if let Some(Some(hwnd)) = with(|h| h.window_hwnd(id)) {
+            window::close(hwnd);
+        }
+    }
+    for (id, title) in std::mem::take(&mut req.titles) {
+        if let Some(Some(hwnd)) = with(|h| h.window_hwnd(id)) {
+            window::set_title(hwnd, &title);
+        }
+    }
+    for (id, dark) in std::mem::take(&mut req.dark) {
+        if let Some(Some(hwnd)) = with(|h| h.window_hwnd(id)) {
+            window::set_dark(hwnd, dark);
+        }
+    }
+    for id in std::mem::take(&mut req.focus) {
+        if let Some(Some(hwnd)) = with(|h| h.window_hwnd(id)) {
+            window::focus(hwnd);
+        }
+    }
 }
 
 /// Applies host requests outside the state borrow. Visibility callbacks may produce more.
-fn apply(mut req: Requests) {
+pub(crate) fn apply(mut req: Requests) {
     for _ in 0..8 {
         if req.is_empty() {
             return;
         }
-        let next_req = std::mem::take(&mut req);
+        let mut next_req = std::mem::take(&mut req);
+        apply_windows(&mut next_req);
         if next_req.quit {
             if let Some(hwnd) = with(|h| h.hwnd) {
                 unsafe {
@@ -716,7 +940,10 @@ fn set_visible(visible: bool) -> Requests {
         }
         layout();
         unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_TRIM);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            // The device may have been released while hidden: paint (and create it) right away.
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
     } else {
         if let Some(r) = with(|h| {
@@ -731,6 +958,7 @@ fn set_visible(visible: bool) -> Requests {
         }
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
+            let _ = SetTimer(Some(hwnd), TIMER_TRIM, TRIM_AFTER_MS, None);
         }
         appbar_op(|ab, hwnd| ab.remove(hwnd));
         layout();
@@ -810,6 +1038,8 @@ fn sync_client_size(hwnd: HWND) {
 
 fn teardown() {
     let Some(mut host) = HOST.with(|cell| cell.try_borrow_mut().ok().and_then(|mut g| g.take())) else { return };
+    KEYBOARD.store(0, Ordering::Relaxed);
+    window::destroy_all(std::mem::take(&mut host.windows));
     host.appbar.remove(host.hwnd);
     if host.notifier {
         crate::appbar::remove_notifier(host.tray_hwnd);
@@ -846,6 +1076,7 @@ fn command(hwnd: HWND, cmd: usize) {
         CMD_REPAINT => unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
         },
+        CMD_REAP => window::reap(),
         _ => {}
     }
 }
@@ -911,6 +1142,15 @@ extern "system" fn keyboard_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 if let Some(req) = req {
                     apply(req);
                 }
+                LRESULT(0)
+            }
+            WM_TIMER if wp.0 == TIMER_TRIM => {
+                let _ = KillTimer(Some(hwnd), TIMER_TRIM);
+                with(|h| {
+                    if !h.visible {
+                        h.renderer.release();
+                    }
+                });
                 LRESULT(0)
             }
             WM_TIMER if wp.0 == TIMER_ID => {

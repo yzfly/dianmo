@@ -83,4 +83,11 @@ pub trait Canvas {
     fn measure_text(&mut self, text: &str, style: TextStyle) -> f32;
     fn push_clip(&mut self, rect: Rect);
     fn pop_clip(&mut self);
+    /// Draws a built-in image by name (e.g. "app-icon", "onboard-1"), scaled with high quality to
+    /// fit `rect` (aspect ratio kept, centred). The Windows host loads `<name>` as a PNG from the
+    /// exe's RCDATA resources, else from `res\<name>.png` next to the exe, and caches it. Unknown
+    /// names draw nothing. Canvases without images (tests) ignore it.
+    fn image(&mut self, name: &str, rect: Rect) {
+        let _ = (name, rect);
+    }
 }

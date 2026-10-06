@@ -116,7 +116,7 @@ impl KeyboardView {
     }
 
     /// Releases every pass-through key and modifier we hold down.
-    fn pc_release_all(&mut self, r: &mut Response) {
+    pub(crate) fn pc_release_all(&mut self, r: &mut Response) {
         let mut ups = Vec::new();
         self.touches.retain(|t| match (&t.target, &t.mode) {
             (Target::Key(Key { action: KeyAction::Raw(code), .. }), Mode::Press) => {

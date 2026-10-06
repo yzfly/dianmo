@@ -79,7 +79,7 @@ scripts/surface/package.sh <name> --uninstall   # 关掉、删快捷方式/开�
 - 控制台窗口（conhost）获得焦点时先后报 `Editable(Text Area)` 和 `NotEditable(Console Window)`，顺序不固定；新开的控制台第一次点击里面（焦点没变）不会弹键盘，靠的是「触摸抬起在上次可编辑元素里重发」，而上次是 `Console Window`。点墨提权后在管理员控制台里来回切换是好的，这一点属于 dianmo-win 焦点分类，普通控制台同样存在。
 - `scripts/surface/package.sh` 的导入表白名单是手写的，dianmo-win 以后新增系统 DLL 依赖时要加进去。
 
-## 语音模块（TODO #27 / #29，2026-10-06，`src/voice.rs`，还没接到 app.rs）
+## 语音模块（TODO #27 / #29，2026-10-06，`src/voice.rs`；已接入主程序，见下一节）
 按 `docs/research/voice.md` 实现：点墨模拟所选引擎的语音热键，看麦克风占用判断是否真的在收音，不行就退回 Win+H。
 
 **接口**（Windows-only，一个实例放在 UI 线程）：
@@ -132,3 +132,87 @@ engine-test 开自己的记事本（`-Medium` 用 explorer 以普通权限开）
 - 电脑键 `Ctrl+Win+←/→`：WeType 的按住说话是按住 Ctrl+Win，布局发这类组合键时建议先按 Win 再按 Ctrl（或保持一次 SendInput 发完），见 voice.rs 模块文档；未实测。
 - 测试副作用：用户剪贴板文字内容保持原样，但有几次是测试脚本用 `Set-Clipboard` 写回的文字，格式数从 4 变成 6（文字相同）。
 - Surface 上 `C:\dev\dianmo-voicebuild\target`（389MB）保留着 voice_probe.exe，供主会话复测；不需要时 `scripts/surface/clean.sh voicebuild`。
+
+## 语音 + 悬浮球接入主程序、发版前验证（TODO #29 / #30，2026-10-06）
+设计见 DESIGN.md「悬浮球」「语音模式 / 语音球」（已按实现更新）。
+
+**改动**
+- `settings.rs`：`voice_engine=wetype|doubao|system`（默认 wetype，其他值忽略）、可选 `voice_doubao_exe=`、`voice_mode=true|false`、`ball_edge=left|right` + `ball_y=<0–1>`（两个都有才生效）。
+- `app.rs`：
+  - `DianmoApp` 里放一个 `Voice`（`set_log(log::write)`、豆包 exe 来自设置）。`UiAction::Voice`（工具栏、电脑键盘细栏的麦克风键）和语音模式下的 `BallEvent::Tap` → `voice_toggle`：清掉未上屏组字 → `voice.toggle()` → `voice_sync`。修饰键由 dianmo-ui 在发 `UiAction::Voice` 之前松开（见下）。
+  - `voice_sync`：Starting/Listening → `set_ball_state(Listening)` + `KeyboardView::set_voice_active(true)`，其余 → Idle / false（只在变化时发）；新的 `Failed(msg)` 在键盘显示时 `show_toast(msg)`；`needs_poll()` 时在键盘窗口上 `SetTimer(0xD1A0, 300ms, TIMERPROC)`（单次：回调里 `KillTimer` 再 `HostProxy::post(VoiceTick)`，`on_event` 里 `poll()` 后需要就再装），不需要就不装，空闲 CPU 为 0。
+  - 回退到 Win+H 后 30 秒内再点一下 → 只再发一次 Win+H（关掉系统语音面板）并回到 Idle，不再去试微信输入法（实测：第一次点 → 1.5 秒后回退并打开「正在聆听」面板；第二次点 → 面板关闭）。
+  - 收起键盘（非语音模式）、换引擎时 `cancel()`；退出时如果还在收音也 `cancel()`（实测 WM_CLOSE 时 WeType 正在收音 → 麦克风随即释放）。
+  - 剪贴板：`voice_running()`（`needs_poll` 或 `is_active`）期间以及最后一次语音状态更新后 3 秒内，`ClipEvent::Text/NoText/Private` 一律忽略（日志 `clipboard change during voice input: not recorded`），所以引擎借剪贴板交付的结果、我们恢复用户剪贴板引起的变化都不进历史、不弹「已复制」、不改粘贴预览。代价：这段时间里用户自己的复制也不记录。
+  - `on_ball`：语音模式 Tap → 语音；其余 Tap / LongPress → `show()`；`Moved` → 存 `ball_edge/ball_y`。`main.rs` 把它们放进 `HostOptions::ball_pos`。
+  - 语音模式下 `FocusEvent::Editable{by_touch}` 不再 `show()`（数字框切数字面板等仍照常）。`UiAction::VoiceBall`（布局菜单「语音球」）/ 托盘「语音模式」打开时：存设置并收起键盘。
+  - 托盘：布局组下面加「语音引擎 ▸ 微信输入法 / 豆包语音 / 系统语音（Win+H）」（当前引擎打勾；不可用的写「（未安装）」或「（未运行）」）和「语音模式（悬浮球点一下说话）」。各引擎是否可用在后台线程里查（`Voice::why_unavailable`，启动时、换引擎后、每次会话结束后），结果 post 回来，托盘菜单不在 UI 线程上做进程快照。
+  - 日志：`voice toggle (<engine>) -> <state>`、`voice: <state>`；`memory (started / keyboard shown / librime started)` 记私有内存（`K32GetProcessMemoryInfo`，kernel32 导出，导入表不变）。
+  - 测试钩子：`DIANMO_NO=clipboard,ball,focus` 不启动对应部分（内存测量用）；`DIANMO_KEYMAP` 多导出 `voiceball`、`t9_1`…`t9_9`（九宫格按数字找键：宽屏九宫格右边有数字小键盘，`6` 是那里的键）。
+- `voice.rs`：只加了 `Voice::why_unavailable(e)`（任意线程可调）；`#![allow(dead_code)]` 留着（报告、指纹等只有 voice_probe 用）。
+- dianmo-ui（只为语音）：`UiAction::VoiceBall`；`KeyboardView::set_voice_active(bool) -> bool` / `voice_active()`（麦克风键画成红色圆底白话筒）；点麦克风键时先 `release_modifiers`（锁定的修饰键清零；电脑键盘里按着的键和修饰键发 `KeyUp`，排在 `UiAction::Voice` 前面）；布局菜单第 7 个磁贴「语音球」（MDL2 话筒图标）；`show_toast` 的时长按字数 1–4 秒（「已复制」仍 1 秒）；`key_center("t9_<n>")`。新测试 4 个（共 64 个）。
+- dianmo-win（为了内存，见下）：`Renderer::release()`；键盘隐藏 5 秒后（`TIMER_TRIM`，单次）释放 D3D/WARP 设备、交换链、D2D 上下文；显示时 `InvalidateRect`，第一次绘制时重建。没有改公开 API。
+- clippy：`collapsible_if` 的自动修复（dianmo-core 1 处、dianmo-ui 8 处、dianmo 3 处），`cargo clippy --workspace --all-targets`（Linux）和 `--target x86_64-pc-windows-gnullvm --examples --tests` 都干净。
+
+**内存回归的结论**（同样的 e2e 步骤 `n i h a o space`，私有内存，进程自己的 `PrivateUsage`）
+| 版本 | 私有内存 |
+|---|---|
+| `dist\elevate`（提权那轮，宽屏之前） | 27.4MB |
+| `dist\layout`（宽屏五行 + 电脑按键） | 31.9MB |
+| `dist\pcclip`（+ 电脑键盘、剪贴板、悬浮球、Raw Input） | 32.4MB |
+| 本轮 `final` | 32–35MB；跑过电脑键盘 + 剪贴板面板 + 触控板的长测试后 43MB |
+| 本轮，`DIANMO_ENGINE=basic`（不带 librime） | 25MB |
+| 本轮，`DIANMO_NO=clipboard,ball,focus` | 29.9MB |
+| 本轮，键盘收起 5 秒后 | **15.5MB**（显示时 34.7MB） |
+- 上一轮报的 33–42MB 主要是测量条件不同：那次是跑完一长串步骤（电脑键盘、剪贴板面板、触控板）之后量的。同样步骤下 pcclip 和宽屏那版都是 32MB 左右，宽屏那轮比之前多了约 4.5MB（更多按键文字、字号、图标字形的缓存），剪贴板 / 悬浮球 / Raw Input 这轮新增的部分合计不到 2MB。
+- 最大的一块是 **WARP 软件渲染**：`VirtualQueryEx` 看私有提交，最大的几块是 7–9MB（≈ 2880×703×4 = 7.9MB，正好是整宽键盘的一个表面）、5–8MB、4MB、2MB，打过字后合计 16–19MB；librime 约 10MB；焦点监听（UIA）、剪贴板监听线程、悬浮球各 1–2MB（单独关掉的差别在测量噪声里）。
+- 已做的低成本优化：键盘隐藏 5 秒后释放渲染设备（dianmo-win `TIMER_TRIM`）。实测隐藏后 34.7 → 15.5MB；再显示（点球）的 CPU 增量约 78ms（含点击处理和第一次绘制；不释放时约 20–30ms），100ms 后截图键盘完整，之后打字正常。键盘大部分时间是收起的（语音模式更是），这是收益最大的一步。显示期间的 16–19MB 是 WARP 必需的表面，要再降只能改用硬件 GPU（驱动反而多 47MB，见 dianmo-win 状态）或局部重绘 / 更小的表面，不在本轮做。
+
+**Surface 实测**（`package.sh final --keep-target` → `C:\dev\dianmo-dist\final\Dianmo`，exe 1029KB，导入表只有系统 DLL；测试副本 `--instance Test --no-elevate`；用户自己的点墨（旧版，边缘把手）一直在运行，没有动它）
+- 回归：全拼 `n i h a o space 2 0 2 6` → `你好2026`；全选 + 复制 → 剪贴板卡片栏，→ 粘贴 → `你好2026你好2026`；小鹤 `n i h c space` → 你好；九宫格 `t9_6 t9_4 t9_4 t9_2 t9_6`（截图：左列 ni/mi/m/n/o，候选你好）+ 空格 → 你好；电脑键盘直通 + Ctrl+A/C/V + 剪贴板卡片 + 选择模式 + 触控板选择删除（上一轮那串步骤）结果和上一轮一致。每次 WM_CLOSE 退出码 0，系统键盘设置、工作区、用户剪贴板文字都恢复；空闲 10 秒 CPU 0ms。
+  - 宽屏 26 键里输入中点数字行（`w o m e n 2`）是先上屏首选再打数字（`我们2`），不是选第 2 个候选：宽屏数字行设计如此（「数字直接上屏」），不是本轮的回归。
+- 语音（微信输入法，记事本用 explorer 以普通权限启动 = `MEDIUM`）：点麦克风键 → 热键后 300–320ms 麦克风占用（`wetype_update.exe` 的 `LastUsedTimeStop=0`）、麦克风键变红、WeType 的绿色语音条出现；再点 → finishing → 约 3 秒后 idle、麦克风释放。有一次 WeType 从环境声音里识别出「截图。」直接打进了测试记事本（WeType 是该窗口的输入法时由它自己上屏），说明整条链路是通的。
+  - 记事本以管理员权限运行时（gui 任务默认）WeType 收不到热键 → 1.5 秒后提示「微信输入法没有开始收音，已改用系统语音输入」（截图里键区中间的提示）并打开 Win+H 面板；再点一下 → Win+H 面板关掉。
+  - 托盘「语音引擎 ▸ 系统语音」→ `voice_engine=system`，点麦克风 → Win+H 面板「正在初始化…」，再点 → 关掉。
+  - 剪贴板：收音中用另一个进程写剪贴板（`CLIPSET`）→ 日志 `not recorded`，voice 也判定「不是 WeType 的，不动它」；结束 3 秒后再写 → 正常进历史，剪贴板栏只有后面那一张卡片。
+- 语音模式（`SET:voice_mode=true`）：收起键盘后点球 → 收音（球上粉色呼吸光圈，截图确认）；再点 → 结束；长按球 → 键盘出来；拖球向上 400px → `ball_edge=left; ball_y=0.2722`。`ball_edge=right, ball_y=0.3` 启动 → 球在右边缘，球心 y = 0.3 × 工作区高。语音模式下点记事本输入区 → 键盘不弹出（对照：非语音模式同样操作 → 弹出）。布局菜单「语音球」磁贴（截图）→ `voice_mode=true` 并收起键盘；托盘「语音模式」再关掉。
+- 图标：托盘溢出区里测试副本是新图标（渐变圆角方形 + 白色书法点），用户在跑的旧版是蓝底「墨」；悬浮球截图边缘平滑。点墨键盘窗口是 TOOLWINDOW，没有任务栏按钮；桌面快捷方式要等安装新版后才换图标。
+- 测完：没有留下弹窗、Win+H 面板或托盘溢出浮窗（最后截了一次整屏确认），WeType 麦克风已释放；用户的剪贴板文字每次都恢复。
+
+**`C:\dev\dianmo-dist\final\Dianmo` 可以直接安装**：`scripts/surface/package.sh final --install --no-build`（会用 WM_CLOSE 关掉用户正在运行的点墨再复制）。设置是向后兼容的（新键缺省：微信输入法、非语音模式、球在左边 62%）。
+
+**e2e 新步骤**（`tests/surface/e2e.ps1`）：`MEDIUM`（普通权限记事本）、`ENV:k=v`、`BALL` / `BALLTAP` / `BALLHOLD` / `BALLDRAG:dx:dy`、`MIC`、`INI`、`VMAP`（私有提交按分配列出）、`CPU`、`CLIPSET:<文字>`、`ESC`；`TRAYMENU[:<下>:<右>]` / `TRAYPICK<n>` / `TRAYPICK:<d r e 序列>` 改成给**测试副本自己的**托盘窗口发图标回调消息（以前按类名 `FindWindow('DianmoTray')`，可能找到用户的点墨）。九宫格键用 `t9_<n>`。
+
+**遗留**
+- 语音球形态（键盘收起）下引擎失败没有文字提示，只有系统语音面板；以后可以给球加气泡提示。
+- 语音进行中及之后 3 秒内，用户自己复制的内容不进历史（为了排除引擎的结果和恢复动作）。
+- 布局菜单里的磁贴切换不会触发 keymap 重写（键盘内部面板切换），自动测试点「语音球」磁贴用的是坐标。
+- 豆包语音这轮没在主程序里实测（托盘里可选、可用；voice 模块上一轮单独测过）。
+- 重新显示时重建 WARP 设备多花约 50ms CPU；如果用户觉得弹出变慢，可把 dianmo-win `host.rs` 的 `TRIM_AFTER_MS` 调大。
+
+## 热修：语音模式退出不了、提权后微信输入法语音失灵（2026-10-06 晚）
+用户报告：切到语音球后「退不出来，好多地方点不开」。日志：语音模式下反复「微信输入法没有开始收音，已改用系统语音输入」→「voice toggle after fallback: Win+H again」，每点一次球就开 / 关一次 Win+H 面板（TextInputHost 的全屏 CoreWindow），双击桌面图标也没让人找到出口。
+
+**根因实测（Surface，WeType 2.1.3.18，`wetype_update.exe` 为 MEDIUM）**，同一个 `LCtrl↓ LWin↓ LShift↓↑ LWin↑ LCtrl↑`：
+| 前台窗口 | 提权进程 SendInput | 普通权限进程 SendInput |
+|---|---|---|
+| 普通记事本（MEDIUM） | 283 ms 开始收音 | 收音 |
+| 管理员记事本（HIGH） | 2.5 s 无反应 | 2.5 s 无反应 |
+- 结论：「提权的点墨发热键微信输入法收不到」不成立（用户自己的日志 15:26:09 提权实例也是 302 ms 收音）；收不到只发生在**管理员窗口在前台**时，谁发都一样（UIPI 挡住了发往高完整性前台窗口的输入，MEDIUM 的 WeType 看不到）。管理员记事本里用 Win+Space 把输入法切换几轮（含 WeType）也一样。所以没做普通权限辅助进程（帮不上）。
+- 用户当时多半是在管理员 PowerShell 里说话（桌面上有一个「管理员: Windows PowerShell」窗口）。
+
+**修复**：
+- 语音模式随时能退出：长按球 / 托盘 / 再次启动都显示键盘（实测：语音模式下第二次启动 → 键盘显示；长按球 → 显示）；键盘候选条最前面加强调色「退出语音模式」（电脑键盘细栏居中也有），布局菜单磁贴变「退出语音球」（`UiAction::VoiceBall` 在 app 里改为切换）。`KeyboardView::set_voice_mode(bool)`，keymap 名 `exitvoice`。
+- 球可发现：进入语音模式（以及本次运行里语音模式下第一次出现球）时，球 10 秒不半隐（重设 dianmo-win 球窗口的 3 秒收边计时器，id 2，见 `bubble.rs::keep_ball_out`；dianmo-win 以后最好给一个正式接口），旁边弹 GDI 小气泡「点一下说话，长按展开键盘」（`src/bubble.rs`，不抢焦点，点一下或 10 秒后消失）。键盘收起时的语音失败原因也用这个气泡（5 秒）。
+- 不再回退 Win+H（用户要求，`voice.set_fallback(false)`）：失败只提示原因；去掉「回退后 30 秒内再点 = Win+H」的逻辑；`fallback=false` 时也不再「失败两次就跳过引擎」，每次都重试。
+- 发热键前看前台窗口完整性级别（`TokenIntegrityLevel`），高于引擎进程就立刻提示「微信输入法收不到管理员窗口里的语音快捷键（Windows 权限隔离），请在普通窗口里使用」，不等 1.5 秒、不计失败次数。
+- 新引擎 `VoiceEngine::DoubaoIme`（豆包输入法，`voice_engine=doubao_ime`，托盘「豆包输入法」；第三方小工具改名「豆包语音（第三方）」）：TIP `{9D2B2E2B-3C93-4D2F-9D35-6EEB85F0D2B0}`，进程 `C:\Program Files\DoubaoIME\versions\<ver>\ImeService.exe`（以 HIGH 运行，是它自己的设计），配置 `%APPDATA%\DoubaoIme\conf\config.json` 的 `voice.enableVoiceShortcut` / `enableGlobalVoiceShortcut` / `voiceShortcutMode`（安装后是 `right_alt_space`，即「免按模式」右 Alt+空格；长按模式 `voiceLongPressShortcutMode=right_alt`）。热键 `RAlt↓ Space↓ Space↑ RAlt↑`（RAlt 扩展键）。可用条件：已装、在输入法列表、ImeService 在运行、语音快捷键开着、模式是 `right_alt_space`、**全局语音快捷键开着**（否则目标窗口输入法不是它时 Alt+空格会弹系统菜单）。收音判定：consent store 里路径含 `#DoubaoIME#` 的项，或本次会话开始后目标进程本身的项。剪贴板兜底同 WeType（owner 为 `imeservice.exe`）。
+- 日志：`keyboard shown|hidden`、`auto-hide: touched outside a text field`、`voice mode hint (...)`。
+- e2e 新步骤：`FGADMIN` / `FGMED`、`BUBBLE`、`SECOND`、`SPEAK:<t>`、`TEXTKW:<kw>`；`MIC` 也列豆包输入法。
+
+**豆包输入法（官方）安装**：`https://shurufa.doubao.com/api/v1/app/download_url?platform=windows`（官网 shurufa.doubao.com/pc 的下载按钮用的接口）→ `lf-wave.doubaocdn.com/.../DoubaoIME_Installer_0.9.1.22_release.exe`，签名「北京春田知韵科技有限公司」（字节旗下，有效），Inno Setup，`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-` 静默装到 `C:\Program Files\DoubaoIME`，安装包在 `C:\dev\dianmo-voice\installers\`。安装程序把自己设成了默认输入法并排到列表第一：已改回（默认仍是微软拼音，列表顺序 WeType、微软拼音、81D4…，豆包排最后）。
+
+**实测（`C:\dev\dianmo-dist\hotfix\Dianmo`，从 gui 任务启动 = 提权，`elevated=true`）**：
+- 语音模式启动 → 键盘在、`exitvoice` → `voice_mode=false` 键盘留着；托盘「语音模式」→ 键盘收起、球完全露出（4.5 秒后仍未半隐）、气泡显示；语音模式下 `SECOND` → 键盘显示；收起后长按球 → 显示。空闲 10 秒 CPU 0 ms，WM_CLOSE 退出码 0，剪贴板恢复。
+- 豆包输入法（当前配置 `voiceShortcutMode=null`、全局快捷键关）→ 点球立刻在球旁气泡提示原因，不发任何热键。
+- **未通过 / 未测**：这一轮 WeType 在普通记事本前台时也不收音了（点墨发、PowerShell 提权发都不行；停掉豆包输入法的 ImeService 也不行），而同一台机器 1 小时前同样的测试是 283 ms 收音 → 判断是 WeType 的语音进程又进入了「热键失灵」状态（见上面「WeType 的语音进程会崩」一条；恢复办法是结束 WeType 三个进程后在普通窗口里重新激活 WeType），没有在用户正在用的机器上动它。管理员窗口分支（立即提示）的逻辑没在点墨里实测（测试脚本没能把管理员记事本切到前台），判断依据是上面的 PowerShell 矩阵。豆包输入法的热键：注入 `右 Alt+空格`（扩展键）和按住右 Alt 都没让它收音（当时它是记事本的当前输入法、配置为 right_alt_space、全局关；可能与没完成首次引导或与搜狗「AI汪仔」抢右 Alt 有关——测试时 AI汪仔 侧栏弹了出来，已关掉），所以豆包输入法引擎是按配置实现的、未实测通过。Edge 输入框、TTS 上屏没测成（WeType 不收音）。

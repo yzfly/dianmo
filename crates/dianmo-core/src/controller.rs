@@ -168,11 +168,10 @@ impl<E: Engine, S: TextSink> InputController<E, S> {
     }
 
     fn apply(&mut self, mut s: Snapshot) {
-        if let Some(text) = s.commit.take() {
-            if !text.is_empty() {
+        if let Some(text) = s.commit.take()
+            && !text.is_empty() {
                 self.sink.commit_text(&text);
             }
-        }
         self.state = s;
     }
 }

@@ -1,0 +1,7 @@
+// Resources linked into the dianmo-win examples by build.rs (llvm-windres from llvm-mingw):
+// the app icon (resource 1: tray, app window title bar and taskbar) and an RCDATA PNG for
+// `Canvas::image("app-icon")`. demo-strip.png is NOT embedded: window_demo loads it from
+// `HostOptions::image_dir` to cover the file path.
+#pragma code_page(65001)
+1 ICON "../../../dianmo/res/dianmo.ico"
+app-icon RCDATA "app-icon.png"

@@ -286,6 +286,8 @@ pub(crate) enum KeyAction {
     ClearComposition,
     Tab(SymTab),
     Voice,
+    /// Layout menu: voice mode (shrink into the voice ball).
+    VoiceBall,
     Hide,
     ExpandCandidates,
     CollapseCandidates,
@@ -1482,15 +1484,17 @@ pub(crate) fn build_candidate_grid(m: &Metrics) -> Built {
     Built { keys, column: None, grid: Some(grid) }
 }
 
-pub(crate) fn build_menu(m: &Metrics, current: Layout, dark: bool) -> Built {
+/// `voice_mode`: the 语音球 tile is selected and turns voice mode off (「退出语音球」).
+pub(crate) fn build_menu(m: &Metrics, current: Layout, dark: bool, voice_mode: bool) -> Built {
     let area = m.keys_area();
-    let tiles: [(KeyAction, &str, &str, bool); 6] = [
+    let tiles: [(KeyAction, &str, &str, bool); 7] = [
         (KeyAction::SetLayout(Layout::Pinyin), "拼", "全拼", current == Layout::Pinyin),
         (KeyAction::SetLayout(Layout::Shuangpin), "鹤", "小鹤双拼", current == Layout::Shuangpin),
         (KeyAction::SetLayout(Layout::T9), "九", "九宫格", current == Layout::T9),
         (KeyAction::SetLayout(Layout::English), "En", "English", current == Layout::English),
         (KeyAction::SetLayout(Layout::Pc), "PC", "电脑键盘", current == Layout::Pc),
         (KeyAction::ToggleTheme, if dark { "☀" } else { "☾" }, if dark { "浅色" } else { "深色" }, false),
+        (KeyAction::VoiceBall, icon::MIC, if voice_mode { "退出语音球" } else { "语音球" }, voice_mode),
     ];
     let n = tiles.len() as f32;
     let tile_w = (area.w / n).min(m.row_h * 2.6);
@@ -1501,6 +1505,7 @@ pub(crate) fn build_menu(m: &Metrics, current: Layout, dark: bool) -> Built {
     let mut keys = Vec::new();
     for (i, (action, glyph, caption, selected)) in tiles.into_iter().enumerate() {
         let mut k = Key::new(action, glyph, Tone::Tile);
+        k.icon = glyph == icon::MIC;
         k.sub = Some(caption.to_string());
         k.selected = selected;
         k.cell = Rect::new(x0 + i as f32 * tile_w, y, tile_w, h);

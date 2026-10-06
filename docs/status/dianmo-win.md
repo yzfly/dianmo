@@ -66,6 +66,48 @@
 - **测试脚本**：`touch.ps1` 新增 `[T]::FindOf(class, pid)`，`e2e.ps1`、`focus.ps1` 只找 demo 进程自己的窗口——Surface 上装好的点墨在运行时，旧脚本的 `FindWindow('DianmoKeyboard')` 会找到它（本轮因此误把 WM_CLOSE 发给了用户的点墨，已重新启动）。
 - **回归**：`run.sh`（e2e）通过：文本 `你好\n你好你好，`，私有内存 9.1MB，空闲 10 秒 CPU 0ms；`run-focus.sh notepad,explorer,edge,fullscreen,tray` 结果同第二轮（Edge #ro/#btn 那次被用户正在运行的点墨键盘挡住，没点到）。开焦点监听 + Raw Input 后闲置 8 秒 CPU 0ms，私有内存 3.8MB（键盘未显示）。
 
+## 收起后释放渲染资源（2026-10-06，主程序集成那轮）
+- 键盘隐藏 5 秒后（`TIMER_TRIM` = 2，单次，`TRIM_AFTER_MS`）`Renderer::release()` 丢掉 `Device`（D3D/WARP 设备、交换链、D2D 上下文、DComp 目标）；显示时 `KillTimer` + `InvalidateRect`，第一次绘制时照常 `Device::new`。实测私有内存 34.7 → 15.5MB，再显示多约 50ms CPU，画面正常。主程序的 `App::on_ball` / `set_ball_state` 已接上（见 dianmo 状态）。
+
+## 应用窗口（2026-10-06，TODO #33 / PRODUCT P3–P5，Surface 实测）
+给设置、关于、首次引导用的普通窗口（`window.rs`）。
+- **外观**：
+  - 普通顶层窗口，可激活，有任务栏按钮；标题栏和任务栏用 exe 图标资源 1（随 DPI 重新加载）。
+  - 系统标题栏，`WS_EX_NOREDIRECTIONBITMAP` + DirectComposition。第一帧画好再显示，不会闪白。
+  - 深色标题栏用 `DWMWA_USE_IMMERSIVE_DARK_MODE`：`WindowOptions::dark = None` 时跟随系统「应用模式」，收到 `ImmersiveColorSet` 就更新；也可以强制指定，或运行时调 `set_window_dark`。Win10 上属性改了以后，标题栏要等下一次重画才变色，所以改完会切一下 `WM_NCACTIVATE` 强制重画（这一步没有实测）。
+  - Win11 可以开 Mica（`DWMWA_SYSTEMBACKDROP_TYPE`，只作用于标题栏；Win10 上忽略）。
+- **位置和大小**：打开在最后一次指针所在的显示器上，在工作区里居中。工作区不含点墨键盘占用的 AppBar；窗口比工作区大时会缩到工作区大小。Per-Monitor-V2：`WM_DPICHANGED` 按系统建议的矩形移动；`min_width/min_height` 通过 `WM_GETMINMAXINFO` 生效。
+- **输入**：
+  - `WM_POINTER`（触摸、笔，以及 `EnableMouseInPointer` 之后的鼠标）→ `View::pointer`。
+  - 鼠标、笔悬停 → `View::hover`，离开窗口时传 (-1,-1)。
+  - `WM_POINTERWHEEL`/`WM_MOUSEWHEEL` → `View::wheel`，换算成 DIP：每格 = 系统滚动行数 × 20 DIP，默认 60；设成「一次一屏」时为窗口高度的 90%。
+  - 按键 → `View::key(vk, down)`，按键随后仍交给 DefWindowProc，所以 Alt+F4 照常可用。
+  - 关闭了长按右键和对应的视觉反馈，保留了触点反馈。触摸滚动的惯性由 View 自己做。
+- **运行方式**：按需重绘；每个窗口同一时间只有一个单次计时器；和键盘共用一个线程、一个消息循环。View 返回的 `UiAction` 交给 `App::on_window_action`。关窗（标题栏 ×、Alt+F4、`close_window`）时先丢弃 View 和渲染资源，再调 `App::on_window_closed`。
+- **GPU 设备**：`canvas.rs` 现在有一个可共享的 `Gpu`（D3D11、D2D 设备、DComp 设备）。键盘用共享的那份；应用窗口各用自己的一份，原因见下面的内存数据。丢弃渲染资源时会先断开 DComp 树并 Commit，再 `ClearResources`、`ClearState`、`Flush`，确保交换链的内存真正释放。
+- **`Canvas::image(name, rect)`**：
+  - 查找顺序：exe 的 RCDATA 资源（资源名就是 name，大小写不敏感）→ exe 旁边的 `res\<name>.png` → `HostOptions::image_dir`。
+  - 用 WIC 解码成 PBGRA，转成 D2D 位图，按窗口缓存；找不到也记下来，不重复查找。
+  - 绘制时保持宽高比、居中放进 rect，插值用 `HIGH_QUALITY_CUBIC`。
+  - 第一次用到图片时，UI 线程会执行 `CoInitializeEx(STA)`；如果已经初始化过（不论哪种模式）就沿用。
+- **实测**（`tests/surface/run-window.sh`，Surface 200%，注入触摸）：
+  - 在不抢焦点的键盘条上点「打开窗口」：窗口能拿到前台（`foreground=True`），DPI 192，客户区 1520×1066 px = 760×533 DIP（用户自己的点墨键盘占着 AppBar，所以高度被缩到工作区大小）。
+  - 手指快速上划 600px：拖动结束时 offset=275，惯性滚到 458–528 后停下。
+  - 点一行能切换开关（`tap Row(9)`）；慢速拖动不触发惯性。
+  - 鼠标悬停有高亮；滚轮 ±120 → `d=±60.0`；方向键和 PgDn 都能收到。
+  - 点「深色」后 `DWMWA_USE_IMMERSIVE_DARK_MODE` 读回 1。但截图里标题栏还是浅色，所以加了上面的 `WM_NCACTIVATE` 重画，加完没有再实测。
+  - 点「关闭」→ `view dropped` → `closed`。键盘条开、关 3 次，最后一次用 WM_CLOSE（相当于点 ×），都能正常关掉。
+  - 窗口开着空闲 5 秒，CPU 0ms；关掉后空闲 3 秒，CPU 0ms。
+  - 截图里文字清晰；app-icon（RCDATA）和 demo-strip（`image_dir`）两张图都按比例缩放显示正常。
+  - **内存**（私有字节，同一配置多次运行之间波动很大，±20MB）：
+    - 只开键盘条：5.5MB。
+    - 窗口共用设备：开着 24–30MB，关掉后 24–25MB，基本不回落，WARP 把释放的内存留在池里了。
+    - 窗口用自己的设备：开着 30–31MB，关掉后 20–21MB，所以现在默认用这种。
+    - 关窗后再隐藏键盘（键盘的设备也释放）：8.5–15MB。剩下的是 DirectWrite、WIC 和堆里留着的内存。
+    - 同一配置的另外几次运行里，窗口刚打开就有 43–52MB，原因没查清，可能是 WARP 的 JIT 或线程。
+    - 开、关多次后内存没有持续增长，看不出泄漏。
+- 演示里用的 PNG 由 `crates/dianmo/res/icon/*.svg` 用 cairosvg 生成，放在 `examples/res/`。`.gitignore` 加了这个目录的例外（全局忽略 `*.png`）。`build.rs` 用 llvm-windres 把 `examples/res/examples.rc`（图标资源 1 + `app-icon` RCDATA）链接进各个 example，所以 `demo.exe` 现在也有图标了。
+
 ## 未完成 / 已知问题
 - 没测：运行中改 DPI、多显示器、旋转屏幕、Explorer 重启（这些代码路径都已写好）。
 - 进程被强杀（TerminateProcess）时 AppBar 占的工作区不会释放，要等下一次有 AppBar 变化（比如再开一次点墨）才恢复。测试时请用 WM_CLOSE 关闭（e2e 脚本就是这样做的）。
@@ -77,12 +119,29 @@
 - 托盘图标现在被系统放进了「隐藏的图标」里（Shell_NotifyIconGetRect 拿不到位置），所以 e2e 里「点托盘图标」那一步被跳过；`run-focus.sh` 改为直接给托盘窗口发图标回调消息来打开菜单。
 - 托盘菜单里调用 SetForegroundWindow 会激活隐藏的托盘窗口（这是 Windows 的已知要求）；这时用户本来就已经离开了目标应用。
 - 测试时 demo 由提权的计划任务启动，所以 UIPI 限制（普通权限的键盘向管理员窗口输入）没有覆盖到。
+- 应用窗口：
+  - 深色标题栏的 `WM_NCACTIVATE` 重画、Mica（Win11）、运行中改 DPI、多显示器，都没有实测。
+  - 关窗后内存只回落约 10MB，见上面的数据。
+  - 应用窗口没有接 `WM_CHAR`，不能直接输入文字，以后要做搜索框得补上。
+  - 在 Surface 上跑测试时，注入的触摸如果落在用户焦点所在的控制台里，正在运行的点墨会把它当成「点了输入框」，然后弹出自己的键盘（另一个进程，不算 bug）。这时 demo 的键盘条会被挤上去，所以测试脚本每次点之前都会重新读取位置。
 
 ## 公开 API
 - `run(view: Box<dyn View>, app: Box<dyn App>) -> windows::core::Result<()>`；`run_with(view, app, HostOptions)`；`enable_per_monitor_dpi()`
-- `HostOptions { start_visible, appbar, tray, edge_handle /*悬浮球开关*/, tray_tip, max_height_fraction, hardware_gpu, tray_menu: Vec<TrayItem>, ball_pos: Option<BallPos> }`（实现了 Default）
+- `HostOptions { start_visible, appbar, tray, edge_handle /*悬浮球开关*/, tray_tip, max_height_fraction, hardware_gpu, tray_menu: Vec<TrayItem>, ball_pos: Option<BallPos>, image_dir: Option<PathBuf> }`（实现了 Default）
 - `trait App { on_start(..) /*默认空*/; on_action(&mut self, UiAction, &mut dyn View, &mut HostControl) -> Response; on_event(Box<dyn Any+Send>, ..) -> Response /*默认空*/; on_visibility_changed(bool, ..) /*默认空*/; on_tray_command(id: u32, ..) /*默认空*/; on_ball(BallEvent, ..) -> Response /*默认 Tap/LongPress → show()*/ }`
 - `HostControl`：`show / hide / toggle / is_visible / set_appbar / appbar_enabled / quit / proxy / set_tray_menu(Vec<TrayItem>) / fullscreen_app() / set_ball_state(BallState)`（请求在回调返回后才生效）
+- 应用窗口：
+  - `HostControl::open_window(Box<dyn View>, WindowOptions) -> WindowId`：id 立即可用，窗口在回调返回后创建。
+  - `close_window(id)`：在同一个回调里刚打开的窗口直接取消，不回调 `on_window_closed`。
+  - `window_open(id) -> bool`、`windows() -> &[WindowId]`、`focus_window(id)`（最小化时先还原）、`set_window_title(id, ..)`、`set_window_dark(id, Option<bool>)`。
+  - `update_keyboard(FnOnce(&mut dyn View) -> Response)`、`update_window(id, FnOnce(..))`：回调结束后在对应的 View 上执行，返回的 Response 按那个 View 的规则处理。窗口回调里要改键盘（比如换主题），或者托盘里要改已打开的设置页，都用这两个。
+- `WindowOptions { title, width, height, min_width, min_height /*客户区，DIP*/, resizable, icon /*exe 图标资源 1*/, dark: Option<bool> /*None=跟随系统*/, mica }`，实现了 Default（880×620，最小 480×360，可调整大小，有图标）。`WindowId` 实现了 Copy、Eq、Hash、Ord。`system_dark_mode() -> bool`。
+- `App` 新增两个方法，都有默认实现：
+  - `on_window_action(id, UiAction, view /*该窗口的 View*/, host) -> Response`
+  - `on_window_closed(id)`：用户关窗、`close_window` 或者窗口创建失败时都会调用，调用时 View 已经丢弃。
+- dianmo-ui 新增的方法，都有默认实现：
+  - `View::wheel(x, y, delta_y /*DIP，向下为正*/)`、`View::key(vk, down)`、`View::hover(x, y)`，只有应用窗口会调用。
+  - `Canvas::image(name, rect)`。
 - 悬浮球：`BallEvent::{Tap, LongPress, Moved(BallPos)}`、`BallPos { edge: BallEdge, y_frac: f32 }`（实现了 Default）、`BallEdge::{Left, Right}`、`BallState::{Idle, Listening}`（在 `handle.rs`；需要 `lib.rs` 加 `pub use handle::{BallEdge, BallEvent, BallPos, BallState};`）
 - `TrayItem::{Command { id: u32, label: String, checked: bool }, Separator, Submenu { label: String, items: Vec<TrayItem> }}`
 - `focus::{start_focus_watcher(HostProxy) -> Result<FocusWatcher>, FocusWatcher /*Drop 即停止*/, FocusEvent::{Editable { kind, by_touch }, NotEditable { by_touch }}, FieldKind::{Text, Number, Password, Url, Search}, TOUCH_WINDOW_MS}`；第一条事件永远是当前焦点（by_touch=false）。App 在 `on_event` 里 `event.downcast::<FocusEvent>()`。
@@ -92,6 +151,7 @@
 
 ## 运行
 - 构建：`scripts/surface/build.sh win build --release -p dianmo-win --example demo`
+- 应用窗口演示：`scripts/surface/build.sh appwin build --release -p dianmo-win --example window_demo`，参数 `window_demo.exe [--open] [--dark]`。测试脚本 `crates/dianmo-win/tests/surface/run-window.sh`，约 30 秒，会在用户屏幕上弹出窗口，**用户在用 Surface 时不要跑**。
 - demo 参数：`demo.exe [--no-appbar] [--hidden] [--no-tray] [--no-handle] [--focus] [--auto] [--tray-menu] [--voice-ball] [--ball-right]`（`--voice-ball`：点球切换 Listening 光圈，长按呼出键盘；`--ball-right`：球从右边缘 85% 高度开始）（`--focus` 启动焦点监听并记录事件；`--auto` 再按 by_touch 自动显示/收起；`--tray-menu` 加自定义托盘菜单）；设置 `DIANMO_DEMO_LOG=<文件>` 会记录触点、焦点事件、托盘命令和显示状态，`DIANMO_FOCUS_LOG=<文件>` 记录焦点事件的原始 UIA 属性。
 - 端到端测试：`crates/dianmo-win/tests/surface/run.sh`。脚本会启动记事本和 demo，注入触摸并截图，最后用 WM_CLOSE 关掉 demo、强杀记事本（不保存）。
 - 焦点 / 托盘 / 全屏测试：`crates/dianmo-win/tests/surface/run-focus.sh [notepad,explorer,edge,vscode,search,fullscreen,tray]`（默认全部，约 80 秒）。会打开记事本、资源管理器窗口、独立配置目录的 Edge 和 VS Code、任务栏搜索，测完全部关掉并删掉临时配置目录；期间把 `EnableDesktopModeAutoInvoke` 设为 0，结束时恢复原值。

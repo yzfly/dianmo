@@ -59,6 +59,9 @@ impl Default for KeyboardConfig {
     }
 }
 
+/// The bar button that turns voice mode off.
+pub(crate) const EXIT_VOICE_LABEL: &str = "退出语音模式";
+
 /// What occupies the area under the candidate bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Panel {
@@ -211,6 +214,11 @@ pub struct KeyboardView {
     pub(crate) clip_menu: Option<u64>,
     /// A short message (「已复制」) and when it goes away.
     pub(crate) toast: Option<(String, u64)>,
+    /// Voice input is running: the microphone keys show it (red).
+    pub(crate) voice_active: bool,
+    /// Voice mode (the floating ball is the voice button): the bar offers 「退出语音模式」 and the
+    /// layout menu's 语音球 tile turns it off.
+    pub(crate) voice_mode: bool,
 }
 
 impl Default for KeyboardView {
@@ -263,6 +271,8 @@ impl KeyboardView {
             clip_scroll: Scroller::default(),
             clip_menu: None,
             toast: None,
+            voice_active: false,
+            voice_mode: false,
         };
         v.rebuild();
         v
@@ -334,9 +344,62 @@ impl KeyboardView {
     /// Centre of a visible key, for automated GUI tests. `name` is a key label ("a", "，",
     /// "符号", "123", "F5") or one of the names below (`clip0`, `clip1` … are clipboard cards in
     /// the bar, or in the clipboard panel when it is open).
+    /// Voice input is running (the host's voice engine is starting or listening): the microphone
+    /// keys turn red. Returns true if it changed (repaint).
+    pub fn set_voice_active(&mut self, on: bool) -> bool {
+        if self.voice_active == on {
+            return false;
+        }
+        self.voice_active = on;
+        true
+    }
+
+    pub fn voice_active(&self) -> bool {
+        self.voice_active
+    }
+
+    /// Voice mode is on: the idle bar shows a prominent 「退出语音模式」 button and the layout
+    /// menu's 语音球 tile reads 「退出语音球」 (both send [`UiAction::VoiceBall`], which the host
+    /// treats as a toggle). Returns true if it changed (repaint).
+    pub fn set_voice_mode(&mut self, on: bool) -> bool {
+        if self.voice_mode == on {
+            return false;
+        }
+        self.voice_mode = on;
+        self.rebuild();
+        true
+    }
+
+    pub fn voice_mode(&self) -> bool {
+        self.voice_mode
+    }
+
+    /// Turns every latched modifier off; on the 电脑键盘 also sends up the keys and modifiers we
+    /// hold down (actions go into `r`).
+    pub(crate) fn release_modifiers(&mut self, r: &mut Response) {
+        if self.pc {
+            self.pc_release_all(r);
+        }
+        if self.latch.iter().any(|l| *l != Latch::Off) {
+            self.latch = [Latch::Off; 5];
+            self.rebuild();
+            r.repaint = true;
+        }
+    }
+
     pub fn key_center(&self, name: &str) -> Option<(f32, f32)> {
         if let Some(i) = name.strip_prefix("clip").and_then(|n| n.parse::<usize>().ok()) {
             return self.clip_card_center(i);
+        }
+        if let Some(d) = name.strip_prefix("t9_").and_then(|n| n.parse::<u8>().ok()).filter(|d| (1..=9).contains(d)) {
+            // 九宫格 keys by digit (their faces show letters; "6" is the digit pad's key).
+            let digit = char::from(b'0' + d);
+            let center = |k: &Key| (k.cell.x + k.cell.w / 2.0, k.cell.y + k.cell.h / 2.0);
+            return self
+                .keys
+                .iter()
+                .find(|k| k.top.as_deref() == Some(&digit.to_string()) && matches!(k.action, KeyAction::Char(_) | KeyAction::T9One))
+                .map(center);
         }
         let edit = |e: EditKey| move |k: &Key| k.action == KeyAction::Edit(e) || k.action == KeyAction::Raw(KeyCode::Edit(e));
         let chord = |c: KeyChord| move |k: &Key| k.action == KeyAction::Chord(c);
@@ -377,6 +440,8 @@ impl KeyboardView {
             "toggle" => k.action == KeyAction::ToggleChinese,
             "expand" => k.action == KeyAction::ExpandCandidates,
             "voice" => k.action == KeyAction::Voice,
+            "voiceball" => k.action == KeyAction::VoiceBall && k.tone == Tone::Tile,
+            "exitvoice" => k.action == KeyAction::VoiceBall && k.label == EXIT_VOICE_LABEL,
             "hide" => k.action == KeyAction::Hide,
             "symbols" => k.action == KeyAction::Symbols,
             "numbers" => k.action == KeyAction::Numbers,
@@ -506,7 +571,7 @@ impl KeyboardView {
             Panel::Numbers => layout::build_numbers(&self.m, &ctx),
             Panel::Symbols(tab) => layout::build_symbols(&self.m, tab),
             Panel::Candidates => layout::build_candidate_grid(&self.m),
-            Panel::Menu => layout::build_menu(&self.m, ctx.layout, self.theme_kind == ThemeKind::Dark),
+            Panel::Menu => layout::build_menu(&self.m, ctx.layout, self.theme_kind == ThemeKind::Dark, self.voice_mode),
             Panel::PcKeys => layout::build_pc_keys(&self.m, &ctx),
             Panel::Clipboard => layout::build_clipboard_panel(&self.m),
         };
@@ -539,7 +604,15 @@ impl KeyboardView {
         let cw = self.chevron_w();
         let right = Rect::new(m.w - cw - m.pad_x, 0.0, cw, m.bar_h);
         if self.pc {
-            return self.build_pc_bar(right);
+            let mut keys = self.build_pc_bar(right);
+            if self.voice_mode {
+                // Between 返回 and the mic key.
+                let w = self.exit_voice_w();
+                let mut k = self.exit_voice_key();
+                k.cell = Rect::new((m.w - w) / 2.0, 0.0, w, m.bar_h);
+                keys.push(k);
+            }
+            return keys;
         }
         if self.panel == Panel::Candidates {
             let mut k = Key::icon(KeyAction::CollapseCandidates, layout::icon::CHEVRON_UP, Tone::Flat);
@@ -602,13 +675,26 @@ impl KeyboardView {
         }
         let mut keys = Vec::new();
         let mut x = m.pad_x + 6.0 * m.s;
+        if self.voice_mode {
+            // Voice mode: the way back to the keyboard comes first and stands out; edit tools
+            // that no longer fit are dropped (the wide edit area still has them).
+            let w = self.exit_voice_w();
+            let room = right.x - m.pad_x - apps_w - 16.0 * m.s - w;
+            while !tools.is_empty() && tools.iter().map(|(w, _)| w).sum::<f32>() > room {
+                tools.pop();
+            }
+            let mut k = self.exit_voice_key();
+            k.cell = Rect::new(x, 0.0, w, m.bar_h);
+            x += w + 8.0 * m.s;
+            keys.push(k);
+        }
         for (w, mut k) in tools.iter().cloned() {
             k.cell = Rect::new(x, 0.0, w, m.bar_h);
             x += w;
             keys.push(k);
         }
         // Apps go right-aligned before the hide chevron when there are tools, else left.
-        let mut ax = if tools.is_empty() { m.pad_x + 6.0 * m.s } else { right.x - apps_w };
+        let mut ax = if tools.is_empty() && !self.voice_mode { m.pad_x + 6.0 * m.s } else { right.x - apps_w };
         for mut k in apps {
             let w = app_w(&k);
             k.cell = Rect::new(ax, 0.0, w, m.bar_h);
@@ -619,6 +705,15 @@ impl KeyboardView {
         hide.cell = right;
         keys.push(hide);
         keys
+    }
+
+    /// 「退出语音模式」: an accent pill in the bar (voice mode only).
+    fn exit_voice_key(&self) -> Key {
+        Key::new(KeyAction::VoiceBall, EXIT_VOICE_LABEL, Tone::Accent)
+    }
+
+    fn exit_voice_w(&self) -> f32 {
+        self.m.bar_h * 3.6
     }
 
     pub(crate) fn chevron_w(&self) -> f32 {
@@ -812,13 +907,12 @@ impl KeyboardView {
                 None => Target::CloseMenu,
             };
         }
-        if let Some((rect, _)) = self.column {
-            if rect.contains(x, y) {
+        if let Some((rect, _)) = self.column
+            && rect.contains(x, y) {
                 return Target::Column(self.column_item_at(y));
             }
-        }
-        if let Some(grid) = self.grid {
-            if grid.contains(x, y) {
+        if let Some(grid) = self.grid
+            && grid.contains(x, y) {
                 return match self.panel {
                     Panel::Candidates => {
                         self.ensure_cand_layout_estimated();
@@ -827,7 +921,6 @@ impl KeyboardView {
                     _ => Target::SymGrid(self.sym_item_at(x, y)),
                 };
             }
-        }
         self.nearest_key(x, y).map(|k| Target::Key(k.clone())).unwrap_or(Target::None)
     }
 
@@ -863,13 +956,12 @@ impl KeyboardView {
         if matches!(&target, Target::Key(k) if k.bubble) {
             let mut held = Vec::new();
             for t in &mut self.touches {
-                if let (false, Mode::Press, Target::Key(k)) = (t.consumed, &t.mode, &t.target) {
-                    if k.bubble {
+                if let (false, Mode::Press, Target::Key(k)) = (t.consumed, &t.mode, &t.target)
+                    && k.bubble {
                         t.consumed = true;
                         t.long_at = None;
                         held.push(k.clone());
                     }
-                }
             }
             for k in held {
                 self.tap_key(&k, r);
@@ -1043,11 +1135,10 @@ impl KeyboardView {
                 let horizontal = horizontal(&t.target);
                 t.vel.push(if horizontal { e.x } else { e.y }, e.time_ms);
                 let d = if horizontal { dx } else { dy };
-                if let Some(s) = self.scroller_mut(&t.target) {
-                    if s.drag_to(d) {
+                if let Some(s) = self.scroller_mut(&t.target)
+                    && s.drag_to(d) {
                         r.repaint = true;
                     }
-                }
                 self.maybe_request_more(r);
             }
             _ => {}
@@ -1119,11 +1210,10 @@ impl KeyboardView {
                 }
             }
             (Mode::Press, Target::SymGrid(Some(idx))) if !t.stopped_fling => {
-                if let Panel::Symbols(tab) = self.panel {
-                    if let Some(s) = layout::symbols(tab).get(idx) {
+                if let Panel::Symbols(tab) = self.panel
+                    && let Some(s) = layout::symbols(tab).get(idx) {
                         r.actions.push(UiAction::Input(Action::Text(s.to_string())));
                     }
-                }
             }
             (Mode::Press, Target::ClipCard(Some(idx))) if !t.stopped_fling => {
                 if let Some(c) = self.clips.get(idx) {
@@ -1131,12 +1221,11 @@ impl KeyboardView {
                 }
             }
             (Mode::Press, Target::ClipGrid(Some(pos))) if !t.stopped_fling => {
-                if self.clip_menu.take().is_none() {
-                    if let Some(c) = self.clip_panel_order().get(pos).and_then(|&i| self.clips.get(i)) {
+                if self.clip_menu.take().is_none()
+                    && let Some(c) = self.clip_panel_order().get(pos).and_then(|&i| self.clips.get(i)) {
                         r.actions.push(UiAction::Paste(c.text.clone()));
                         self.set_panel(Panel::Keys);
                     }
-                }
             }
             (Mode::Press, Target::ClipGrid(None)) => self.clip_menu = None,
             (Mode::Press, Target::ClipBtn { id, delete }) => {
@@ -1326,7 +1415,16 @@ impl KeyboardView {
             KeyAction::Back | KeyAction::CollapseCandidates => self.set_panel(Panel::Keys),
             KeyAction::ClearComposition => input(r, Action::ClearComposition),
             KeyAction::Tab(tab) => self.set_panel(Panel::Symbols(*tab)),
-            KeyAction::Voice => r.actions.push(UiAction::Voice),
+            KeyAction::Voice => {
+                // The engine's hotkey must not combine with our modifiers (电脑键盘: really down).
+                self.release_modifiers(r);
+                r.actions.push(UiAction::Voice);
+            }
+            KeyAction::VoiceBall => {
+                self.release_modifiers(r);
+                self.set_panel(Panel::Keys);
+                r.actions.push(UiAction::VoiceBall);
+            }
             KeyAction::Hide => r.actions.push(UiAction::Hide),
             KeyAction::ExpandCandidates => {
                 self.set_panel(Panel::Candidates);
@@ -1435,11 +1533,10 @@ impl KeyboardView {
 
     fn maybe_request_more(&mut self, r: &mut Response) {
         if self.panel == Panel::Candidates {
-            if let Some(g) = self.grid {
-                if self.grid_scroll.offset >= self.grid_scroll.max - g.h * 0.5 {
+            if let Some(g) = self.grid
+                && self.grid_scroll.offset >= self.grid_scroll.max - g.h * 0.5 {
                     self.request_more(r);
                 }
-            }
         } else if self.composing() && self.strip.offset >= self.strip.max - self.strip_rect().w * 0.5 {
             self.request_more(r);
         }

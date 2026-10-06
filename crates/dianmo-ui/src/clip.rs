@@ -79,11 +79,10 @@ impl KeyboardView {
             return false;
         }
         self.clips = clips;
-        if let Some(id) = self.clip_menu {
-            if !self.clips.iter().any(|c| c.id == id) {
+        if let Some(id) = self.clip_menu
+            && !self.clips.iter().any(|c| c.id == id) {
                 self.clip_menu = None;
             }
-        }
         self.rebuild();
         true
     }
@@ -116,11 +115,12 @@ impl KeyboardView {
         self.show_toast("已复制", now_ms)
     }
 
-    /// Shows a short message over the keys for [`TOAST_MS`] (a one-shot timer, no
-    /// polling).
+    /// Shows a short message over the keys (a one-shot timer, no polling): [`TOAST_MS`] for a
+    /// few characters, longer messages (a voice engine that could not start) up to 4 s.
     pub fn show_toast(&mut self, text: &str, now_ms: u64) -> Response {
         self.now = self.now.max(now_ms);
-        self.toast = Some((text.to_owned(), now_ms + TOAST_MS));
+        let ms = (600 + 130 * text.chars().count() as u64).clamp(TOAST_MS, 4000);
+        self.toast = Some((text.to_owned(), now_ms + ms));
         self.finish(Response::repaint())
     }
 

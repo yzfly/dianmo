@@ -34,8 +34,11 @@ pub struct PointerEvent {
 pub enum UiAction {
     /// Feed to the input controller.
     Input(Action),
-    /// Start Windows voice typing (Win+H).
+    /// The microphone key: start or stop voice input (the host's voice engine). Modifiers latched
+    /// on the keyboard were already released (and, on the 电脑键盘, keys held down sent up).
     Voice,
+    /// 「语音球」: switch to voice mode and shrink the keyboard into the floating voice ball.
+    VoiceBall,
     /// Hide the keyboard.
     Hide,
     /// The user expanded the candidate list: host fetches more via `Engine::candidates`
@@ -112,5 +115,26 @@ pub trait View {
     /// from a tray command). Views that don't need it keep the default.
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         None
+    }
+    /// Mouse wheel / touchpad scroll at (`x`, `y`) (DIPs, window coordinates). `delta_y` is in
+    /// DIPs, positive = scroll down (content moves up). Touch scrolling arrives as pointer drags
+    /// instead (the view does its own momentum). Used by app windows (settings); the keyboard
+    /// window never calls it.
+    fn wheel(&mut self, x: f32, y: f32, delta_y: f32) -> Response {
+        let _ = (x, y, delta_y);
+        Response::none()
+    }
+    /// A key went down or up while the view's window has keyboard focus (app windows only; the
+    /// keyboard window is never focused). `vk` is the Windows virtual-key code (Esc = 0x1B,
+    /// Tab = 0x09, Enter = 0x0D, arrows = 0x25..=0x28); auto-repeat sends more downs.
+    fn key(&mut self, vk: u32, down: bool) -> Response {
+        let _ = (vk, down);
+        Response::none()
+    }
+    /// The mouse (or a hovering pen) moved over the view without pressing (app windows only).
+    /// (-1, -1) when it leaves the window. Touch never hovers, so nothing may depend on it.
+    fn hover(&mut self, x: f32, y: f32) -> Response {
+        let _ = (x, y);
+        Response::none()
     }
 }

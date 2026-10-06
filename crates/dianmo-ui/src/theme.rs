@@ -94,3 +94,115 @@ impl Theme {
         }
     }
 }
+
+/// Colours of the settings window, the about page and onboarding (`crate::settings`).
+///
+/// Neutral greys and semantic colours follow ByteDance's Arco Design tokens (the design language
+/// of 飞书 / 豆包 desktop); the brand blue is the one used by the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SettingsTheme {
+    pub kind: ThemeKind,
+    /// Content area background (behind the cards).
+    pub background: Color,
+    /// Left navigation / top tabs background.
+    pub sidebar: Color,
+    /// Group cards.
+    pub card: Color,
+    pub card_border: Color,
+    pub divider: Color,
+    /// Titles and body text.
+    pub text: Color,
+    /// Descriptions, group titles.
+    pub text_secondary: Color,
+    /// Captions, disabled text, chevrons.
+    pub text_faint: Color,
+    pub accent: Color,
+    pub accent_pressed: Color,
+    /// Selected nav item, info badges.
+    pub accent_soft: Color,
+    pub on_accent: Color,
+    /// Pressed / hovered overlay on flat items.
+    pub pressed: Color,
+    pub hover: Color,
+    /// Segmented control track, secondary buttons, switch track when off.
+    pub fill: Color,
+    pub fill_strong: Color,
+    pub switch_off: Color,
+    /// Thumb of switches and sliders.
+    pub knob: Color,
+    pub shadow: Color,
+    pub success: Color,
+    pub warning: Color,
+    pub danger: Color,
+    pub danger_soft: Color,
+    pub warning_soft: Color,
+}
+
+impl SettingsTheme {
+    pub fn of(kind: ThemeKind) -> Self {
+        match kind {
+            ThemeKind::Light => Self::light(),
+            ThemeKind::Dark => Self::dark(),
+        }
+    }
+
+    pub fn light() -> Self {
+        Self {
+            kind: ThemeKind::Light,
+            background: Color::rgb(245, 246, 248),
+            sidebar: Color::rgb(238, 240, 243),
+            card: Color::rgb(255, 255, 255),
+            card_border: Color::rgb(229, 230, 235).with_alpha(0.7),
+            divider: Color::rgb(229, 230, 235),
+            text: Color::rgb(29, 33, 41),
+            text_secondary: Color::rgb(78, 89, 105),
+            text_faint: Color::rgb(134, 144, 156),
+            accent: Color::rgb(59, 108, 246),
+            accent_pressed: Color::rgb(40, 86, 214),
+            accent_soft: Color::rgb(232, 239, 254),
+            on_accent: Color::rgb(255, 255, 255),
+            pressed: Color::rgb(29, 33, 41).with_alpha(0.07),
+            hover: Color::rgb(29, 33, 41).with_alpha(0.04),
+            fill: Color::rgb(242, 243, 245),
+            fill_strong: Color::rgb(229, 230, 235),
+            switch_off: Color::rgb(201, 205, 212),
+            knob: Color::rgb(255, 255, 255),
+            shadow: Color::rgb(29, 33, 41).with_alpha(0.10),
+            success: Color::rgb(0, 180, 42),
+            warning: Color::rgb(255, 125, 0),
+            danger: Color::rgb(245, 63, 63),
+            danger_soft: Color::rgb(255, 236, 232),
+            warning_soft: Color::rgb(255, 247, 232),
+        }
+    }
+
+    pub fn dark() -> Self {
+        Self {
+            kind: ThemeKind::Dark,
+            background: Color::rgb(23, 23, 26),
+            sidebar: Color::rgb(30, 30, 33),
+            card: Color::rgb(36, 36, 40),
+            card_border: Color::rgb(255, 255, 255).with_alpha(0.06),
+            divider: Color::rgb(255, 255, 255).with_alpha(0.08),
+            text: Color::rgb(255, 255, 255).with_alpha(0.90),
+            text_secondary: Color::rgb(255, 255, 255).with_alpha(0.65),
+            text_faint: Color::rgb(255, 255, 255).with_alpha(0.42),
+            accent: Color::rgb(82, 132, 255),
+            accent_pressed: Color::rgb(64, 112, 230),
+            accent_soft: Color::rgb(82, 132, 255).with_alpha(0.18),
+            on_accent: Color::rgb(255, 255, 255),
+            pressed: Color::rgb(255, 255, 255).with_alpha(0.10),
+            hover: Color::rgb(255, 255, 255).with_alpha(0.05),
+            fill: Color::rgb(255, 255, 255).with_alpha(0.08),
+            fill_strong: Color::rgb(255, 255, 255).with_alpha(0.14),
+            switch_off: Color::rgb(255, 255, 255).with_alpha(0.22),
+            knob: Color::rgb(255, 255, 255),
+            shadow: Color::rgb(0, 0, 0).with_alpha(0.35),
+            success: Color::rgb(39, 195, 70),
+            warning: Color::rgb(255, 150, 38),
+            danger: Color::rgb(247, 105, 101),
+            danger_soft: Color::rgb(247, 105, 101).with_alpha(0.16),
+            warning_soft: Color::rgb(255, 150, 38).with_alpha(0.14),
+        }
+    }
+}

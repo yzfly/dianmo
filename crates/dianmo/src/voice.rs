@@ -6,6 +6,7 @@
 //! | engine | start / stop (same chord, one `SendInput`) | listening = | result |
 //! |---|---|---|---|
 //! | [`VoiceEngine::WeType`] 微信输入法 | `LCtrl↓ LWin↓ LShift↓ LShift↑ LWin↑ LCtrl↑` | mic in use by `…#WeType#<ver>#wetype_update.exe` | typed by WeType when it is the target window's IME; otherwise WeType copies it to the clipboard and **点墨 types it** (clipboard fallback below) |
+//! | [`VoiceEngine::DoubaoIme`] 豆包输入法 (ByteDance, official) | `voice.voiceShortcutMode` from `%APPDATA%\DoubaoIme\conf\config.json`: `right_alt_space` (default) = `RAlt↓ Space↓ Space↑ RAlt↑` | mic in use by `…#DoubaoIME#…#ImeService.exe` (or the target app) | typed by 豆包输入法; clipboard fallback like WeType (unverified, see below) |
 //! | [`VoiceEngine::DoubaoVoice`] 豆包语音小工具 (third-party, not the 豆包输入法) | `HotKey` from `%APPDATA%\DouBaoVoice\config.json` (F6) | mic in use by `…#DouBaoVoice*.exe` | typed by the tool itself |
 //! | [`VoiceEngine::System`] | `LWin↓ H↓ H↑ LWin↑` (Win+H) | not tracked | typed by Windows |
 //!
@@ -14,10 +15,19 @@
 //! app holds the microphone (Win10 1903+).
 //!
 //! If the selected engine is not available, or it does not start listening within 1.5 s after
-//! the hotkey (3 s while its voice window is already visible), [`Voice`] falls back to Win+H and
-//! reports [`VoiceState::Failed`] with the reason (to show on the voice ball). After two failures
-//! in a row the engine is skipped (straight to Win+H) until [`Voice::set_engine`] is called again.
-//! [`Voice::set_fallback`]`(false)` reports the failure without starting Win+H.
+//! the hotkey (3 s while its voice window is already visible), [`Voice`] reports
+//! [`VoiceState::Failed`] with the reason. With [`Voice::set_fallback`]`(true)` (the default; 点墨
+//! turns it off since 2026-10-06: the user doesn't want Windows voice typing) it also starts
+//! Win+H, and after two failures in a row skips the engine (straight to Win+H) until
+//! [`Voice::set_engine`].
+//!
+//! **Elevated windows.** The engines run un-elevated. While an elevated (administrator) window is
+//! in the foreground, Windows (UIPI) keeps the injected hotkey from them — whoever injects it:
+//! tested 2026-10-06 on the Surface with WeType 2.1.3.18 (`wetype_update.exe` at medium
+//! integrity): elevated or un-elevated `SendInput` with a normal Notepad in front → listening
+//! after ~0.3 s; with an administrator Notepad in front → nothing from either. So [`Voice::start`]
+//! checks the foreground window first and fails at once ("管理员窗口…") instead of waiting 1.5 s,
+//! and an un-elevated helper process would not help (not built).
 //!
 //! **Clipboard fallback (WeType).** [`Voice::start`] records `GetClipboardSequenceNumber` and a
 //! copy of the clipboard (all memory-based formats, up to 32 MB; GDI-handle formats such as
@@ -57,7 +67,7 @@
 //!   leaves the clipboard replaced (tested 2026-10-06), so [`Voice`] saves the clipboard at
 //!   `start` too and puts it back 1 s after DouBaoVoice's change. Its Ctrl+V can't reach elevated
 //!   windows (it runs un-elevated).
-#![allow(dead_code)] // until app.rs wires it to the mic key / voice ball / tray menu
+#![allow(dead_code)] // reports, fingerprints and some setters are only used by examples/voice_probe.rs
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -75,15 +85,19 @@ use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, REG_VALUE_TYPE, RegCloseKey,
     RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW,
 };
+use windows::Win32::Security::{
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    TokenIntegrityLevel,
+};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
     MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId,
+    CreateWindowExW, DestroyWindow, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
     HWND_MESSAGE, IsWindowVisible, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 use windows::core::{BOOL, PCWSTR, PWSTR, w};
@@ -93,6 +107,8 @@ use windows::core::{BOOL, PCWSTR, PWSTR, w};
 pub enum VoiceEngine {
     /// 微信输入法 (WeType), default.
     WeType,
+    /// 豆包输入法 Windows 版 (ByteDance's IME, `C:\Program Files\DoubaoIME`).
+    DoubaoIme,
     /// 豆包语音输入 Windows 版 (third-party `DouBaoVoice*.exe`, Volcengine streaming ASR).
     DoubaoVoice,
     /// Windows voice typing (Win+H).
@@ -100,12 +116,14 @@ pub enum VoiceEngine {
 }
 
 impl VoiceEngine {
-    pub const ALL: [VoiceEngine; 3] = [VoiceEngine::WeType, VoiceEngine::DoubaoVoice, VoiceEngine::System];
+    pub const ALL: [VoiceEngine; 4] =
+        [VoiceEngine::WeType, VoiceEngine::DoubaoIme, VoiceEngine::DoubaoVoice, VoiceEngine::System];
 
     /// Value in `settings.ini` (`voice_engine=wetype|doubao|system`).
     pub fn as_setting(self) -> &'static str {
         match self {
             VoiceEngine::WeType => "wetype",
+            VoiceEngine::DoubaoIme => "doubao_ime",
             VoiceEngine::DoubaoVoice => "doubao",
             VoiceEngine::System => "system",
         }
@@ -114,6 +132,7 @@ impl VoiceEngine {
     pub fn from_setting(s: &str) -> Option<VoiceEngine> {
         match s.trim().to_ascii_lowercase().as_str() {
             "wetype" | "weixin" | "wechat" => Some(VoiceEngine::WeType),
+            "doubao_ime" | "doubaoime" => Some(VoiceEngine::DoubaoIme),
             "doubao" | "doubao_voice" | "doubaovoice" => Some(VoiceEngine::DoubaoVoice),
             "system" | "win+h" | "windows" => Some(VoiceEngine::System),
             _ => None,
@@ -124,8 +143,9 @@ impl VoiceEngine {
     pub fn label(self) -> &'static str {
         match self {
             VoiceEngine::WeType => "微信输入法",
-            VoiceEngine::DoubaoVoice => "豆包语音",
-            VoiceEngine::System => "系统（Win+H）",
+            VoiceEngine::DoubaoIme => "豆包输入法",
+            VoiceEngine::DoubaoVoice => "豆包语音（第三方）",
+            VoiceEngine::System => "系统语音（Win+H）",
         }
     }
 
@@ -198,11 +218,18 @@ const WETYPE_MIC_EXE: &str = "wetype_update.exe";
 const WETYPE_VOICE_CLASS: &str = "wetype.flutter.setting";
 const WETYPE_VOICE_TITLE: &str = "语音输入";
 const DOUBAO_PREFIX: &str = "doubaovoice";
+/// 豆包输入法's TIP (text service) CLSID and install directory (as it appears, lower case, in
+/// the microphone consent store's `#`-separated paths).
+const DOUBAO_IME_TIP: &str = "{9D2B2E2B-3C93-4D2F-9D35-6EEB85F0D2B0}";
+const DOUBAO_IME_DIR: &str = "#doubaoime#";
+const DOUBAO_IME_SERVICE: &str = "imeservice.exe";
 
 const VK_LSHIFT: u16 = 0xA0;
 const VK_LCONTROL: u16 = 0xA2;
 const VK_LMENU: u16 = 0xA4;
 const VK_LWIN: u16 = 0x5B;
+const VK_RMENU: u16 = 0xA5;
+const VK_SPACE: u16 = 0x20;
 const VK_ESCAPE: u16 = 0x1B;
 const VK_H: u16 = b'H' as u16;
 const VK_F6: u16 = 0x75;
@@ -228,8 +255,14 @@ enum Phase {
 pub struct Voice {
     engine: VoiceEngine,
     phase: Phase,
-    /// Consecutive start failures per engine; at 2 the engine is skipped until `set_engine`.
-    failures: [u8; 3],
+    /// Consecutive start failures per engine; with `fallback`, at 2 the engine is skipped until
+    /// `set_engine`.
+    failures: [u8; 4],
+    /// The foreground process's exe (lower case) when the session started: 豆包输入法 may capture
+    /// the microphone inside the target app.
+    target_exe: Option<String>,
+    /// FILETIME when the start hotkey went out.
+    session_filetime: u64,
     doubao_exe: Option<PathBuf>,
     doubao_launch: bool,
     /// Fall back to Win+H when the engine can't be used (default true).
@@ -246,7 +279,9 @@ impl Voice {
         Voice {
             engine,
             phase: Phase::Idle,
-            failures: [0; 3],
+            failures: [0; 4],
+            target_exe: None,
+            session_filetime: 0,
             doubao_exe: None,
             doubao_launch: true,
             fallback: true,
@@ -267,7 +302,7 @@ impl Voice {
             self.cancel();
         }
         self.engine = e;
-        self.failures = [0; 3];
+        self.failures = [0; 4];
         if matches!(self.phase, Phase::Failed(_)) {
             self.phase = Phase::Idle;
         }
@@ -305,6 +340,12 @@ impl Voice {
     /// System: always.
     pub fn available(e: VoiceEngine) -> bool {
         unavailable_reason(e, None, true).is_none()
+    }
+
+    /// Why `e` can't be used right now (None = usable), with the default DoubaoVoice lookup.
+    /// Safe to call from any thread.
+    pub fn why_unavailable(e: VoiceEngine) -> Option<String> {
+        unavailable_reason(e, None, true)
     }
 
     /// Like [`available`](Voice::available) for the selected engine with this instance's
@@ -364,12 +405,19 @@ impl Voice {
         if engine == VoiceEngine::System {
             return self.system_voice();
         }
-        if self.failures[engine.index()] >= 2 {
+        if self.fallback && self.failures[engine.index()] >= 2 {
             return self.fail(format!("{}多次没有响应", engine.label()));
         }
         if let Some(why) = unavailable_reason(engine, self.doubao_exe.as_deref(), self.doubao_launch) {
             return self.fail(why);
         }
+        if let Some(why) = blocked_by_elevated_foreground(engine) {
+            // The hotkey can't reach the engine (UIPI); not the engine's fault: no failure count.
+            return self.fail(why);
+        }
+        self.target_exe = foreground_pid().and_then(process_path).and_then(|p| {
+            p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase())
+        });
         // Both engines may replace the clipboard with the result: save it to put it back.
         self.clip_seq = unsafe { GetClipboardSequenceNumber() };
         let (snap, ok) = ClipSnapshot::take();
@@ -389,6 +437,7 @@ impl Voice {
                 }
                 self.send_hotkey(engine);
             }
+            VoiceEngine::DoubaoIme => self.send_hotkey(engine),
             VoiceEngine::DoubaoVoice => {
                 if find_process(|n| n.starts_with(DOUBAO_PREFIX)).is_none() {
                     let Some(exe) = doubao_exe(self.doubao_exe.as_deref()) else {
@@ -418,6 +467,7 @@ impl Voice {
     /// Sends the engine's toggle hotkey and enters `Starting`.
     fn send_hotkey(&mut self, engine: VoiceEngine) {
         let filetime = filetime_now();
+        self.session_filetime = filetime;
         let ok = send_keys(&toggle_chord(engine));
         self.logf(format_args!("voice: {} start hotkey sent (ok={ok})", engine.as_setting()));
         self.phase = Phase::Starting { sent: Instant::now(), filetime };
@@ -433,7 +483,7 @@ impl Voice {
             }
             Phase::Starting { .. } => {
                 // Only send the toggle again if the engine actually reacted, or it would *start*.
-                let reacted = mic_in_use(engine, 0) || (engine == VoiceEngine::WeType && wetype_voice_window());
+                let reacted = mic_in_use(engine, 0, self.target()) || (engine == VoiceEngine::WeType && wetype_voice_window());
                 if reacted {
                     send_keys(&toggle_chord(engine));
                     self.phase = Phase::Finishing { stop_sent: Instant::now(), mic_released: None, pasted: None };
@@ -465,8 +515,8 @@ impl Voice {
                 return;
             }
             (VoiceEngine::DoubaoVoice, Phase::Finishing { .. }) | (_, Phase::Discarding { .. }) => return,
-            (VoiceEngine::WeType, Phase::Starting { .. } | Phase::Listening) => {
-                if mic_in_use(VoiceEngine::WeType, 0) {
+            (VoiceEngine::WeType | VoiceEngine::DoubaoIme, Phase::Starting { .. } | Phase::Listening) => {
+                if mic_in_use(self.engine, 0, self.target()) {
                     send_keys(&[(VK_ESCAPE, false), (VK_ESCAPE, true)]);
                 }
             }
@@ -481,7 +531,7 @@ impl Voice {
             }
             _ => {}
         }
-        if self.engine == VoiceEngine::WeType && self.clip_saved.is_some() {
+        if matches!(self.engine, VoiceEngine::WeType | VoiceEngine::DoubaoIme) && self.clip_saved.is_some() {
             self.phase = Phase::Discarding { since: now, mic_released: None };
         } else {
             self.clip_saved = None;
@@ -512,7 +562,7 @@ impl Voice {
                 }
             }
             Phase::Starting { sent, filetime } => {
-                if mic_in_use(engine, filetime) {
+                if mic_in_use(engine, filetime, self.target()) {
                     self.failures[engine.index()] = 0;
                     self.report.listen_after_ms = Some((now - sent).as_millis() as u64);
                     self.logf(format_args!("voice: {} listening after {} ms", engine.as_setting(), (now - sent).as_millis()));
@@ -532,14 +582,17 @@ impl Voice {
                 }
             }
             Phase::Listening => {
-                if !mic_in_use(engine, 0) {
+                if !mic_in_use(engine, 0, self.target()) {
                     // Stopped from the engine's own UI, or it ended on silence.
                     self.logf(format_args!("voice: {} stopped by itself", engine.as_setting()));
                     self.phase = Phase::Finishing { stop_sent: now, mic_released: Some(now), pasted: None };
                 }
             }
             Phase::Finishing { stop_sent, mic_released, pasted } => {
-                if engine == VoiceEngine::WeType && self.clipboard_changed() && self.try_clipboard_result() {
+                if matches!(engine, VoiceEngine::WeType | VoiceEngine::DoubaoIme)
+                    && self.clipboard_changed()
+                    && self.try_clipboard_result()
+                {
                     self.phase = Phase::Idle;
                     return self.state();
                 }
@@ -568,7 +621,7 @@ impl Voice {
                 }
                 match mic_released {
                     None => {
-                        if !mic_in_use(engine, 0) {
+                        if !mic_in_use(engine, 0, self.target()) {
                             self.phase = Phase::Finishing { stop_sent, mic_released: Some(now), pasted };
                         } else if now - stop_sent > STOP_MIC_TIMEOUT {
                             // The stop chord was not taken; the engine is still listening.
@@ -590,7 +643,7 @@ impl Voice {
                     self.finish_clipboard(false); // restores it if it is WeType's copy
                     self.phase = Phase::Idle;
                 } else {
-                    let released = mic_released.or_else(|| (!mic_in_use(engine, 0)).then_some(now));
+                    let released = mic_released.or_else(|| (!mic_in_use(engine, 0, self.target())).then_some(now));
                     let done = released.is_some_and(|t| now - t > CLIPBOARD_WAIT)
                         || now - since > STOP_MIC_TIMEOUT + CLIPBOARD_WAIT;
                     self.phase = if done {
@@ -642,7 +695,7 @@ impl Voice {
     /// and restore the user's clipboard. Returns true when the session is done.
     fn try_clipboard_result(&mut self) -> bool {
         let owner = clipboard_owner_exe();
-        let from_wetype = clipboard_from_engine(VoiceEngine::WeType, owner.as_deref());
+        let from_wetype = clipboard_from_engine(self.engine, owner.as_deref());
         self.logf(format_args!(
             "voice: clipboard changed (owner={}, wetype window={}, from wetype={from_wetype})",
             owner.as_deref().unwrap_or("-"),
@@ -688,6 +741,14 @@ impl Voice {
         self.logf(format_args!("voice: clipboard restored={} formats={}", restored.is_some(), self.report.restored_formats));
     }
 
+    /// The target app for [`mic_in_use`] (豆包输入法 only).
+    fn target(&self) -> Option<(&str, u64)> {
+        if self.engine != VoiceEngine::DoubaoIme {
+            return None;
+        }
+        self.target_exe.as_deref().map(|t| (t, self.session_filetime))
+    }
+
     fn logf(&self, args: std::fmt::Arguments) {
         if let Some(f) = self.log {
             f(&args.to_string());
@@ -705,7 +766,7 @@ fn unavailable_reason(e: VoiceEngine, doubao_exe_setting: Option<&Path>, may_lau
             if !reg_key_exists(HKEY_LOCAL_MACHINE, &tip) {
                 return Some("没有安装微信输入法".into());
             }
-            if !wetype_enabled() {
+            if !tip_enabled(WETYPE_TIP) {
                 return Some("微信输入法不在输入法列表里".into());
             }
             if find_process(|n| n == "wetype_server.exe").is_none() {
@@ -717,6 +778,35 @@ fn unavailable_reason(e: VoiceEngine, doubao_exe_setting: Option<&Path>, may_lau
             // launches it again (no window shows; tested).
             if find_process(|n| n == WETYPE_MIC_EXE).is_none() && wetype_update_exe().is_none() {
                 return Some("微信输入法的语音组件（wetype_update.exe）没有在运行".into());
+            }
+            None
+        }
+        VoiceEngine::DoubaoIme => {
+            if !reg_key_exists(HKEY_LOCAL_MACHINE, &format!(r"SOFTWARE\Microsoft\CTF\TIP\{DOUBAO_IME_TIP}")) {
+                return Some("没有安装豆包输入法".into());
+            }
+            if !tip_enabled(DOUBAO_IME_TIP) {
+                return Some("豆包输入法不在输入法列表里".into());
+            }
+            if doubao_ime_service().is_none() {
+                return Some("豆包输入法没有在运行".into());
+            }
+            let cfg = doubao_ime_config().unwrap_or_default();
+            if !cfg.shortcut {
+                return Some("豆包输入法关闭了语音快捷键（豆包输入法设置 → 语音输入）".into());
+            }
+            if cfg.mode != "right_alt_space" {
+                // Seen: `null` after its settings window was first opened (meaning unknown).
+                return Some(if cfg.mode == "null" || cfg.mode.is_empty() {
+                    "豆包输入法没有设置「免按模式」语音快捷键（豆包输入法设置 → 语音输入）".to_owned()
+                } else {
+                    format!("豆包输入法的语音快捷键不是「右 Alt+空格」（{}）", cfg.mode)
+                });
+            }
+            // Without the global shortcut it only works while 豆包输入法 is the target window's
+            // input method, and elsewhere right Alt+Space opens the window's system menu.
+            if !cfg.global {
+                return Some("豆包输入法没有打开全局语音快捷键（豆包输入法设置 → 语音输入）".into());
             }
             None
         }
@@ -741,14 +831,43 @@ fn unavailable_reason(e: VoiceEngine, doubao_exe_setting: Option<&Path>, may_lau
     }
 }
 
-/// WeType's profile is in one of `HKCU\Control Panel\International\User Profile\<lang>` as a
-/// value named `0804:{CLSID}{PROFILE}`.
-fn wetype_enabled() -> bool {
+/// An input method's profile is in one of `HKCU\Control Panel\International\User Profile\<lang>`
+/// as a value named `0804:{CLSID}{PROFILE}`.
+fn tip_enabled(tip: &str) -> bool {
     let root = r"Control Panel\International\User Profile";
     reg_subkeys(HKEY_CURRENT_USER, root).iter().any(|lang| {
         reg_value_names(HKEY_CURRENT_USER, &format!(r"{root}\{lang}"))
             .iter()
-            .any(|v| v.to_ascii_uppercase().contains(WETYPE_TIP))
+            .any(|v| v.to_ascii_uppercase().contains(tip))
+    })
+}
+
+/// 豆包输入法's `ImeService.exe` (the name is generic: check its directory).
+fn doubao_ime_service() -> Option<u32> {
+    find_processes(|n| n == DOUBAO_IME_SERVICE).into_iter().find(|&pid| {
+        process_path(pid).is_some_and(|p| p.to_string_lossy().to_ascii_lowercase().contains(r"\doubaoime\"))
+    })
+}
+
+#[derive(Default)]
+struct DoubaoImeConfig {
+    /// `voice.enableVoiceShortcut`
+    shortcut: bool,
+    /// `voice.enableGlobalVoiceShortcut`
+    global: bool,
+    /// `voice.voiceShortcutMode` (`right_alt_space`, …)
+    mode: String,
+}
+
+/// Reads the voice shortcut settings from `%APPDATA%\DoubaoIme\conf\config.json` (nothing else).
+fn doubao_ime_config() -> Option<DoubaoImeConfig> {
+    let path = PathBuf::from(std::env::var_os("APPDATA")?).join(r"DoubaoIme\conf\config.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim_start_matches('\u{feff}');
+    Some(DoubaoImeConfig {
+        shortcut: json_field(text, "enableVoiceShortcut").is_none_or(|v| v == "true"),
+        global: json_field(text, "enableGlobalVoiceShortcut").is_some_and(|v| v == "true"),
+        mode: json_field(text, "voiceShortcutMode").unwrap_or("right_alt_space").to_owned(),
     })
 }
 
@@ -764,6 +883,8 @@ fn toggle_chord(engine: VoiceEngine) -> Vec<(u16, bool)> {
             (VK_LWIN, true),
             (VK_LCONTROL, true),
         ],
+        // `right_alt_space` (豆包输入法's default 「免按模式」 shortcut). Right Alt is an extended key.
+        VoiceEngine::DoubaoIme => chord(&[VK_RMENU, VK_SPACE]),
         VoiceEngine::DoubaoVoice => {
             let keys = doubao_config().and_then(|c| parse_hotkey(&c.hotkey)).unwrap_or_else(|| vec![VK_F6]);
             chord(&keys)
@@ -894,23 +1015,35 @@ fn doubao_exe(setting: Option<&Path>) -> Option<PathBuf> {
 /// Whether `engine`'s process holds the microphone, according to the consent store. With
 /// `since_filetime != 0`, only a use that started after it (minus 1 s) counts, so a stale entry
 /// (crashed process) doesn't look like a fresh start.
-fn mic_in_use(engine: VoiceEngine, since_filetime: u64) -> bool {
-    let matches: fn(&str) -> bool = match engine {
-        VoiceEngine::WeType => |exe| exe == WETYPE_MIC_EXE,
-        VoiceEngine::DoubaoVoice => |exe| exe.starts_with(DOUBAO_PREFIX),
-        VoiceEngine::System => return false,
-    };
+/// `target`: the target app's exe and the session's start (豆包输入法 may record inside it; only a
+/// use that started with this session counts, not another app's long recording).
+fn mic_in_use(engine: VoiceEngine, since_filetime: u64, target: Option<(&str, u64)>) -> bool {
     let root = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged";
     let Some(key) = RegKey::open(HKEY_CURRENT_USER, root) else { return false };
     key.subkeys().into_iter().any(|name| {
-        let exe = name.rsplit('#').next().unwrap_or("").to_ascii_lowercase();
-        if !matches(&exe) {
+        let lower = name.to_ascii_lowercase();
+        let exe = lower.rsplit('#').next().unwrap_or("");
+        let mut since = since_filetime;
+        let matches = match engine {
+            VoiceEngine::WeType => exe == WETYPE_MIC_EXE,
+            VoiceEngine::DoubaoVoice => exe.starts_with(DOUBAO_PREFIX),
+            // Its service, or the target app (if it records inside its text service).
+            VoiceEngine::DoubaoIme => {
+                lower.contains(DOUBAO_IME_DIR)
+                    || target.is_some_and(|(t, start)| {
+                        since = since.max(start);
+                        t == exe
+                    })
+            }
+            VoiceEngine::System => false,
+        };
+        if !matches {
             return false;
         }
         let Some(sub) = RegKey::open(key.0, &name) else { return false };
         let start = sub.qword("LastUsedTimeStart").unwrap_or(0);
         let stop = sub.qword("LastUsedTimeStop").unwrap_or(1);
-        stop == 0 && start != 0 && start + 10_000_000 >= since_filetime
+        stop == 0 && start != 0 && start + 10_000_000 >= since
     })
 }
 
@@ -981,6 +1114,78 @@ fn wetype_update_exe() -> Option<PathBuf> {
 
 // ---------------------------------------------------------------- processes
 
+/// All processes whose lower-case exe name matches.
+fn find_processes(pred: impl Fn(&str) -> bool) -> Vec<u32> {
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
+        let mut e = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut ok = Process32FirstW(snap, &mut e).is_ok();
+        while ok {
+            let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            if pred(&String::from_utf16_lossy(&e.szExeFile[..n]).to_ascii_lowercase()) {
+                out.push(e.th32ProcessID);
+            }
+            ok = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
+    }
+    out
+}
+
+/// The process of the foreground window.
+fn foreground_pid() -> Option<u32> {
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return None;
+    }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) };
+    (pid != 0).then_some(pid)
+}
+
+/// Mandatory integrity level RID of a process (0x2000 medium, 0x3000 high), if it can be read.
+fn integrity_level(pid: u32) -> Option<u32> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut token = HANDLE::default();
+        let opened = OpenProcessToken(h, TOKEN_QUERY, &mut token).is_ok();
+        let _ = CloseHandle(h);
+        if !opened {
+            return None;
+        }
+        let mut buf = [0u64; 16]; // TOKEN_MANDATORY_LABEL + SID, aligned
+        let mut len = 0u32;
+        let ok = GetTokenInformation(token, TokenIntegrityLevel, Some(buf.as_mut_ptr().cast()), size_of_val(&buf) as u32, &mut len).is_ok();
+        let _ = CloseHandle(token);
+        if !ok {
+            return None;
+        }
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let sid = label.Label.Sid;
+        let count = *GetSidSubAuthorityCount(sid);
+        if count == 0 {
+            return None;
+        }
+        Some(*GetSidSubAuthority(sid, count as u32 - 1))
+    }
+}
+
+/// The engine's (un-elevated) process can't get the hotkey while a window of higher integrity
+/// (an administrator window) is in front: Windows drops injected input aimed at it for lower
+/// processes' hooks (tested 2026-10-06, see the module docs). Returns the message to show.
+fn blocked_by_elevated_foreground(engine: VoiceEngine) -> Option<String> {
+    let engine_pid = match engine {
+        VoiceEngine::WeType => find_process(|n| n == WETYPE_MIC_EXE),
+        VoiceEngine::DoubaoIme => doubao_ime_service(),
+        VoiceEngine::DoubaoVoice => find_process(|n| n.starts_with(DOUBAO_PREFIX)),
+        VoiceEngine::System => None,
+    }?;
+    let fg = integrity_level(foreground_pid()?)?;
+    let eng = integrity_level(engine_pid)?;
+    (fg > eng).then(|| format!("{}收不到管理员窗口里的语音快捷键（Windows 权限隔离），请在普通窗口里使用", engine.label()))
+}
+
 /// First process whose lower-case exe name matches.
 fn find_process(pred: impl Fn(&str) -> bool) -> Option<u32> {
     unsafe {
@@ -1021,6 +1226,8 @@ fn clipboard_from_engine(engine: VoiceEngine, owner_exe: Option<&str>) -> bool {
     match (engine, owner_exe) {
         (VoiceEngine::WeType, Some(n)) => n.starts_with("wetype"),
         (VoiceEngine::WeType, None) => wetype_voice_window(),
+        (VoiceEngine::DoubaoIme, Some(n)) => n == DOUBAO_IME_SERVICE,
+        (VoiceEngine::DoubaoIme, None) => false,
         (VoiceEngine::DoubaoVoice, Some(n)) => n.starts_with(DOUBAO_PREFIX),
         (VoiceEngine::DoubaoVoice, None) => true,
         (VoiceEngine::System, _) => false,
@@ -1342,6 +1549,12 @@ mod tests {
         assert_eq!(c[2], (VK_LSHIFT, false));
         assert_eq!(c[3], (VK_LSHIFT, true));
         assert_eq!(c[4], (VK_LWIN, true));
+    }
+
+    #[test]
+    fn doubao_ime_chord_is_right_alt_space() {
+        let c = toggle_chord(VoiceEngine::DoubaoIme);
+        assert_eq!(c, vec![(VK_RMENU, false), (VK_SPACE, false), (VK_SPACE, true), (VK_RMENU, true)]);
     }
 
     #[test]

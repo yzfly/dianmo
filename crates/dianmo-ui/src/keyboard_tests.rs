@@ -1518,3 +1518,87 @@ fn clip_preview_is_one_short_line() {
     assert_eq!(crate::clip_preview("一二三四五六七", 4), "一二三四…");
     assert_eq!(crate::clip_preview("   ", 4), "");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Voice (TODO #29): mic key state, modifiers released, 语音球 tile, longer toasts
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn voice_key_releases_latched_modifiers() {
+    let mut h = H::wide(idle());
+    h.tap("ctrl");
+    assert!(h.v.mods().on(Modifier::Ctrl));
+    assert_eq!(h.tap("voice"), vec![UiAction::Voice]);
+    assert!(!h.v.mods().on(Modifier::Ctrl), "Ctrl must not combine with the engine's hotkey");
+    // 电脑键盘: a held modifier is really down; tapping the mic sends it up first.
+    let mut h = pc_harness();
+    let shift = h.at("shift");
+    h.down(3, shift);
+    h.wait(400); // long press: Shift really down
+    let voice = h.at("voice");
+    let acts = h.tap_at(voice);
+    assert_eq!(acts.last(), Some(&UiAction::Voice), "{acts:?}");
+    assert!(acts.contains(&UiAction::Input(Action::KeyUp(KeyCode::Shift))), "{acts:?}");
+    assert!(h.up(3, shift).is_empty(), "already released");
+}
+
+#[test]
+fn voice_active_paints_the_mic_and_voice_ball_tile() {
+    let mut h = H::wide(idle());
+    let before = h.paint().fills;
+    assert!(h.v.set_voice_active(true));
+    assert!(!h.v.set_voice_active(true));
+    assert!(h.v.voice_active());
+    assert_eq!(h.paint().fills, before + 1, "red disc behind the mic");
+    // Layout menu → 语音球.
+    h.tap("layout");
+    assert_eq!(h.tap("voiceball"), vec![UiAction::VoiceBall]);
+    assert_eq!(h.v.panel, Panel::Keys);
+}
+
+#[test]
+fn t9_keys_by_digit_for_tests() {
+    let mut h = H::wide(st(true, Schema::T9, "", &[]));
+    assert_eq!(h.tap("t9_6"), vec![UiAction::Input(Action::Char('6'))]);
+    assert_ne!(h.v.key_center("t9_6"), h.v.key_center("6"), "the digit pad's 6 is another key");
+}
+
+#[test]
+fn long_toasts_stay_longer() {
+    let mut h = H::wide(idle());
+    let r = h.v.show_toast("已复制", h.t);
+    assert_eq!(r.timer_ms, Some(TOAST_MS));
+    let r = h.v.show_toast("微信输入法没有开始收音，已改用系统语音输入", h.t);
+    assert!(r.timer_ms.unwrap() > 3000 && r.timer_ms.unwrap() <= 4000, "{r:?}");
+}
+
+#[test]
+fn voice_mode_offers_an_exit_button() {
+    // Wide (edit area on), phone and 电脑键盘 bars all show 「退出语音模式」 in voice mode.
+    for mut h in [H::wide(idle()), H::with(idle()), pc_harness()] {
+        assert!(h.v.key_center("exitvoice").is_none());
+        assert!(h.v.set_voice_mode(true));
+        assert!(!h.v.set_voice_mode(true));
+        let (x, _) = h.v.key_center("exitvoice").expect("exit button in the bar");
+        assert!(x > 0.0);
+        assert_eq!(h.tap("exitvoice"), vec![UiAction::VoiceBall]);
+        // No two bar keys overlap.
+        let cells: Vec<Rect> = h.v.bar_keys.iter().map(|k| k.cell).collect();
+        for (i, a) in cells.iter().enumerate() {
+            for b in &cells[i + 1..] {
+                assert!(a.x + a.w <= b.x + 0.5 || b.x + b.w <= a.x + 0.5, "{cells:?}");
+            }
+        }
+        h.paint();
+    }
+    // The layout menu's tile turns voice mode off too.
+    let mut h = H::wide(idle());
+    h.v.set_voice_mode(true);
+    h.tap("layout");
+    let tile = h.v.keys.iter().find(|k| k.action == KeyAction::VoiceBall).unwrap();
+    assert_eq!(tile.sub.as_deref(), Some("退出语音球"));
+    assert!(tile.selected);
+    assert_eq!(h.tap("voiceball"), vec![UiAction::VoiceBall]);
+    assert!(h.v.set_voice_mode(false));
+    assert!(h.v.key_center("exitvoice").is_none());
+}
