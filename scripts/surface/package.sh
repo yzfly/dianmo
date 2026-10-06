@@ -2,6 +2,7 @@
 # Build and package 点墨 on the Surface; optionally install it for the user.
 #
 #   scripts/surface/package.sh <name> [--install] [--start] [--keep-target] [--no-build]
+#   scripts/surface/package.sh <name> --dist-only --install [--start]   (install the existing dist as-is)
 #   scripts/surface/package.sh <name> --uninstall
 #   scripts/surface/package.sh <name> --stop        (only close a running 点墨)
 #
@@ -25,13 +26,14 @@
 # Finally removes the build's target\ (TODO #10) unless --keep-target.
 set -euo pipefail
 name=${1:?usage: package.sh <name> [--install] [--start] [--keep-target] [--no-build] | --uninstall}; shift
-install=0; start=0; keep=0; build=1; uninstall=0; stop=0
+install=0; start=0; keep=0; build=1; uninstall=0; stop=0; assemble=1
 for a in "$@"; do
   case $a in
     --install) install=1 ;;
     --start) start=1 ;;
     --keep-target) keep=1 ;;
     --no-build) build=0 ;;
+    --dist-only) build=0; assemble=0; keep=1 ;;
     --uninstall) uninstall=1 ;;
     --stop) stop=1 ;;
     *) echo "unknown option $a" >&2; exit 2 ;;
@@ -78,11 +80,11 @@ fi
 if [ $build = 1 ]; then
   out=$("$here/build.sh" "$name" build --release -p dianmo 2>&1 | tee /dev/stderr)
   grep -q 'cargo exit: 0' <<<"$out" || { echo "build failed" >&2; exit 1; }
-else
+elif [ $assemble = 1 ]; then
   "$here/sync.sh" "$name"
 fi
 
-"$here/ps.sh" <<PS
+[ $assemble = 1 ] && "$here/ps.sh" <<PS
 \$ErrorActionPreference = 'Stop'
 \$env:Path = "C:\dev\tools\llvm-mingw\bin;\$env:Path"
 Set-Location '$dir'
