@@ -15,17 +15,17 @@ cd ~/yzfly/dianmo && claude # 新会话：先读 CLAUDE.md → TODO.md → docs/
 
 | crate | 状态 | 说明 |
 |---|---|---|
-| `dianmo-core` | ✅ 已提交 | `Engine` / `TextSink` 接口、`InputController`（手机输入规则），11 个测试在服务器和 Surface 上都通过 |
-| `dianmo-ui` | 🔄 子 agent 开发中 | 键盘界面。接口 `canvas.rs` / `view.rs` 由主会话定义，已提交；其余见 `docs/status/dianmo-ui.md` |
-| `dianmo-win` | 🔄 子 agent 开发中 | 窗口宿主、D2D Canvas、SendInput、Win+H、托盘、AppBar。见 `docs/status/dianmo-win.md` |
-| `dianmo-rime` | 🔄 子 agent 开发中 | librime FFI 已写好，数据已下到 Surface。前两个 agent 因 API 内容过滤报错中断过，见下文。状态见 `docs/status/dianmo-rime.md` |
-| `dianmo`（主程序） | ⏳ 未开始 | 主会话负责组装：`dianmo_win::run(KeyboardView, App)`，App 里放 `InputController<RimeEngine, SendInputSink>`；打包到 `%LOCALAPPDATA%\Dianmo` + 桌面图标「点墨」（已经跟用户说过这个位置） |
+| `dianmo-core` | ✅ | `Engine` / `TextSink` 接口、`InputController`（手机输入规则），11 个测试通过 |
+| `dianmo-ui` | ✅ M1 完成 | `KeyboardView`：全拼 / 小鹤（键面标韵母）/ 九宫格 / 英文 / 数字 / 符号，候选条可滑动、可展开，气泡、长按、上滑、删除连删、空格移光标，深浅主题；32 个测试。效果图在 `docs/previews/`。未在 Surface 上实际渲染过，雅黑字体度量和 MDL2 图标码位待确认。详见 `docs/status/dianmo-ui.md` |
+| `dianmo-win` | ✅ Surface 实测通过 | 不抢焦点（记事本一直在前台），多点触控，D2D + DirectComposition（默认用 WARP 软件渲染，私有内存 9.6MB），空闲 CPU 为 0，exe 361KB，托盘，左边缘把手，Win+H，AppBar。详见 `docs/status/dianmo-win.md` |
+| `dianmo-rime` | 🟡 一半 | FFI（98 个函数位已对过头文件）、九宫格拼音逻辑（7 个测试）、数据已下到 Surface（rime-ice `da1fbe6`）。**`RimeEngine`、预编译部署和 probe 还没写**，下一步见 `docs/status/dianmo-rime.md` |
+| `dianmo`（主程序） | ⏳ 未开始 | 主会话负责：`dianmo_win::run_with(KeyboardView, App, HostOptions)`，App 里放 `InputController<RimeEngine, SendInputSink>`；启动时 `SetSchema`，关掉系统键盘自动弹出，退出时恢复；打包到 `%LOCALAPPDATA%\Dianmo` + 桌面图标「点墨」 |
 
-各子 agent 收尾时会把进度写到 `docs/status/<crate>.md`。那几个文件和它们改过的代码在第一阶段**没有提交**；下个会话先 `git status` 看一下，确认能编译以后再提交。
+第一阶段的全部代码都已提交，各模块的进度和下一步写在 `docs/status/<crate>.md`。
 
 ## 下一步
 
-1. 看 `docs/status/*.md`，把三个 crate 补到能用（M1，DESIGN §7）。
+1. 写完 `RimeEngine` 和预编译部署，跑 probe 测时延和内存（见 `docs/status/dianmo-rime.md`）。
 2. 写 `crates/dianmo` 主程序，在 Surface 上构建，组装数据：`rime.dll` + `data\rime` + 预编译好的词库。
 3. 实测：记事本 / 浏览器里打全拼、小鹤，测删除、回车、语音键；看内存和空闲 CPU。
 4. 安装到 `%LOCALAPPDATA%\Dianmo`，桌面放「点墨」图标，**通知用户试用**（TODO #16）。
