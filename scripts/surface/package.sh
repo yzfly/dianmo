@@ -13,9 +13,14 @@
 #    with the built-in letters-only engine.
 # --install    closes a running 点墨 with WM_CLOSE (never killed: that would leave the AppBar's
 #              screen space reserved), copies dist to %LOCALAPPDATA%\Dianmo, creates 「点墨」 shortcuts
-#              on the desktop and in the Start menu.
-# --start      starts the installed 点墨 in the user's desktop session afterwards.
-# --uninstall  closes 点墨, removes shortcuts, autostart entry and %LOCALAPPDATA%\Dianmo
+#              on the desktop and in the Start menu, and registers the scheduled task `Dianmo`
+#              (`dianmo.exe --register-task`: run with highest privileges, so 点墨 can type into
+#              administrator windows; TODO #23). The shortcuts point at dianmo.exe, which hands
+#              over to the task. Autostart = the task's logon trigger (an old HKCU Run entry is
+#              migrated).
+# --start      starts the installed 点墨 in the user's desktop session afterwards (unelevated,
+#              like the shortcut: it hands over to the task).
+# --uninstall  closes 点墨, removes shortcuts, the task, the old Run entry and %LOCALAPPDATA%\Dianmo
 #              (settings/log in %APPDATA%\Dianmo are kept).
 # Finally removes the build's target\ (TODO #10) unless --keep-target.
 set -euo pipefail
@@ -64,6 +69,7 @@ $close_ps
 \$sh = New-Object -ComObject WScript.Shell
 foreach (\$d in @(\$sh.SpecialFolders('Desktop'), \$sh.SpecialFolders('Programs'))) { Remove-Item (Join-Path \$d '点墨.lnk') -ErrorAction SilentlyContinue }
 Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name Dianmo -ErrorAction SilentlyContinue
+if (Get-ScheduledTask -TaskName Dianmo -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName Dianmo -Confirm:\$false; "removed task Dianmo" }
 if (-not (Get-Process dianmo -ErrorAction SilentlyContinue)) { Remove-Item \$inst -Recurse -Force -ErrorAction SilentlyContinue; "removed \$inst" }
 PS
   exit 0
@@ -123,6 +129,11 @@ foreach (\$d in @(\$sh.SpecialFolders('Desktop'), \$sh.SpecialFolders('Programs'
   \$lnk.Save()
 }
 "installed to \$inst; shortcuts: desktop + start menu"
+# The gui job is elevated, as registering a highest-privileges task requires.
+\$p = Start-Process (Join-Path \$inst 'dianmo.exe') -ArgumentList '--register-task' -Wait -PassThru
+\$t = Get-ScheduledTask -TaskName Dianmo -ErrorAction SilentlyContinue
+if (\$p.ExitCode -ne 0 -or -not \$t) { "WARNING: registering task Dianmo failed (exit \$(\$p.ExitCode)); see %APPDATA%\Dianmo\dianmo.log" }
+else { "task Dianmo: \$(\$t.Actions[0].Execute) \$(\$t.Actions[0].Arguments)  runlevel=\$(\$t.Principal.RunLevel)  autostart=\$([bool](\$t.Triggers | ? { \$_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' }))" }
 PS
 fi
 
@@ -130,10 +141,12 @@ if [ $start = 1 ]; then
   "$here/gui.sh" 30 <<'PS'
 $exe = Join-Path $env:LOCALAPPDATA 'Dianmo\dianmo.exe'
 # The gui job runs elevated; start 点墨 unelevated (like the shortcut would) through Explorer.
+# It hands over to the task Dianmo (elevated) and exits.
 Start-Process explorer.exe -ArgumentList "`"$exe`""
-Start-Sleep -Seconds 2
-$p = Get-Process dianmo -ErrorAction SilentlyContinue
-if ($p) { "started: pid $($p.Id)" } else { "not running after 2s; see %APPDATA%\Dianmo\dianmo.log" }
+Start-Sleep -Seconds 3
+$p = @(Get-Process dianmo -ErrorAction SilentlyContinue)
+if ($p.Count) { "started: pid $($p.Id -join ', ')" } else { "not running after 3s; see %APPDATA%\Dianmo\dianmo.log" }
+Get-Content (Join-Path $env:APPDATA 'Dianmo\dianmo.log') -Tail 4 -Encoding UTF8
 PS
 fi
 
