@@ -30,6 +30,8 @@ pub mod icon {
     pub const CLIPBOARD: &str = "\u{E81C}";
     pub const PIN: &str = "\u{E718}";
     pub const CLOSE: &str = "\u{E711}";
+    /// Gear: the settings window.
+    pub const SETTINGS: &str = "\u{E713}";
 }
 
 /// The letter-key layouts the user can pick.
@@ -289,6 +291,8 @@ pub(crate) enum KeyAction {
     /// Layout menu: voice mode (shrink into the voice ball).
     VoiceBall,
     Hide,
+    /// Toolbar ⚙: open the settings window.
+    Settings,
     ExpandCandidates,
     CollapseCandidates,
     SetLayout(Layout),

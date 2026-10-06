@@ -6,8 +6,7 @@
 //! translucent, rounded. It hides itself after a few seconds (one-shot timer) or when touched.
 //! Nothing runs while it is hidden.
 //!
-//! Also [`keep_ball_out`]: keeps the ball fully visible (not tucked into the screen edge) for a
-//! while, so a new voice-mode user can find it.
+//! (Keeping the ball out of the screen edge meanwhile is dianmo-win's `HostControl::reveal_ball`.)
 
 use std::cell::RefCell;
 
@@ -29,10 +28,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, w};
 
 const HIDE_TIMER: usize = 1;
-/// dianmo-win's ball (handle.rs): its window class and the id of its 3 s "tuck into the edge"
-/// timer. Re-arming that timer with a longer delay keeps the ball out (same thread, same window).
+/// dianmo-win's ball window class (handle.rs).
 const BALL_CLASS: &str = "DianmoBall";
-const BALL_TUCK_TIMER: usize = 2;
 
 const FONT_DIP: i32 = 15;
 const PAD_X_DIP: i32 = 14;
@@ -66,18 +63,6 @@ fn ball_hwnd() -> Option<HWND> {
         let _ = EnumThreadWindows(GetCurrentThreadId(), Some(cb), LPARAM(&mut found as *mut _ as isize));
     }
     found
-}
-
-/// Keeps the (shown) ball out of the screen edge for `ms` instead of 3 s. False if there is no
-/// visible ball.
-pub fn keep_ball_out(ms: u32) -> bool {
-    let Some(ball) = ball_hwnd() else { return false };
-    unsafe {
-        if !IsWindowVisible(ball).as_bool() {
-            return false;
-        }
-        SetTimer(Some(ball), BALL_TUCK_TIMER, ms, None) != 0
-    }
 }
 
 /// Shows `text` beside the ball for `ms` (replacing a bubble already shown). False if the ball

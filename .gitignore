@@ -2,3 +2,4 @@
 *.png
 !docs/**/*.png
 !crates/dianmo-win/examples/res/*.png
+/dist

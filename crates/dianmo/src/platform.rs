@@ -43,6 +43,11 @@ fn instance() -> &'static str {
     INSTANCE.get().map(String::as_str).unwrap_or("")
 }
 
+/// The `--instance` name ("" for the normal one).
+pub fn instance_name() -> &'static str {
+    instance()
+}
+
 fn suffixed(base: &str, sep: &str) -> String {
     match instance() {
         "" => base.to_owned(),
@@ -79,6 +84,16 @@ pub fn attach_parent_console() -> bool {
 
 /// Sent by a second `dianmo.exe` to the running one: show the keyboard.
 const WM_APP_SHOW_KEYBOARD: u32 = WM_APP + 0x51;
+/// Sent by `dianmo.exe --quit` (the installer runs the new exe's `--quit`; `--uninstall` sends it
+/// too): exit gracefully. Let through UIPI like the show message.
+pub const WM_APP_QUIT: u32 = WM_APP + 0x52;
+/// Sent by `dianmo.exe --settings` (Start menu 「点墨设置」) to the running one: open the settings
+/// window. Let through UIPI like the show message.
+const WM_APP_OPEN_SETTINGS: u32 = WM_APP + 0x53;
+
+/// Posted to the app (`HostProxy::post`) when another `dianmo.exe --settings` asked for the
+/// settings window.
+pub struct OpenSettings;
 
 fn mutex_name() -> HSTRING {
     HSTRING::from(suffixed("Local\\Dianmo.SingleInstance", "."))
@@ -86,6 +101,11 @@ fn mutex_name() -> HSTRING {
 
 fn instance_class() -> HSTRING {
     HSTRING::from(suffixed("DianmoInstance", "."))
+}
+
+/// The running instance's message-only window, if any.
+pub fn find_instance_window() -> Option<HWND> {
+    unsafe { FindWindowExW(Some(HWND_MESSAGE), None, &instance_class(), PCWSTR::null()).ok() }
 }
 
 /// Holds the named mutex for the life of the process.
@@ -113,21 +133,23 @@ pub fn acquire_single_instance() -> Option<InstanceLock> {
     }
 }
 
-/// Asks the running instance to show its keyboard. False if it couldn't be found (still starting,
-/// or exiting).
-pub fn signal_running_instance() -> bool {
-    wait_for_instance(Duration::from_secs(2), true)
+/// Asks the running instance to show its keyboard (`settings`: open its settings window
+/// instead). False if it couldn't be found (still starting, or exiting).
+pub fn signal_running_instance(settings: bool) -> bool {
+    wait_for_instance(Duration::from_secs(2), true, settings)
 }
 
 /// Waits up to `timeout` for the running instance's message window; with `show`, asks it to show
-/// the keyboard. False if it didn't appear (or the message was refused).
-pub fn wait_for_instance(timeout: Duration, show: bool) -> bool {
+/// the keyboard, or with `settings` to open the settings window. False if it didn't appear (or
+/// the message was refused).
+pub fn wait_for_instance(timeout: Duration, show: bool, settings: bool) -> bool {
     let class = instance_class();
     let start = Instant::now();
+    let msg = if settings { Some(WM_APP_OPEN_SETTINGS) } else { show.then_some(WM_APP_SHOW_KEYBOARD) };
     loop {
         unsafe {
             if let Ok(hwnd) = FindWindowExW(Some(HWND_MESSAGE), None, &class, PCWSTR::null()) {
-                return !show || PostMessageW(Some(hwnd), WM_APP_SHOW_KEYBOARD, WPARAM(0), LPARAM(0)).is_ok();
+                return msg.is_none_or(|m| PostMessageW(Some(hwnd), m, WPARAM(0), LPARAM(0)).is_ok());
             }
         }
         if start.elapsed() >= timeout {
@@ -142,13 +164,34 @@ thread_local! {
     /// "Show" arrived before the host was ready (an instance started hidden by the task, then
     /// asked to show by the `dianmo.exe` that started the task).
     static PENDING_SHOW: Cell<bool> = const { Cell::new(false) };
+    /// "Quit" arrived before the host was ready.
+    static PENDING_QUIT: Cell<bool> = const { Cell::new(false) };
+    /// "Open the settings" arrived before the host was ready (or `--settings` on the first start).
+    static PENDING_SETTINGS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Opens the settings window once the host is ready (`dianmo.exe --settings` starting 点墨).
+pub fn request_settings() {
+    match PROXY.with(|p| p.get()) {
+        Some(p) => {
+            p.post(OpenSettings);
+        }
+        None => PENDING_SETTINGS.with(|p| p.set(true)),
+    }
 }
 
 /// The host proxy, once the app has seen its first callback (see `DianmoApp::proxy_ready`).
 pub fn set_proxy(proxy: HostProxy) {
     PROXY.with(|p| p.set(Some(proxy)));
+    if PENDING_QUIT.with(|p| p.replace(false)) {
+        proxy.quit();
+        return;
+    }
     if PENDING_SHOW.with(|p| p.replace(false)) {
         proxy.show();
+    }
+    if PENDING_SETTINGS.with(|p| p.replace(false)) {
+        proxy.post(OpenSettings);
     }
 }
 
@@ -183,8 +226,10 @@ pub fn create_instance_window() -> windows::core::Result<HWND> {
     };
     if elevate::is_elevated() {
         unsafe {
-            if let Err(e) = ChangeWindowMessageFilterEx(hwnd, WM_APP_SHOW_KEYBOARD, MSGFLT_ALLOW, None) {
-                crate::log!("allowing the show message through UIPI failed: {e}");
+            for msg in [WM_APP_SHOW_KEYBOARD, WM_APP_QUIT, WM_APP_OPEN_SETTINGS] {
+                if let Err(e) = ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, None) {
+                    crate::log!("allowing message {msg:#x} through UIPI failed: {e}");
+                }
             }
         }
         allow_shell_messages();
@@ -216,6 +261,21 @@ extern "system" fn instance_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 crate::log!("asked to show the keyboard before the host was ready; showing once it is");
                 PENDING_SHOW.with(|p| p.set(true));
             }
+        }
+        return LRESULT(0);
+    }
+    if msg == WM_APP_OPEN_SETTINGS {
+        crate::log!("asked to open the settings");
+        request_settings();
+        return LRESULT(0);
+    }
+    if msg == WM_APP_QUIT {
+        crate::log!("asked to quit (installer / uninstaller)");
+        match PROXY.with(|p| p.get()) {
+            Some(p) => {
+                p.quit();
+            }
+            None => PENDING_QUIT.with(|p| p.set(true)),
         }
         return LRESULT(0);
     }

@@ -88,7 +88,7 @@ struct Gpu {
 }
 
 thread_local! {
-    static GPU: RefCell<Weak<Gpu>> = RefCell::new(Weak::new());
+    static GPU: RefCell<Weak<Gpu>> = const { RefCell::new(Weak::new()) };
     static WIC: RefCell<Option<IWICImagingFactory>> = const { RefCell::new(None) };
     /// Extra directory searched for `<name>.png` by [`Canvas::image`] (`HostOptions::image_dir`).
     static IMAGE_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
@@ -652,7 +652,7 @@ impl Canvas for Frame<'_> {
         let dest = Rect::new(rect.x + (rect.w - w) / 2.0, rect.y + (rect.h - h) / 2.0, w, h);
         unsafe {
             self.dc.DrawBitmap(
-                &*bitmap,
+                bitmap,
                 Some(&d2d_rect(dest)),
                 1.0,
                 D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,

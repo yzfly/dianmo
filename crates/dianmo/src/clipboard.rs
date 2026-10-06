@@ -27,6 +27,8 @@ pub const TYPE_MAX_CHARS: usize = 2000;
 pub struct ClipStore {
     items: Vec<ClipItem>,
     next_id: u64,
+    /// Most unpinned entries kept (settings 「最多保存」); 0 = [`MAX_RECENT`].
+    limit: usize,
 }
 
 impl ClipStore {
@@ -46,6 +48,24 @@ impl ClipStore {
         &self.items
     }
 
+    /// How many unpinned entries to keep (the oldest beyond that are dropped now and later).
+    pub fn set_limit(&mut self, n: usize) {
+        self.limit = n.max(1);
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        let max = if self.limit == 0 { MAX_RECENT } else { self.limit };
+        let mut recent = 0;
+        self.items.retain(|c| {
+            if c.pinned {
+                return true;
+            }
+            recent += 1;
+            recent <= max
+        });
+    }
+
     /// Records copied text as the most recent entry (an existing equal entry moves to the front).
     /// False if it is not worth keeping (blank, too long).
     pub fn add(&mut self, text: String) -> bool {
@@ -60,14 +80,7 @@ impl ClipStore {
             }
         };
         self.items.insert(0, item);
-        let mut recent = 0;
-        self.items.retain(|c| {
-            if c.pinned {
-                return true;
-            }
-            recent += 1;
-            recent <= MAX_RECENT
-        });
+        self.trim();
         true
     }
 

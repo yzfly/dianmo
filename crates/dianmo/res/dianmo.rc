@@ -1,6 +1,9 @@
 // Resources embedded into dianmo.exe by build.rs (llvm-windres from llvm-mingw).
 #pragma code_page(65001)
 1 ICON "dianmo.ico"
+// Canvas::image("app-icon"): the settings window, about page and onboarding (256 px PNG from
+// icon/dianmo.svg).
+app-icon RCDATA "app-icon.png"
 
 1 VERSIONINFO
 FILEVERSION     DIANMO_VER_MAJOR,DIANMO_VER_MINOR,DIANMO_VER_PATCH,0

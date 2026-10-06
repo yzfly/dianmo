@@ -1,21 +1,45 @@
 use super::*;
-use crate::view::{PointerEvent, PointerPhase, View};
+use crate::view::{PointerEvent, PointerPhase, UiAction, View};
+
+/// The settings actions a response hands to the host.
+fn settings_actions(r: &Response) -> Vec<SettingsAction> {
+    r.actions
+        .iter()
+        .filter_map(|a| match a {
+            UiAction::Settings(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
 
 struct T {
     v: SettingsView,
     t: u64,
+    acts: Vec<SettingsAction>,
 }
 
 impl T {
     fn new(w: f32, h: f32) -> Self {
         let mut v = SettingsView::new(SettingsModel::default(), ThemeKind::Light);
         v.resize(w, h);
-        Self { v, t: 1000 }
+        Self { v, t: 1000, acts: Vec::new() }
     }
 
     fn ev(&mut self, phase: PointerPhase, x: f32, y: f32) -> Response {
         self.t += 16;
-        self.v.pointer(PointerEvent { id: 1, phase, x, y, time_ms: self.t })
+        let r = self.v.pointer(PointerEvent { id: 1, phase, x, y, time_ms: self.t });
+        self.acts.extend(settings_actions(&r));
+        r
+    }
+
+    fn key(&mut self, vk: u32) -> Response {
+        let r = self.v.key(vk, true);
+        self.acts.extend(settings_actions(&r));
+        r
+    }
+
+    fn take_actions(&mut self) -> Vec<SettingsAction> {
+        std::mem::take(&mut self.acts)
     }
 
     fn tap_at(&mut self, x: f32, y: f32) -> Response {
@@ -46,14 +70,14 @@ fn tapping_a_switch_row_toggles_and_animates() {
     let r = t.tap("autostart");
     assert!(r.repaint);
     assert_eq!(r.timer_ms, Some(crate::scroll::FRAME_MS), "switch animation runs");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::SetAutostart(false)]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetAutostart(false)]);
     assert!(!t.v.model().autostart);
     t.run_timers();
     t.t += 16;
     assert_eq!(t.v.timer(t.t).timer_ms, None, "animation stops when done");
     t.tap("autostart");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::SetAutostart(true)]);
-    assert!(t.v.take_actions().is_empty());
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetAutostart(true)]);
+    assert!(t.take_actions().is_empty());
 }
 
 #[test]
@@ -62,12 +86,12 @@ fn input_mode_cards_and_default_layout_on_general_page() {
         let mut t = T::new(w, 680.0);
         assert_eq!(t.v.page(), Page::General);
         t.tap("mode/语音球");
-        assert_eq!(t.v.take_actions(), vec![SettingsAction::SetInputMode(InputMode::VoiceBall)]);
+        assert_eq!(t.take_actions(), vec![SettingsAction::SetInputMode(InputMode::VoiceBall)]);
         assert_eq!(t.v.model().input_mode, InputMode::VoiceBall);
         t.tap("mode/键盘");
-        assert_eq!(t.v.take_actions(), vec![SettingsAction::SetInputMode(InputMode::Keyboard)]);
+        assert_eq!(t.take_actions(), vec![SettingsAction::SetInputMode(InputMode::Keyboard)]);
         t.tap("layout/九宫格");
-        assert_eq!(t.v.take_actions(), vec![SettingsAction::SetLayout(LayoutChoice::T9)]);
+        assert_eq!(t.take_actions(), vec![SettingsAction::SetLayout(LayoutChoice::T9)]);
     }
 }
 
@@ -75,12 +99,12 @@ fn input_mode_cards_and_default_layout_on_general_page() {
 fn segmented_choice_sends_action_and_updates_theme() {
     let mut t = T::new(960.0, 680.0);
     t.tap("theme/深色");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::SetTheme(ThemeChoice::Dark)]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetTheme(ThemeChoice::Dark)]);
     assert_eq!(t.v.theme(), ThemeKind::Dark);
     assert_eq!(t.v.model().theme, ThemeChoice::Dark);
     // 跟随系统: the host resolves the actual theme.
     t.tap("theme/跟随系统");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::SetTheme(ThemeChoice::System)]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetTheme(ThemeChoice::System)]);
 }
 
 #[test]
@@ -90,9 +114,9 @@ fn nav_switches_pages() {
     assert!(x < 232.0, "left navigation in a wide window");
     t.tap_at(x, y);
     assert_eq!(t.v.page(), Page::Keyboard);
-    assert!(t.v.take_actions().is_empty());
+    assert!(t.take_actions().is_empty());
     t.tap("long_press/长");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::SetLongPress(LongPress::Long)]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetLongPress(LongPress::Long)]);
     let (x, y) = t.v.element_center("关于").unwrap();
     t.tap_at(x, y);
     assert_eq!(t.v.page(), Page::About);
@@ -108,8 +132,8 @@ fn narrow_window_uses_top_tabs() {
     t.tap_at(x, y);
     assert_eq!(t.v.page(), Page::Voice);
     // Rows still work (controls stacked under their text when needed).
-    t.tap("engine_2");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::SetVoiceEngine(VoiceEngineChoice::System)]);
+    t.tap("engine_system");
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetVoiceEngine(VoiceEngineChoice::System)]);
 }
 
 #[test]
@@ -123,7 +147,7 @@ fn drag_scrolls_with_momentum_and_does_not_tap() {
         t.ev(PointerPhase::Move, x, y - i as f32 * 20.0);
     }
     let r = t.ev(PointerPhase::Up, x, y - 120.0);
-    assert!(t.v.take_actions().is_empty(), "a drag is not a tap");
+    assert!(t.take_actions().is_empty(), "a drag is not a tap");
     assert!(t.v.scroll_offset() > 100.0);
     assert!(r.timer_ms.is_some(), "fling continues");
     let before = t.v.scroll_offset();
@@ -140,12 +164,12 @@ fn wheel_and_keys_scroll() {
     assert_eq!(t.v.scroll_offset(), 100.0);
     // Outside the content (navigation) the wheel does nothing.
     assert!(!t.v.wheel(100.0, 300.0, 100.0).repaint);
-    t.v.key(0x23, true); // End
+    t.key(0x23); // End
     assert_eq!(t.v.scroll_offset(), t.v.max_scroll());
-    t.v.key(0x24, true); // Home
+    t.key(0x24); // Home
     assert_eq!(t.v.scroll_offset(), 0.0);
-    t.v.key(0x1B, true); // Esc
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::Close]);
+    t.key(0x1B); // Esc
+    assert_eq!(t.take_actions(), vec![SettingsAction::Close]);
 }
 
 #[test]
@@ -153,15 +177,15 @@ fn danger_action_needs_inline_confirmation() {
     let mut t = T::new(960.0, 680.0);
     t.v.set_page(Page::Clipboard);
     t.tap("清空");
-    assert!(t.v.take_actions().is_empty(), "first tap only asks");
+    assert!(t.take_actions().is_empty(), "first tap only asks");
     // The row now shows 取消 / 清空 in place.
     assert!(t.v.element_center("取消").is_some());
     t.tap("取消");
-    assert!(t.v.take_actions().is_empty());
+    assert!(t.take_actions().is_empty());
     assert!(t.v.element_center("取消").is_none());
     t.tap("清空");
     t.tap("清空");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::ClearClipboardHistory]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::ClearClipboardHistory]);
     assert!(t.v.element_center("取消").is_none(), "confirmation closes after acting");
 }
 
@@ -171,12 +195,12 @@ fn tapping_elsewhere_closes_confirmation() {
     t.tap("恢复默认");
     assert!(t.v.element_center("恢复").is_some());
     t.tap("autostart");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::SetAutostart(false)]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetAutostart(false)]);
     assert!(t.v.element_center("恢复").is_none());
     t.tap("恢复默认");
-    t.v.key(0x1B, true);
+    t.key(0x1B);
     assert!(t.v.element_center("恢复").is_none(), "Esc cancels the confirmation first");
-    assert!(t.v.take_actions().is_empty());
+    assert!(t.take_actions().is_empty());
 }
 
 #[test]
@@ -188,9 +212,9 @@ fn slider_drag_sends_value_on_release() {
     t.ev(PointerPhase::Down, x, y);
     t.ev(PointerPhase::Move, x + 30.0, y);
     t.ev(PointerPhase::Move, x + 400.0, y + 3.0);
-    assert!(t.v.take_actions().is_empty(), "nothing sent while dragging");
+    assert!(t.take_actions().is_empty(), "nothing sent while dragging");
     t.ev(PointerPhase::Up, x + 400.0, y + 3.0);
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::SetKeyboardHeight(1.5)]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetKeyboardHeight(1.5)]);
     assert_eq!(t.v.model().keyboard_height, 1.5);
 }
 
@@ -199,9 +223,9 @@ fn fuzzy_chips_toggle() {
     let mut t = T::new(960.0, 680.0);
     t.v.set_page(Page::Input);
     t.tap("fuzzy/z = zh");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::SetFuzzy(FuzzyPair::ZZh, true)]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetFuzzy(FuzzyPair::ZZh, true)]);
     t.tap("fuzzy/z = zh");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::SetFuzzy(FuzzyPair::ZZh, false)]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetFuzzy(FuzzyPair::ZZh, false)]);
 }
 
 #[test]
@@ -212,7 +236,7 @@ fn admin_task_fix_button_only_when_needed() {
     assert!(t.v.set_model(m.clone()));
     assert!(!t.v.set_model(m));
     t.tap("一键修复");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::FixAdminTask]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::FixAdminTask]);
 }
 
 #[test]
@@ -220,14 +244,14 @@ fn about_page_links_and_update_states() {
     let mut t = T::new(960.0, 680.0);
     t.v.set_page(Page::About);
     t.tap("homepage");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::OpenUrl(HOMEPAGE.into())]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::OpenUrl(HOMEPAGE.into())]);
     t.tap("检查更新");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::CheckUpdate]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::CheckUpdate]);
     for a in ["feedback", "diagnostics", "logs", "onboarding"] {
         t.tap(a);
     }
     assert_eq!(
-        t.v.take_actions(),
+        t.take_actions(),
         vec![SettingsAction::ReportIssue, SettingsAction::ExportDiagnostics, SettingsAction::OpenLogDir, SettingsAction::ShowOnboarding]
     );
     let mut m = t.v.model().clone();
@@ -237,16 +261,18 @@ fn about_page_links_and_update_states() {
     m.update = UpdateState::Available { version: "0.4.0".into(), notes: "新增设置界面\n修复若干问题".into() };
     t.v.set_model(m);
     t.tap("立即更新");
-    assert_eq!(t.v.take_actions(), vec![SettingsAction::InstallUpdate]);
+    assert_eq!(t.take_actions(), vec![SettingsAction::InstallUpdate]);
 }
 
 #[test]
 fn every_hit_target_is_at_least_44_dips() {
     for w in [960.0, 600.0] {
         let mut t = T::new(w, 680.0);
-        let mut m = SettingsModel::default();
-        m.admin_task = Status::warn("未注册");
-        m.pinned_clips = vec![crate::view::ClipItem { id: 7, text: "固定".into(), pinned: true }];
+        let m = SettingsModel {
+            admin_task: Status::warn("未注册"),
+            pinned_clips: vec![crate::view::ClipItem { id: 7, text: "固定".into(), pinned: true }],
+            ..SettingsModel::default()
+        };
         t.v.set_model(m);
         for p in Page::ALL {
             t.v.set_page(p);
@@ -300,18 +326,25 @@ fn every_page_paints() {
 struct O {
     v: OnboardingView,
     t: u64,
+    acts: Vec<SettingsAction>,
 }
 
 impl O {
     fn new() -> Self {
         let mut v = OnboardingView::new(SettingsModel::default(), ThemeKind::Light);
         v.resize(760.0, 560.0);
-        Self { v, t: 1000 }
+        Self { v, t: 1000, acts: Vec::new() }
     }
 
     fn ev(&mut self, phase: PointerPhase, x: f32, y: f32) -> Response {
         self.t += 16;
-        self.v.pointer(PointerEvent { id: 1, phase, x, y, time_ms: self.t })
+        let r = self.v.pointer(PointerEvent { id: 1, phase, x, y, time_ms: self.t });
+        self.acts.extend(settings_actions(&r));
+        r
+    }
+
+    fn take_actions(&mut self) -> Vec<SettingsAction> {
+        std::mem::take(&mut self.acts)
     }
 
     fn tap(&mut self, name: &str) {
@@ -338,10 +371,10 @@ fn onboarding_next_choose_and_finish() {
     o.tap("下一步");
     assert_eq!(o.v.page(), 1);
     o.tap("九宫格");
-    assert_eq!(o.v.take_actions(), vec![SettingsAction::SetLayout(LayoutChoice::T9)]);
+    assert_eq!(o.take_actions(), vec![SettingsAction::SetLayout(LayoutChoice::T9)]);
     o.tap("下一步");
     o.tap("系统语音");
-    assert_eq!(o.v.take_actions(), vec![SettingsAction::SetVoiceEngine(VoiceEngineChoice::System)]);
+    assert_eq!(o.take_actions(), vec![SettingsAction::SetVoiceEngine(VoiceEngineChoice::System)]);
     o.tap("上一步");
     assert_eq!(o.v.page(), 1);
     o.tap("下一步");
@@ -349,7 +382,7 @@ fn onboarding_next_choose_and_finish() {
     assert_eq!(o.v.page(), 3);
     assert!(o.v.element_center("跳过").is_none(), "no skip on the last card");
     o.tap("开始使用");
-    assert_eq!(o.v.take_actions(), vec![SettingsAction::FinishOnboarding]);
+    assert_eq!(o.take_actions(), vec![SettingsAction::FinishOnboarding]);
 }
 
 #[test]
@@ -370,12 +403,91 @@ fn onboarding_swipes_between_cards() {
     o.ev(PointerPhase::Up, 400.0, 300.0);
     o.settle();
     assert_eq!(o.v.page(), 0);
-    assert!(o.v.take_actions().is_empty());
+    assert!(o.take_actions().is_empty());
 }
 
 #[test]
 fn onboarding_skip_finishes() {
     let mut o = O::new();
     o.tap("跳过");
-    assert_eq!(o.v.take_actions(), vec![SettingsAction::FinishOnboarding]);
+    assert_eq!(o.take_actions(), vec![SettingsAction::FinishOnboarding]);
+}
+
+#[test]
+fn actions_reach_the_host_in_the_response() {
+    let mut t = T::new(960.0, 680.0);
+    assert!(t.v.scroll_into_view("autostart"));
+    let (x, y) = t.v.element_center("autostart").unwrap();
+    t.ev(PointerPhase::Down, x, y);
+    let r = t.ev(PointerPhase::Up, x, y);
+    assert_eq!(r.actions, vec![UiAction::Settings(SettingsAction::SetAutostart(false))]);
+    let r = t.key(0x1B);
+    assert_eq!(r.actions, vec![UiAction::Settings(SettingsAction::Close)]);
+}
+
+#[test]
+fn coming_soon_rows_get_a_tag() {
+    let model = SettingsModel { coming_soon: vec!["candidate_size".into()], ..SettingsModel::default() };
+    let blocks = pages::build(Page::Input, &model);
+    let rows: Vec<&widgets::Row> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Group { rows, .. } => Some(rows.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let tag = |key: &str| rows.iter().find(|r| r.key == key).and_then(|r| r.tag.clone()).map(|t| t.0);
+    assert_eq!(tag("candidate_size").as_deref(), Some("下个版本生效"));
+    assert_eq!(tag("space_first"), None);
+}
+
+#[test]
+fn toast_shows_and_goes_away() {
+    let mut t = T::new(960.0, 680.0);
+    let r = t.v.show_toast("下个版本提供", 5000);
+    assert!(r.repaint);
+    let ms = r.timer_ms.expect("hides itself");
+    assert!((1500..=5000).contains(&ms));
+    assert_eq!(t.v.toast(), Some("下个版本提供"));
+    #[derive(Default)]
+    struct Rec {
+        texts: Vec<String>,
+    }
+    impl crate::canvas::Canvas for Rec {
+        fn clear(&mut self, _: crate::canvas::Color) {}
+        fn fill_rect(&mut self, _: Rect, _: f32, _: crate::canvas::Color) {}
+        fn stroke_rect(&mut self, _: Rect, _: f32, _: f32, _: crate::canvas::Color) {}
+        fn text(&mut self, t: &str, _: Rect, _: TextStyle) {
+            self.texts.push(t.to_string());
+        }
+        fn measure_text(&mut self, t: &str, s: TextStyle) -> f32 {
+            widgets::text_w(t, s.size)
+        }
+        fn push_clip(&mut self, _: Rect) {}
+        fn pop_clip(&mut self) {}
+    }
+    let mut c = Rec::default();
+    t.v.paint(&mut c);
+    assert!(c.texts.iter().any(|s| s == "下个版本提供"));
+    let r = t.v.timer(5000 + ms);
+    assert!(r.repaint && r.timer_ms.is_none());
+    assert_eq!(t.v.toast(), None);
+}
+
+#[test]
+fn voice_page_lists_four_engines_without_fallback() {
+    let blocks = pages::build(Page::Voice, &SettingsModel::default());
+    let keys: Vec<String> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Group { rows, .. } => Some(rows.iter().map(|r| r.key.clone())),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    for e in VoiceEngineChoice::ALL {
+        assert!(keys.contains(&format!("engine_{}", e.key())), "{e:?}");
+    }
+    assert!(!keys.iter().any(|k| k == "voice_fallback"), "no Win+H fallback (TODO #37)");
 }

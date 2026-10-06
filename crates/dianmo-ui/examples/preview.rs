@@ -818,6 +818,12 @@ fn demo_model() -> SettingsModel {
                 note: "点墨以管理员权限运行时通过辅助进程调用".into(),
                 download_url: None,
             },
+            doubao_ime: EngineStatus {
+                available: false,
+                detail: "全局语音快捷键没有打开".into(),
+                download_url: Some("https://shurufa.doubao.com/pc".into()),
+                ..Default::default()
+            },
             doubao: EngineStatus { available: false, detail: "未检测到豆包语音".into(), ..Default::default() },
             system: EngineStatus { available: true, detail: "Windows 自带，随时可用".into(), ..Default::default() },
         },

@@ -1,0 +1,39 @@
+[package]
+name = "dianmo-setup"
+description = "点墨 Dianmo installer: DianmoSetup-<version>.exe (self-extracting) and its packer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+# The installer stub. `dianmo-pack` appends the payload (the dist dir) to a copy of it.
+[[bin]]
+name = "dianmo-setup"
+path = "src/main.rs"
+
+# Console tool (runs anywhere): dianmo-pack <dianmo-setup.exe> <dist dir> <out.exe>
+[[bin]]
+name = "dianmo-pack"
+path = "src/bin/dianmo-pack.rs"
+
+[dependencies]
+# Pure Rust deflate/inflate (zlib framing, Adler-32 checked on extraction).
+miniz_oxide = "0.8"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]

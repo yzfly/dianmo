@@ -451,7 +451,7 @@ impl KeyboardView {
         }
         let Target::Key(k) = &t.target else { return };
         match &t.mode {
-            Mode::Press if k.bubble => {
+            Mode::Press if k.bubble && self.key_popup => {
                 let label = match &k.action {
                     KeyAction::Letter(ch) if self.mods().on(Modifier::Shift) => ch.to_ascii_uppercase().to_string(),
                     KeyAction::Letter(ch) => ch.to_string(),

@@ -1602,3 +1602,45 @@ fn voice_mode_offers_an_exit_button() {
     assert!(h.v.set_voice_mode(false));
     assert!(h.v.key_center("exitvoice").is_none());
 }
+
+#[test]
+fn key_popup_setting_hides_the_bubble() {
+    let mut h = H::new();
+    assert!(h.v.key_popup());
+    assert!(h.v.set_key_popup(false));
+    assert!(!h.v.set_key_popup(false), "no change");
+    let base = h.paint().texts.iter().filter(|(t, _)| t == "g").count();
+    h.down(1, h.at("g"));
+    let n = h.paint().texts.iter().filter(|(t, _)| t == "g").count();
+    assert_eq!(n, base, "no bubble");
+    assert_eq!(h.up(1, h.at("g")), vec![input(Action::Char('g'))], "the key still types");
+}
+
+#[test]
+fn long_press_delay_is_a_setting() {
+    let mut h = H::new();
+    assert_eq!(h.v.long_press_ms(), LONG_PRESS_MS);
+    assert!(h.v.set_long_press_ms(500));
+    assert!(h.v.set_long_press_ms(5), "clamped, changed");
+    assert_eq!(h.v.long_press_ms(), 150);
+    h.v.set_long_press_ms(500);
+    let p = h.at("q");
+    h.down(1, p);
+    assert_eq!(h.last.timer_ms, Some(500));
+    h.wait(LONG_PRESS_MS);
+    assert!(!matches!(h.v.touches[0].mode, Mode::Long { .. }), "not yet at 350 ms");
+    h.wait(500 - LONG_PRESS_MS);
+    assert!(matches!(h.v.touches[0].mode, Mode::Long { .. }));
+}
+
+#[test]
+fn toolbar_gear_opens_settings() {
+    for w in [W, WIDE] {
+        let mut h = H::sized(w, st(true, Schema::Pinyin, "", &[]));
+        assert!(h.v.key_center("settings").is_some(), "gear on the idle toolbar ({w})");
+        assert_eq!(h.tap("settings"), vec![UiAction::OpenSettings]);
+    }
+    // Not while composing (the candidate bar replaces the toolbar).
+    let h = H::with(st(true, Schema::Pinyin, "ni", NIHAO));
+    assert!(h.v.key_center("settings").is_none());
+}

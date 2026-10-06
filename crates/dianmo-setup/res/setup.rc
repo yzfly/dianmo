@@ -1,0 +1,30 @@
+// Resources embedded into dianmo-setup.exe by build.rs (llvm-windres from llvm-mingw).
+#pragma code_page(65001)
+1 ICON "../../dianmo/res/dianmo.ico"
+1 24 "setup.manifest"
+
+1 VERSIONINFO
+FILEVERSION     DIANMO_VER_MAJOR,DIANMO_VER_MINOR,DIANMO_VER_PATCH,0
+PRODUCTVERSION  DIANMO_VER_MAJOR,DIANMO_VER_MINOR,DIANMO_VER_PATCH,0
+FILEOS          0x40004
+FILETYPE        0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080404B0"
+    BEGIN
+      VALUE "CompanyName",      "云中江树"
+      VALUE "FileDescription",  "点墨 安装程序"
+      VALUE "FileVersion",      DIANMO_VER_STR
+      VALUE "InternalName",     "dianmo-setup"
+      VALUE "OriginalFilename", "DianmoSetup.exe"
+      VALUE "ProductName",      "点墨 Dianmo"
+      VALUE "ProductVersion",   DIANMO_VER_STR
+      VALUE "LegalCopyright",   "GPL-3.0-or-later"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0804, 0x04B0
+  END
+END

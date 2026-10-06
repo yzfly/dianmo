@@ -219,6 +219,10 @@ pub struct KeyboardView {
     /// Voice mode (the floating ball is the voice button): the bar offers 「退出语音模式」 and the
     /// layout menu's 语音球 tile turns it off.
     pub(crate) voice_mode: bool,
+    /// Bubble above pressed keys (user setting).
+    pub(crate) key_popup: bool,
+    /// Long-press delay in ms (user setting).
+    pub(crate) long_ms: u64,
 }
 
 impl Default for KeyboardView {
@@ -273,6 +277,8 @@ impl KeyboardView {
             toast: None,
             voice_active: false,
             voice_mode: false,
+            key_popup: true,
+            long_ms: LONG_PRESS_MS,
         };
         v.rebuild();
         v
@@ -280,6 +286,27 @@ impl KeyboardView {
 
     pub fn theme(&self) -> ThemeKind {
         self.theme_kind
+    }
+
+    /// The magnified bubble above a pressed key (user setting, default on). Returns whether it
+    /// changed.
+    pub fn set_key_popup(&mut self, on: bool) -> bool {
+        std::mem::replace(&mut self.key_popup, on) != on
+    }
+
+    pub fn key_popup(&self) -> bool {
+        self.key_popup
+    }
+
+    /// Long-press delay for alternates, the trackpad excluded (user setting: 250 / 350 / 500 ms;
+    /// clamped to 150..=1000). Returns whether it changed.
+    pub fn set_long_press_ms(&mut self, ms: u64) -> bool {
+        let ms = ms.clamp(150, 1000);
+        std::mem::replace(&mut self.long_ms, ms) != ms
+    }
+
+    pub fn long_press_ms(&self) -> u64 {
+        self.long_ms
     }
 
     /// Switches the colour theme. The caller repaints.
@@ -443,6 +470,7 @@ impl KeyboardView {
             "voiceball" => k.action == KeyAction::VoiceBall && k.tone == Tone::Tile,
             "exitvoice" => k.action == KeyAction::VoiceBall && k.label == EXIT_VOICE_LABEL,
             "hide" => k.action == KeyAction::Hide,
+            "settings" => k.action == KeyAction::Settings,
             "symbols" => k.action == KeyAction::Symbols,
             "numbers" => k.action == KeyAction::Numbers,
             "back" => k.action == KeyAction::Back,
@@ -648,6 +676,7 @@ impl KeyboardView {
         }
         apps.push(flat(KeyAction::ClipPanel, layout::icon::CLIPBOARD));
         apps.push(flat(KeyAction::Tab(SymTab::Emoji), layout::icon::EMOJI));
+        apps.push(flat(KeyAction::Settings, layout::icon::SETTINGS));
         let app_w = |k: &Key| if k.sub.is_some() { tool_w * 1.15 } else { icon_w };
         let apps_w: f32 = apps.iter().map(app_w).sum();
         let mut tools = Vec::new();
@@ -1010,15 +1039,15 @@ impl KeyboardView {
                     // Win: long-press latches. 电脑键盘: a long-pressed Shift / Ctrl / Alt is
                     // really held down.
                     if m == Modifier::Win || self.pc && m != Modifier::Fn {
-                        t.long_at = Some(e.time_ms + LONG_PRESS_MS);
+                        t.long_at = Some(e.time_ms + self.long_ms);
                     }
                 }
-                _ if k.has_long_press() => t.long_at = Some(e.time_ms + LONG_PRESS_MS),
+                _ if k.has_long_press() => t.long_at = Some(e.time_ms + self.long_ms),
                 _ => {}
             },
-            Target::Bar(k) if k.hold.is_some() => t.long_at = Some(e.time_ms + LONG_PRESS_MS),
+            Target::Bar(k) if k.hold.is_some() => t.long_at = Some(e.time_ms + self.long_ms),
             Target::ClipGrid(Some(_)) => {
-                t.long_at = Some(e.time_ms + LONG_PRESS_MS);
+                t.long_at = Some(e.time_ms + self.long_ms);
                 t.stopped_fling = self.clip_scroll.stop();
                 t.vel.push(e.y, e.time_ms);
             }
@@ -1073,7 +1102,7 @@ impl KeyboardView {
                     } else if k.bubble && !expand(k.cell, k.cell.w * 0.15, row_h * 0.2).contains(e.x, e.y) {
                         // Slid onto another key: the key under the finger fires on release.
                         if let Some(nk) = self.nearest_key(e.x, e.y).filter(|nk| nk.bubble && nk.cell != k.cell) {
-                            t.long_at = nk.has_long_press().then_some(e.time_ms + LONG_PRESS_MS);
+                            t.long_at = nk.has_long_press().then_some(e.time_ms + self.long_ms);
                             t.target = Target::Key(nk.clone());
                             t.x0 = e.x;
                             t.y0 = e.y;
@@ -1426,6 +1455,10 @@ impl KeyboardView {
                 r.actions.push(UiAction::VoiceBall);
             }
             KeyAction::Hide => r.actions.push(UiAction::Hide),
+            KeyAction::Settings => {
+                self.release_modifiers(r);
+                r.actions.push(UiAction::OpenSettings);
+            }
             KeyAction::ExpandCandidates => {
                 self.set_panel(Panel::Candidates);
                 self.request_more(r);

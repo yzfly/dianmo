@@ -144,6 +144,11 @@
   - `Canvas::image(name, rect)`。
 - 悬浮球：`BallEvent::{Tap, LongPress, Moved(BallPos)}`、`BallPos { edge: BallEdge, y_frac: f32 }`（实现了 Default）、`BallEdge::{Left, Right}`、`BallState::{Idle, Listening}`（在 `handle.rs`；需要 `lib.rs` 加 `pub use handle::{BallEdge, BallEvent, BallPos, BallState};`）
 - `TrayItem::{Command { id: u32, label: String, checked: bool }, Separator, Submenu { label: String, items: Vec<TrayItem> }}`
+- 2026-10-06 新增（主程序接设置窗口用）：
+  - `HostOptions::tray_builtins`（默认 true）：false 时托盘菜单只有 app 的项（app 自己放「显示/隐藏键盘」「退出」，用 `toggle()` / `quit()`）。
+  - `HostControl::reveal_ball(ms)`：球（键盘收起时）完全露出并保持 `ms` 毫秒再收边（取代主程序重置内部计时器 id 2 的做法）；在同一回调的显示 / 隐藏之后执行。
+  - `HostControl::set_ball_pos(BallPos)`（设置里「靠左 / 靠右」）、`set_ball_enabled(bool)`（运行中创建 / 销毁悬浮球，位置保留）。
+  - `App::on_system_theme_changed(dark, view, host) -> Response`（默认空）：键盘窗口收到 `WM_SETTINGCHANGE "ImmersiveColorSet"` 时调用（Windows 一次切换会发好几次，app 自己去重）。
 - `focus::{start_focus_watcher(HostProxy) -> Result<FocusWatcher>, FocusWatcher /*Drop 即停止*/, FocusEvent::{Editable { kind, by_touch }, NotEditable { by_touch }}, FieldKind::{Text, Number, Password, Url, Search}, TOUCH_WINDOW_MS}`；第一条事件永远是当前焦点（by_touch=false）。App 在 `on_event` 里 `event.downcast::<FocusEvent>()`。
 - `HostProxy`（Send + Sync + Copy）：`post<T: Any+Send>(T)`（交给 `App::on_event`）、`show / hide / toggle / quit / hwnd`
 - `SendInputSink`（实现 `TextSink`）、`send_text`、`send_edit_key`、`start_voice_typing`、`now_ms`

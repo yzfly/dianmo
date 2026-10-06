@@ -1,4 +1,6 @@
-//! Embeds the 「墨」 icon and version info into dianmo.exe on Windows targets.
+//! Embeds the icon, the `app-icon` PNG (settings / about / onboarding) and version info into
+//! dianmo.exe on Windows targets, and sets `DIANMO_BUILD_DATE` (YYYY-MM-DD, UTC; override with the
+//! environment variable of the same name) for the about page.
 //!
 //! Uses `llvm-windres` / `windres` from llvm-mingw (on PATH in `scripts/surface/build.sh`). When no
 //! resource compiler is found (e.g. `cargo check` on the Linux server) the exe simply has no icon.
@@ -7,9 +9,32 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Civil date (UTC) from unix seconds (Howard Hinnant's `civil_from_days`).
+fn date_from_unix(secs: u64) -> String {
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=res/dianmo.rc");
     println!("cargo:rerun-if-changed=res/dianmo.ico");
+    println!("cargo:rerun-if-changed=res/app-icon.png");
+    // Any source change re-runs this script, so the build date stays current.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-env-changed=DIANMO_BUILD_DATE");
+    let date = env::var("DIANMO_BUILD_DATE").unwrap_or_else(|_| {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        date_from_unix(now)
+    });
+    println!("cargo:rustc-env=DIANMO_BUILD_DATE={date}");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

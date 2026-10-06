@@ -110,10 +110,6 @@ impl OnboardingView {
         &self.model
     }
 
-    pub fn take_actions(&mut self) -> Vec<SettingsAction> {
-        std::mem::take(&mut self.actions)
-    }
-
     /// Centre of a named element for tests / automation: "跳过", "上一步", "下一步", "开始使用",
     /// a layout name ("九宫格") or an engine name ("系统语音").
     pub fn element_center(&self, name: &str) -> Option<(f32, f32)> {
@@ -172,9 +168,9 @@ impl OnboardingView {
 
     fn engine_rows(&self) -> Vec<(Rect, VoiceEngineChoice)> {
         let (x, w) = self.column();
-        let rh = 72.0;
-        let y0 = 132.0;
-        VoiceEngineChoice::ALL.iter().enumerate().map(|(i, &e)| (Rect::new(x, y0 + i as f32 * (rh + 12.0), w, rh), e)).collect()
+        let rh = 62.0;
+        let y0 = 128.0;
+        VoiceEngineChoice::ALL.iter().enumerate().map(|(i, &e)| (Rect::new(x, y0 + i as f32 * (rh + 10.0), w, rh), e)).collect()
     }
 
     fn bar_buttons(&self) -> Vec<(Rect, Target)> {
@@ -362,6 +358,7 @@ impl OnboardingView {
             }
             let glyph = match e {
                 VoiceEngineChoice::WeType => "\u{E8BD}",
+                VoiceEngineChoice::DoubaoIme => "\u{E765}",
                 VoiceEngineChoice::Doubao => "\u{E720}",
                 VoiceEngineChoice::System => "\u{E7F8}",
             };
@@ -369,10 +366,11 @@ impl OnboardingView {
             c.fill_rect(ib, 10.0, if sel { t.accent_soft } else { t.fill });
             c.text(glyph, ib, icon(18.0, if sel { t.accent } else { t.text_secondary }));
             let tx = ib.x + 54.0;
-            c.text(e.name(), Rect::new(tx, r.y + 14.0, 200.0, 22.0), bold(15.0, t.text));
+            let ty = r.y + (r.h - 44.0) / 2.0;
+            c.text(e.name(), Rect::new(tx, ty, 200.0, 22.0), bold(15.0, t.text));
             if e == rec && st.available {
                 let x = tx + text_w(e.name(), 15.0) + 8.0;
-                let tr = Rect::new(x, r.y + 16.0, 34.0, 18.0);
+                let tr = Rect::new(x, ty + 2.0, 34.0, 18.0);
                 c.fill_rect(tr, 4.0, t.accent_soft);
                 c.text("推荐", tr, centered(11.0, t.accent));
             }
@@ -383,7 +381,7 @@ impl OnboardingView {
             } else {
                 Status::warn(st.detail.clone())
             };
-            status_line(c, t, &status, Rect::new(tx, r.y + 40.0, r.w - (tx - r.x) - 60.0, 18.0));
+            status_line(c, t, &status, Rect::new(tx, ty + 26.0, r.w - (tx - r.x) - 60.0, 18.0));
             radio(c, t, Rect::new(r.x + r.w - 42.0, r.y + (r.h - 22.0) / 2.0, 22.0, 22.0), sel);
         }
         let (x, w) = self.column();
@@ -454,31 +452,14 @@ impl OnboardingView {
     }
 }
 
-impl View for OnboardingView {
-    fn resize(&mut self, width: f32, height: f32) {
-        self.w = width;
-        self.h = height;
+impl OnboardingView {
+    /// Hands the queued [`SettingsAction`]s to the host with the response.
+    fn flush(&mut self, mut r: Response) -> Response {
+        r.actions.extend(self.actions.drain(..).map(crate::view::UiAction::Settings));
+        r
     }
 
-    fn preferred_height(&self, _width: f32) -> f32 {
-        560.0
-    }
-
-    fn paint(&mut self, c: &mut dyn Canvas) {
-        let t = self.theme;
-        c.clear(t.background);
-        c.push_clip(Rect::new(0.0, 0.0, self.w, self.content_h()));
-        for i in 0..ONBOARDING_PAGES {
-            let dx = (i as f32 - self.page as f32) * self.w + self.offset;
-            if dx.abs() < self.w {
-                self.paint_page(c, i, dx);
-            }
-        }
-        c.pop_clip();
-        self.paint_bar(c);
-    }
-
-    fn pointer(&mut self, e: PointerEvent) -> Response {
+    fn handle_pointer(&mut self, e: PointerEvent) -> Response {
         match e.phase {
             PointerPhase::Down => {
                 if self.press.is_some() {
@@ -541,20 +522,7 @@ impl View for OnboardingView {
         }
     }
 
-    fn timer(&mut self, now_ms: u64) -> Response {
-        let Some(s) = self.slide else { return Response::none() };
-        let f = (now_ms.saturating_sub(s.start) as f32 / SLIDE_MS as f32).clamp(0.0, 1.0);
-        let e = 1.0 - (1.0 - f).powi(3);
-        self.offset = s.from * (1.0 - e);
-        if f >= 1.0 {
-            self.offset = 0.0;
-            self.slide = None;
-            return Response::repaint();
-        }
-        Response { repaint: true, actions: Vec::new(), timer_ms: Some(FRAME_MS) }
-    }
-
-    fn key(&mut self, vk: u32, down: bool) -> Response {
+    fn handle_key(&mut self, vk: u32, down: bool) -> Response {
         if !down {
             return Response::none();
         }
@@ -572,6 +540,54 @@ impl View for OnboardingView {
             0x1B => self.activate(Target::Skip, 0),
             _ => Response::none(),
         }
+    }
+}
+
+impl View for OnboardingView {
+    fn resize(&mut self, width: f32, height: f32) {
+        self.w = width;
+        self.h = height;
+    }
+
+    fn preferred_height(&self, _width: f32) -> f32 {
+        560.0
+    }
+
+    fn paint(&mut self, c: &mut dyn Canvas) {
+        let t = self.theme;
+        c.clear(t.background);
+        c.push_clip(Rect::new(0.0, 0.0, self.w, self.content_h()));
+        for i in 0..ONBOARDING_PAGES {
+            let dx = (i as f32 - self.page as f32) * self.w + self.offset;
+            if dx.abs() < self.w {
+                self.paint_page(c, i, dx);
+            }
+        }
+        c.pop_clip();
+        self.paint_bar(c);
+    }
+
+    fn pointer(&mut self, e: PointerEvent) -> Response {
+        let r = self.handle_pointer(e);
+        self.flush(r)
+    }
+
+    fn timer(&mut self, now_ms: u64) -> Response {
+        let Some(s) = self.slide else { return Response::none() };
+        let f = (now_ms.saturating_sub(s.start) as f32 / SLIDE_MS as f32).clamp(0.0, 1.0);
+        let e = 1.0 - (1.0 - f).powi(3);
+        self.offset = s.from * (1.0 - e);
+        if f >= 1.0 {
+            self.offset = 0.0;
+            self.slide = None;
+            return Response::repaint();
+        }
+        Response { repaint: true, actions: Vec::new(), timer_ms: Some(FRAME_MS) }
+    }
+
+    fn key(&mut self, vk: u32, down: bool) -> Response {
+        let r = self.handle_key(vk, down);
+        self.flush(r)
     }
 
     fn set_input_state(&mut self, _state: InputState) -> Response {

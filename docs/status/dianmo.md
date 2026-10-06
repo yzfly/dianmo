@@ -216,3 +216,104 @@ engine-test 开自己的记事本（`-Medium` 用 explorer 以普通权限开）
 - 语音模式启动 → 键盘在、`exitvoice` → `voice_mode=false` 键盘留着；托盘「语音模式」→ 键盘收起、球完全露出（4.5 秒后仍未半隐）、气泡显示；语音模式下 `SECOND` → 键盘显示；收起后长按球 → 显示。空闲 10 秒 CPU 0 ms，WM_CLOSE 退出码 0，剪贴板恢复。
 - 豆包输入法（当前配置 `voiceShortcutMode=null`、全局快捷键关）→ 点球立刻在球旁气泡提示原因，不发任何热键。
 - **未通过 / 未测**：这一轮 WeType 在普通记事本前台时也不收音了（点墨发、PowerShell 提权发都不行；停掉豆包输入法的 ImeService 也不行），而同一台机器 1 小时前同样的测试是 283 ms 收音 → 判断是 WeType 的语音进程又进入了「热键失灵」状态（见上面「WeType 的语音进程会崩」一条；恢复办法是结束 WeType 三个进程后在普通窗口里重新激活 WeType），没有在用户正在用的机器上动它。管理员窗口分支（立即提示）的逻辑没在点墨里实测（测试脚本没能把管理员记事本切到前台），判断依据是上面的 PowerShell 矩阵。豆包输入法的热键：注入 `右 Alt+空格`（扩展键）和按住右 Alt 都没让它收音（当时它是记事本的当前输入法、配置为 right_alt_space、全局关；可能与没完成首次引导或与搜狗「AI汪仔」抢右 Alt 有关——测试时 AI汪仔 侧栏弹了出来，已关掉），所以豆包输入法引擎是按配置实现的、未实测通过。Edge 输入框、TTS 上屏没测成（WeType 不收音）。
+
+## 安装包、卸载、检查更新、反馈与诊断（PRODUCT.md P1 / P2 / P6 / P7，2026-10-06）
+设计取舍见 DESIGN.md §6.1。
+
+**安装包 `crates/dianmo-setup`**（`DianmoSetup-<版本>.exe`）
+- stub `dianmo-setup.exe`（windows 子系统，manifest：asInvoker、PerMonitorV2、Common Controls v6；图标和版本信息复用 `crates/dianmo/res/dianmo.ico`）585KB，导入表只有系统 DLL；打包工具 `dianmo-pack <stub> <dist> <out.exe> [--version v]`（控制台，两线程压缩）。负载格式见 `src/lib.rs`：逐文件 zlib（miniz_oxide 0.8，纯 Rust，Adler-32 校验）追加在 stub 后面，尾部 32 字节索引。实测 dist 46 个文件 49.2MB → 安装包 **20.7MB**，打包 12.7s。
+- 参数：`/S`（静默，升级用；装完以 `--hidden` 启动）、`/NORUN`、`--instance <名>`（测试：任务 / 卸载项 `Dianmo<名>`、快捷方式「点墨 <名>」、默认目录 `%LOCALAPPDATA%\Dianmo-<名>`）；环境变量 `DIANMO_INSTALL_ROOT` 指定安装目录（测试用）。日志 `%TEMP%\DianmoSetup.log`。
+- 流程：解压到 `<目录>.new` → `<目录>.new\dianmo.exe --quit`（退出码 3 = 对方提权、消息被 UIPI 挡住 → 提权再跑一次）→ `<目录>`→`.old`、`.new`→`<目录>`（失败回滚；改名失败时覆盖复制）→ `<目录>\dianmo.exe --install [--quiet] [--no-run]`。界面：一个小窗口「点墨 · 正在安装…」+ 进度条（GDI 自绘，200% 下已截图确认），没有按钮；失败时一个 MessageBox 说明原因。拒绝 UAC 时仍装好，提示「暂时不能给管理员窗口输入，可以在设置里修复」。
+- 为什么 asInvoker + 单独提权：见 DESIGN.md §6.1（拒绝 UAC 仍可用；从提权的点墨发起的升级不弹 UAC；重装时任务已指向同一 exe 则完全不弹；装完以用户身份启动点墨）。
+
+**`dianmo.exe` 新参数**（`src/install.rs`，main.rs 只加了分支）
+- `--quit`：找本实例的消息窗口，发 `WM_APP+0x52`（platform.rs `WM_APP_QUIT`，提权实例用 `ChangeWindowMessageFilterEx` 放行，和 show 消息一样）；4 秒没退出（旧版本不认识这条消息）就给该进程的 `DianmoKeyboard` 窗口发 `WM_CLOSE`；等进程句柄（打不开就等窗口消失）。退出码 0 = 没在运行或已退出，1 = 还在运行，3 = 被 UIPI 拒绝。从不强杀。
+- `--install [--quiet] [--no-run]`：桌面和开始菜单「点墨」、开始菜单「点墨设置」（`--settings`）；HKCU `...\Uninstall\Dianmo`（DisplayName 点墨、DisplayIcon、DisplayVersion、Publisher 云中江树、URLInfoAbout、HelpLink、InstallLocation、InstallDate、UninstallString `"<exe>" --uninstall`、QuietUninstallString `... --uninstall --quiet`、EstimatedSize、NoModify、NoRepair）；计划任务已指向本 exe 就跳过，否则提权跑 `--register-task`（已提权就直接跑）；最后启动点墨。退出码 0 / 2（任务没注册）/ 1（快捷方式或卸载项失败）。
+- `--uninstall [--keep-data | --delete-data] [--quiet | /S]`：不安静时先问（MessageBox 是/否/取消：保留个人数据 / 一并删除 / 不卸载，默认保留）→ 关掉点墨（被 UIPI 拒绝就提权 `--quit`）→ settings.ini 里还有 `saved_*`（崩溃留下的）就恢复系统触摸键盘设置 → 删计划任务（没权限就提权 `--unregister-task`）、旧 Run 项、快捷方式、卸载项 → 弹「点墨已卸载」→ 起一个隐藏的 `cmd`（工作目录 %TEMP%），每秒重试 `rmdir` 直到程序目录（和选了删除时的 `%APPDATA%\Dianmo`）删掉，最多 30 秒。程序目录只在等于登记的 InstallLocation / 默认目录 / `DIANMO_INSTALL_ROOT` 且含 dianmo.exe 时才删（从构建目录误跑不会删代码）。退出码 1602 = 用户取消。
+- `--check-update`：打印检查结果（测试用；`DIANMO_UPDATE_REPO=owner/name` 换仓库；`DIANMO_UPDATE_TEST_DOWNLOAD="<url> <size> <sha256>"` 按升级的方式下载一个文件并校验）。
+- `--diagnostics`：打印预填好的 issue 链接并导出诊断包。
+
+**检查更新 `src/update.rs`**（给 app.rs，已在用 `update::Release`）
+```rust
+update::start_auto_check(proxy, settings.last_update_check); // 启动时一次：1 分钟后检查，之后每天最多一次
+update::set_auto_check(settings.auto_update);                 // 「自动检查更新」开关
+update::check_async(proxy);                                   // 「检查更新」（进行中再点会被忽略）
+update::download_and_install(release, proxy);                 // 「立即更新」
+// App::on_event: event.downcast::<update::UpdateEvent>()
+enum UpdateEvent {
+    Checked { auto: bool, at: u64, outcome: Result<CheckOutcome, String> }, // at → settings.last_update_check
+    Progress(f32),   // → UpdateState::Downloading
+    Installing,      // 安装包已以 /S 运行，它会 --quit 本实例；可以收起设置窗口
+    Failed(String),  // → UpdateState::Failed
+}
+enum CheckOutcome { UpToDate { latest }, NoRelease, Available(Release) }
+struct Release { version, tag, notes /* 纯文本，≤1200 字 */, url /* 空 = 没有安装包，打开 page */, size, sha256, page }
+```
+- WinHTTP（系统代理 `WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY`，超时 10/10/15/30s，UA `Dianmo/<ver>`）请求 `https://api.github.com/repos/yzfly/dianmo/releases/latest`；404（仓库不存在或没有 release）→ `NoRelease`，403/429 → 「GitHub 暂时限制了访问次数」，网络错误翻成中文。JSON 用内置小解析器（不引 serde_json）；版本按 semver 比较（预发布低于正式版）。说明文字去掉 Markdown / HTML 标记。
+- 下载到 `%TEMP%\DianmoSetup-<ver>.exe.part`，校验大小和 GitHub 资产的 `digest`（SHA-256，CNG `BCRYPT_SHA256_ALG_HANDLE`），通过后改名并以 `/S`（带 `--instance`）运行。
+- 自动检查线程：睡 60s，之后每小时醒一次看墙钟（休眠不会拉长「一天」），`AUTO` 关时什么都不做；每进程只起一个。没有 UI 线程定时器。
+- 体积：dianmo.exe 增加约 126KB（WinHTTP、JSON、zip、安装 / 卸载），导入表多了 `winhttp.dll`（已加进 package.sh 白名单）。
+
+**反馈与诊断 `src/diag.rs`**
+- `diag::report_issue_url() -> String`：`https://github.com/yzfly/dianmo/issues/new?title=&body=…`，预填版本、系统（注册表 ProductName + DisplayVersion + 内部版本.UBR，build ≥ 22000 写 Windows 11）、屏幕（主显示器分辨率、缩放，多显示器注明个数）、管理员模式、语音引擎。
+- `diag::export() -> Result<PathBuf, String>`：桌面 `点墨诊断-<日期>-<时间>.zip`（stored zip，UTF-8 文件名）：info.txt（以上信息 + exe 路径、实例、计划任务、数据目录文件清单）、dianmo.log、dianmo.log.old、settings.ini、安装日志；**不含** clips.txt 和 rime 用户词库；所有文件里的用户目录替换成 `%USERPROFILE%`。
+- `diag::open_url(url)` / `diag::reveal(path)`：在短线程里打开；点墨提权时通过桌面 Explorer 的 `IShellDispatch2::ShellExecute` 打开（浏览器以普通用户身份运行，不会变成管理员浏览器），失败再退回 `ShellExecuteW`。
+- `diag::system_info()` / `issue_body()` / `issue_url()` 是纯函数部分，Linux 上有测试。
+
+**打包**：`scripts/surface/package.sh <名字> --setup [--keep-target]`：构建时多带 `-p dianmo-setup`，组装 dist 后检查 stub 导入表、打 `C:\dev\dianmo-dist\<名字>\DianmoSetup-<ver>.exe`（ver = 工作区版本），scp 回仓库 `dist/`（已加进 .gitignore）。
+
+**测试**
+- 服务器：`cargo test -p dianmo-setup`（负载往返、损坏检测、路径安全，3 个）；dianmo 新增测试 6 个（版本比较、JSON、release 解析 / 说明文字、issue 链接编码、脱敏、zip 结构；zip 另用 Python zipfile 验证过）。clippy（gnullvm）干净。
+- Surface（用 `HEAD + 本轮改动` 的隔离副本构建，`--instance SetupTest`，`DIANMO_INSTALL_ROOT=C:\dev\dianmo-instest\Dianmo`，gui 任务 = 提权；用户自己的点墨一直在运行，没碰）：
+  - 静默安装 2.2s（解压 0.5s）：46 个文件 / 49.2MB、任务 `DianmoSetupTest`（`--task --instance SetupTest`，Highest）、卸载项各值正确（见上）、三个快捷方式目标和参数正确。
+  - 提权实例 + 用 RunLevel Limited 的临时任务跑 `--quit` → 1.2s 内正常退出（UIPI 放行生效，日志「asked to quit」→「exit」）。
+  - 覆盖升级：运行中的实例被安装包 `--quit` 关掉，目录整体替换（旧目录里多放的文件消失，没有留下 `.old`），任务已指向同一 exe → 不再注册。
+  - `--check-update`：rust-lang/rust → 「available 1.99.0」，说明文字正常；yzfly/dianmo（还不存在）→ `NoRelease`。下载：ripgrep 的一个 109 字节资产（302 跳转到 objects.githubusercontent.com）→ 成功；错的 SHA-256 → 「安装包校验失败」；错的大小 → 「下载不完整」；404 → 「下载失败（HTTP 404）」。
+  - `--diagnostics`：issue 链接 1092 字符；zip 4 个文件，info.txt「Windows 10 Enterprise LTSC 2021 21H2（19044.7184）/ 2880×1920，缩放 200% / 管理员模式：是」，路径已脱敏；测完删掉。
+  - 卸载（`--quiet --delete-data`，实例在运行）：退出码 0，实例退出，程序目录、数据目录、任务、卸载项、快捷方式全部清掉。
+  - 交互安装（`/NORUN`）：进度窗口截图正常（200%，标题栏图标、「点墨 · 安装完成 / 版本 0.1.0 · 100%」、蓝色进度条），整个安装不到 1 秒。
+  - 测完 Surface 上没有残留（`C:\dev\dianmo-setup`、测试 dist、测试目录、任务、快捷方式都删了）。
+
+**遗留 / 没测**
+- 没测普通权限下的 UAC 路径（安装时注册任务、卸载时删任务的提权弹窗；用户正在用机器，不弹 UAC），以及拒绝 UAC 的分支；逻辑是 `ShellExecuteEx runas`，`ERROR_CANCELLED` → 退出码 2 / 提示。
+- 交互式卸载的 MessageBox（是/否/取消、完成提示）没在实机上点过。
+- `download_and_install` 的最后一步（以 `/S` 运行真正的安装包、旧实例被关掉、新版 `--hidden` 启动）要等 yzfly/dianmo 有第一个 release 后实测；从当前已安装的旧版（不认识 `WM_APP_QUIT`）升级时，会走「4 秒后 WM_CLOSE」，若旧版是提权的则安装包要提权一次（弹一次 UAC）。
+- 「点墨设置」快捷方式只在开始菜单；桌面只有「点墨」。package.sh 的 `--install` 段仍是原来的 robocopy 流程（另一个 agent 在改），以后可以改成直接运行安装包 `/S`。
+- 安装包没有签名；SmartScreen 对没信誉的下载会拦一次（「仍要运行」）。
+
+## 设置窗口、关于、首次引导接入主程序（TODO #33 / PRODUCT P3 P4 P5 P8 P9，2026-10-06）
+
+**改动**
+- `settings.rs`：新键 `input_mode=keyboard|voice|pc`（取代 `voice_mode` / `pc_keyboard`，旧键仍能读，写回时只写新键）、`theme=system|light|dark`（默认跟随系统）、`show_ball`、`key_popup`、`key_sound`、`long_press=short|medium|long`、`candidate_size`、`full_width_punct`、`space_commits_first`、`fuzzy=z-zh,n-l,…`、`shuangpin`、`clip_history`、`clip_limit`（默认 50）、`clip_skip_passwords`、`auto_update`、`last_update_check`、`onboarded`；`reset_preferences()`（恢复默认：保留开机自启、引导状态、球的位置、`saved_*`）。
+- `prefs.rs`（纯逻辑，Linux 上有测试）：`model(&Settings, &SysState) -> SettingsModel`、`apply(&mut Settings, &SettingsAction) -> bool`、`engine_status`（引擎检测结果 → 状态点 / 说明 / 下载链接）、`effective_theme` / `window_dark`、`layout_schema`。测试保证「视图自己 apply 后的模型」和「主程序存进 ini 再读出来的模型」一致。
+- `app/settings_ui.rs`（`DianmoApp` 的设置窗口部分）：
+  - 设置窗口单例（960×680，可缩放，最小 420×420，再开就 `focus_window`，可指定分页）；引导窗口 760×560 不可缩放。
+  - 窗口发来的 `UiAction::Settings(a)` 先 post 给自己（`SettingsCmd`），在 `on_event` 里拿着键盘 View 处理：存 ini → 立即作用到键盘（主题、高度、编辑区、按键气泡、长按时长、布局、输入模式）、宿主（让出屏幕空间、悬浮球开关 / 位置）、系统（开机自启、管理员任务）、语音引擎、剪贴板（条数上限、不记录、不记密码框、清空、取消固定）。
+  - 每个回调结束时 `sync_windows`：模型变了就 `update_window` 推给打开的窗口（托盘、键盘布局菜单、拖球改了设置也会刷新）；处理完设置动作后强制推一次，所以没能生效的开关会弹回去。
+  - 主题「跟随系统」：`system_dark_mode()` + dianmo-win 新的 `App::on_system_theme_changed`（键盘窗口收到 `WM_SETTINGCHANGE "ImmersiveColorSet"` 时回调，不轮询）。
+  - 管理员窗口支持：打开设置时后台查计划任务；「一键修复」= 已提权就直接 `elevate::register`，否则 `ShellExecuteEx runas dianmo.exe --register-task`（UAC），完成后提示并重查。
+  - 开机自启失败（任务存在但点墨没提权）时提示原因，开关弹回。
+  - 豆包语音程序位置：后台线程里开系统的文件对话框（`shell::pick_exe`，IFileOpenDialog），不阻塞 UI 线程。
+  - 关于页：链接、反馈问题、打开日志目录走 `diag::open_url`（提权时经 Explorer 以普通权限打开）；导出诊断包在后台线程里 `diag::export()`，完成后提示并在资源管理器里选中；检查更新 / 立即更新 / 自动检查接 `update.rs`（启动 1 分钟后自动检查，结果存 `last_update_check`；有新版时托盘「关于点墨（新版本 x）」）。
+  - 下个版本才做的：按键音、用户词库导入 / 导出 / 清空 → 设置窗口底部提示「…下个版本提供」；候选字号、全角标点、空格上屏首选 → 保存并在行上标「下个版本生效」（`SettingsModel::coming_soon`）；模糊音同理（`fuzzy_supported=false`）。
+  - 首次引导：`onboarded` 不是 true 时 `on_start` 打开；完成 / 跳过 / 关窗都写 `onboarded=true`；引导里选布局、语音引擎立即生效。`DIANMO_NO=onboarding` 可关掉（测试用）。
+- **托盘（P8）**：显示/隐藏键盘、布局 ▸（全拼 / 小鹤双拼 / 九宫格 / English）、语音引擎 ▸、输入模式 ▸（键盘 / 语音球 / 电脑键盘）、设置…、关于点墨、退出点墨。dianmo-win 的内置项关掉了（`tray_builtins: false`）；高度、主题、编辑区、自动弹出、开机自启、让出屏幕空间都挪到设置里。
+- **入口**：键盘工具栏 ⚙（`UiAction::OpenSettings`）；`dianmo.exe --settings`（已运行时发 `WM_APP+0x53` 给运行中的实例，提权实例放行这条消息；没运行就隐藏启动并打开设置；经计划任务转交时也转发）；开始菜单「点墨设置」（`package.sh` 安装段；`install.rs` 也会建）。
+- **悬浮球**：`bubble::keep_ball_out`（重置 dianmo-win 内部计时器的 hack）删掉，改用 `HostControl::reveal_ball(ms)`；气泡在球出来之后再显示（post 一条 `ShowBubble`）。「显示悬浮球」关掉时球消失（`set_ball_enabled`），语音模式下总是显示。
+- **资源**：exe 嵌入 RCDATA `app-icon`（`res/app-icon.png`，256px，由 `res/icon/dianmo.svg` 导出）；`build.rs` 设置 `DIANMO_BUILD_DATE`（UTC 日期，源码有改动就更新，可用同名环境变量覆盖）。
+- `shell.rs`：`run_elevated`（UAC）、`pick_exe`（文件对话框）。Cargo features 加了 `Win32_UI_Shell`、`Win32_UI_Shell_Common`。
+- e2e：测试副本默认写 `onboarded=true`（否则引导窗口会抢前台），`SET:onboarded=false` 可以覆盖。
+
+**测试**
+- 服务器：`cargo test --workspace` 136 个全过（dianmo 20 个，新增 settings 2 个、prefs 5 个；dianmo-ui 92 个，新增 7 个）；`cargo clippy --workspace --all-targets` 和 `--target x86_64-pc-windows-gnullvm --examples --tests` 都干净。
+- Surface（`package.sh settings` → `C:\dev\dianmo-dist\settings\Dianmo`，exe 1373KB，导入表只有系统 DLL；`crates/dianmo/tests/surface/run-settings.sh <dist> <本地目录>`，测试副本 `--instance Test --no-elevate`，全程 17 秒，用户自己的点墨没动）：
+  - 首次启动（`--hidden`，`onboarded=false`）319ms 后引导窗口出现；→ 键翻到第 2、3 屏；Esc = 跳过 → 窗口关闭、`onboarded=true`。
+  - 第二个 `dianmo.exe --settings` 退出码 0，日志 `asked it to open the settings (delivered: true)`，运行中的实例打开设置窗口（工作区被用户的键盘占了一部分，客户区 960×533 DIP）。
+  - 点「语音球」卡片 → `input_mode=voice`（日志 `voice mode hint`）；点「键盘」→ `input_mode=keyboard`；End 后点主题「深色」→ `theme=dark`，窗口和标题栏变深色（截图）；「浅色」→ `theme=light`；键盘页高度滑块点到 120% → `height=1.2`；Esc 关闭设置窗口；WM_CLOSE 退出码 0。
+  - 截图（窗口区域，200%）：`docs/screenshots/settings-general.png`、`settings-general-dark.png`、`settings-keyboard.png`、`settings-voice.png`、`settings-voice-dark.png`、`about.png`、`onboarding.png`、`onboarding-layout.png`、`onboarding-voice.png`。实机上微信输入法「已就绪」，豆包输入法显示「没有设置『免按模式』语音快捷键…」，MDL2 新图标（⚙ E713、输入 E8D2、关于 E946、引导里的 E8BD / E765 / E720 / E7F8）都显示正常。
+
+**没测 / 遗留**
+- 真机上没点：一键修复（会弹 UAC）、开机自启开关、选择豆包语音程序（文件对话框）、检查更新 / 立即更新、导出诊断包、反馈问题、打开链接、恢复默认、跟随系统时切换 Windows 深浅色、键盘工具栏 ⚙、托盘新菜单（托盘图标在溢出区，测试脚本点不到）。逻辑都在服务器上测了映射，Windows 代码只做了 check / clippy。
+- 语音球的「出来 + 气泡」（`reveal_ball`）这次截图被用户自己的键盘挡住了，只有日志。
+- 托盘图标的「有新版」小红点没做（只改了菜单文字）。
+- 候选字号、全角标点、空格上屏首选、模糊音、按键音、用户词库导入导出清空：界面已接，功能下个版本。

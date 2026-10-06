@@ -37,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_POINTERUP, WM_POINTERUPDATE, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW,
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
-use windows::core::{Result, w};
+use windows::core::{PCWSTR, Result, w};
 
 use crate::appbar::{ABN_FULLSCREENAPP, ABN_POSCHANGED, ABN_STATECHANGE, AppBar};
 use crate::canvas::Renderer;
@@ -112,6 +112,10 @@ pub struct HostOptions {
     /// App items for the tray menu, shown above the built-in ones. Change at runtime with
     /// [`HostControl::set_tray_menu`]; choices arrive in [`App::on_tray_command`].
     pub tray_menu: Vec<TrayItem>,
+    /// Add the built-in items (显示/隐藏键盘, the AppBar switch, 退出) below the app's. Off: the
+    /// menu is exactly [`Self::tray_menu`] (the app offers show/hide and quit itself, with
+    /// [`HostControl::toggle`] / [`HostControl::quit`]).
+    pub tray_builtins: bool,
     /// Extra directory searched for `<name>.png` by `Canvas::image`, after the exe's RCDATA
     /// resources and `res\` next to the exe.
     pub image_dir: Option<PathBuf>,
@@ -128,6 +132,7 @@ impl Default for HostOptions {
             max_height_fraction: 0.5,
             hardware_gpu: false,
             tray_menu: Vec::new(),
+            tray_builtins: true,
             ball_pos: None,
             image_dir: None,
         }
@@ -190,6 +195,15 @@ pub trait App {
     fn on_window_closed(&mut self, id: WindowId) {
         let _ = id;
     }
+
+    /// The Windows app theme (Settings → Personalisation → Colours) may have changed
+    /// (`WM_SETTINGCHANGE` "ImmersiveColorSet", which Windows sends several times per change):
+    /// `dark` is [`crate::system_dark_mode`] now. App windows that follow the system already
+    /// switched their title bars; the views' own colours are up to the app.
+    fn on_system_theme_changed(&mut self, dark: bool, view: &mut dyn View, host: &mut HostControl) -> Response {
+        let _ = (dark, view, host);
+        Response::none()
+    }
 }
 
 /// Deferred work on a view (see [`HostControl::update_keyboard`]).
@@ -201,6 +215,10 @@ pub(crate) struct Requests {
     appbar: Option<bool>,
     quit: bool,
     ball_state: Option<BallState>,
+    /// Keep the ball out of the screen edge for this many ms.
+    reveal_ball: Option<u32>,
+    ball_pos: Option<BallPos>,
+    ball_enabled: Option<bool>,
     /// Applied by `Host::process` itself (no window operations involved).
     tray_menu: Option<Vec<TrayItem>>,
     keyboard_updates: Vec<ViewUpdate>,
@@ -219,6 +237,9 @@ impl Requests {
             && self.appbar.is_none()
             && !self.quit
             && self.ball_state.is_none()
+            && self.reveal_ball.is_none()
+            && self.ball_pos.is_none()
+            && self.ball_enabled.is_none()
             && self.opens.is_empty()
             && self.closes.is_empty()
             && self.titles.is_empty()
@@ -295,6 +316,24 @@ impl HostControl {
     /// input running; the only animation, and only in that state).
     pub fn set_ball_state(&mut self, state: BallState) {
         self.req.ball_state = Some(state);
+    }
+
+    /// Brings the floating ball fully out of the screen edge (if it is showing, i.e. the keyboard
+    /// is hidden) and keeps it out for `ms` instead of tucking it in after 3 s, e.g. so a new
+    /// voice-mode user can find it. Applied after the keyboard's visibility changes requested in
+    /// the same callback.
+    pub fn reveal_ball(&mut self, ms: u32) {
+        self.req.reveal_ball = Some(ms);
+    }
+
+    /// Moves the floating ball (e.g. 靠左 / 靠右 chosen in the settings).
+    pub fn set_ball_pos(&mut self, pos: BallPos) {
+        self.req.ball_pos = Some(pos);
+    }
+
+    /// Turns the floating ball on or off at runtime ([`HostOptions::edge_handle`] at start).
+    pub fn set_ball_enabled(&mut self, on: bool) {
+        self.req.ball_enabled = Some(on);
     }
 
     /// Opens an app window (settings, about, onboarding) showing `view`, centred on the monitor
@@ -829,6 +868,15 @@ fn merge_requests(into: &mut Requests, r: Requests) {
     if r.ball_state.is_some() {
         into.ball_state = r.ball_state;
     }
+    if r.reveal_ball.is_some() {
+        into.reveal_ball = r.reveal_ball;
+    }
+    if r.ball_pos.is_some() {
+        into.ball_pos = r.ball_pos;
+    }
+    if r.ball_enabled.is_some() {
+        into.ball_enabled = r.ball_enabled;
+    }
     into.opens.extend(r.opens);
     into.closes.extend(r.closes);
     into.titles.extend(r.titles);
@@ -889,9 +937,61 @@ pub(crate) fn apply(mut req: Requests) {
         if let Some(on) = next_req.appbar {
             set_appbar(on);
         }
+        if let Some(on) = next_req.ball_enabled {
+            set_ball_enabled(on);
+        }
+        if let Some(pos) = next_req.ball_pos {
+            with(|h| {
+                h.opts.ball_pos = Some(pos);
+                if let Some(ball) = &h.handle {
+                    ball.set_pos(pos);
+                }
+            });
+        }
         if let Some(v) = next_req.visible {
             req = set_visible(v);
         }
+        if let Some(ms) = next_req.reveal_ball {
+            with(|h| {
+                if let Some(ball) = &h.handle {
+                    ball.reveal(ms);
+                }
+            });
+        }
+    }
+}
+
+/// Creates or removes the floating ball (its position is kept for the next time).
+fn set_ball_enabled(on: bool) {
+    let Some(old) = with(|h| {
+        if on == h.handle.is_some() {
+            return None;
+        }
+        if on {
+            match EdgeHandle::new(h.hwnd, h.opts.ball_pos.unwrap_or_default()) {
+                Ok(ball) => h.handle = Some(ball),
+                Err(_) => return None,
+            }
+            h.opts.edge_handle = true;
+            None
+        } else {
+            h.opts.edge_handle = false;
+            let ball = h.handle.take()?;
+            if let Some(pos) = ball.pos() {
+                h.opts.ball_pos = Some(pos);
+            }
+            Some(ball)
+        }
+    }) else {
+        return;
+    };
+    match old {
+        Some(ball) => unsafe {
+            let _ = DestroyWindow(ball.hwnd());
+            drop(ball);
+        },
+        // Just created: place and show it if the keyboard is hidden.
+        None => layout(),
     }
 }
 
@@ -1196,6 +1296,16 @@ extern "system" fn keyboard_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 if wp.0 == SPI_SETWORKAREA.0 as usize && with(|h| h.appbar.is_registered()) == Some(false) {
                     post_cmd(hwnd, CMD_LAYOUT);
                 }
+                if lp.0 != 0 && PCWSTR(lp.0 as *const u16).to_string().is_ok_and(|s| s == "ImmersiveColorSet") {
+                    let dark = crate::window::system_dark_mode();
+                    if let Some(req) = with(|h| {
+                        let mut ctl = h.control();
+                        let r = h.app.on_system_theme_changed(dark, &mut *h.view, &mut ctl);
+                        h.process(ctl, r)
+                    }) {
+                        apply(req);
+                    }
+                }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_WINDOWPOSCHANGED => {
@@ -1291,9 +1401,9 @@ extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             match (lp.0 & 0xFFFF) as u32 {
                 NIN_SELECT | NIN_KEYSELECT => post_cmd(keyboard, CMD_TOGGLE),
                 WM_CONTEXTMENU => {
-                    let (visible, appbar, items) =
-                        with(|h| (h.visible, h.appbar_on, h.tray_menu.clone())).unwrap_or_default();
-                    match tray::menu(hwnd, visible, appbar, &items) {
+                    let (visible, appbar, items, builtins) =
+                        with(|h| (h.visible, h.appbar_on, h.tray_menu.clone(), h.opts.tray_builtins)).unwrap_or_default();
+                    match tray::menu(hwnd, visible, appbar, &items, builtins) {
                         Choice::Builtin(tray::CMD_TOGGLE) => post_cmd(keyboard, CMD_TOGGLE),
                         Choice::Builtin(tray::CMD_APPBAR) => post_cmd(keyboard, CMD_APPBAR_TOGGLE),
                         Choice::Builtin(tray::CMD_QUIT) => post_cmd(keyboard, CMD_QUIT),

@@ -62,6 +62,11 @@ pub enum UiAction {
     /// A 复制 button was pressed (Ctrl+C sent). If the clipboard does not change shortly, nothing
     /// was selected: the host calls `KeyboardView::enter_select_mode`.
     CheckCopied,
+    /// The ⚙ toolbar button: open the settings window.
+    OpenSettings,
+    /// From [`crate::SettingsView`] / [`crate::OnboardingView`]: a setting changed (already
+    /// applied to the view's own model) or a command for the host.
+    Settings(crate::settings::SettingsAction),
 }
 
 /// One clipboard history entry, as the host passes it to the view (most recent first).

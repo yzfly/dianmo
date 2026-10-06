@@ -3,9 +3,9 @@
 //! [`SettingsView`] implements [`View`] for the app-window host in `dianmo-win`: left
 //! navigation (top tabs when the window is narrower than [`NARROW_WIDTH`]), scrollable content
 //! (touch drag with momentum, mouse wheel, arrow / page keys). Every change applies at once: the
-//! view updates its own copy of the model and queues a [`SettingsAction`] for the host
-//! ([`SettingsView::take_actions`]). The host saves / applies it and may push the authoritative
-//! state back with [`SettingsView::set_model`].
+//! view updates its own copy of the model and hands a [`SettingsAction`] to the host as
+//! `UiAction::Settings` in the returned `Response`. The host saves / applies it and may push the
+//! authoritative state back with [`SettingsView::set_model`].
 //!
 //! [`OnboardingView`] is the 3–4 card first-run guide.
 
@@ -92,6 +92,8 @@ pub struct SettingsView {
     anim: Option<SwitchAnim>,
     /// Slider value while dragging (row index, value): sent on release.
     slider_drag: Option<(usize, f32)>,
+    /// A short message at the bottom of the content (text, hide time in ms).
+    toast: Option<(String, u64)>,
 }
 
 impl SettingsView {
@@ -112,6 +114,7 @@ impl SettingsView {
             actions: Vec::new(),
             anim: None,
             slider_drag: None,
+            toast: None,
         };
         v.relayout();
         v
@@ -161,9 +164,27 @@ impl SettingsView {
         self.theme.kind
     }
 
-    /// Actions produced since the last call, oldest first.
-    pub fn take_actions(&mut self) -> Vec<SettingsAction> {
-        std::mem::take(&mut self.actions)
+    /// Shows a short message (e.g. 「已导出到 …」, 「下个版本提供」) at the bottom of the content
+    /// for 1.5–5 s depending on its length. `now_ms` is the host's monotonic clock.
+    pub fn show_toast(&mut self, text: &str, now_ms: u64) -> Response {
+        let ms = (1200 + 120 * text.chars().count() as u64).clamp(1500, 5000);
+        self.toast = Some((text.to_string(), now_ms + ms));
+        Response { repaint: true, actions: Vec::new(), timer_ms: self.next_timer(now_ms) }
+    }
+
+    /// The toast currently shown, if any.
+    pub fn toast(&self) -> Option<&str> {
+        self.toast.as_ref().map(|(t, _)| t.as_str())
+    }
+
+    /// When the view needs its next `timer` call: every frame while something animates, else when
+    /// the toast goes away.
+    fn next_timer(&self, now_ms: u64) -> Option<u64> {
+        if self.scroll.animating() || self.anim.is_some() {
+            Some(FRAME_MS)
+        } else {
+            self.toast.as_ref().map(|(_, until)| until.saturating_sub(now_ms).max(1))
+        }
     }
 
     pub fn scroll_offset(&self) -> f32 {
@@ -326,11 +347,10 @@ impl SettingsView {
         for b in &blocks {
             if let Block::Group { rows, .. } = b {
                 for r in rows {
-                    if r.key == key {
-                        if let widgets::Control::Switch { on, .. } = r.control {
+                    if r.key == key
+                        && let widgets::Control::Switch { on, .. } = r.control {
                             return on;
                         }
-                    }
                 }
             }
         }
@@ -440,6 +460,23 @@ impl SettingsView {
         }
     }
 
+    fn paint_toast(&self, c: &mut dyn Canvas) {
+        let Some((text, _)) = &self.toast else { return };
+        let t = &self.theme;
+        let vp = self.viewport();
+        let max_w = (vp.w - 48.0).max(120.0);
+        let lines = widgets::wrap(text, 14.0, max_w - 40.0);
+        let w = lines.iter().map(|l| widgets::text_w(l, 14.0)).fold(0.0f32, f32::max) + 40.0;
+        let h = lines.len() as f32 * 21.0 + 20.0;
+        let r = Rect::new(vp.x + (vp.w - w) / 2.0, vp.y + vp.h - h - 28.0, w, h);
+        let (bg, fg) = if t.kind == ThemeKind::Dark { (t.fill_strong, t.text) } else { (t.text.with_alpha(0.88), t.card) };
+        widgets::shadow(c, r, h.min(40.0) / 2.0, t.shadow.with_alpha(0.12), 6.0);
+        c.fill_rect(r, (h / 2.0).min(20.0), bg);
+        for (i, l) in lines.iter().enumerate() {
+            c.text(l, Rect::new(r.x, r.y + 10.0 + i as f32 * 21.0, r.w, 21.0), TextStyle { align: Align::Center, ..style(14.0, fg) });
+        }
+    }
+
     fn paint_scrollbar(&self, c: &mut dyn Canvas) {
         let scrolling = self.scroll.animating() || self.press.is_some_and(|p| p.mode == PressMode::Scroll);
         if !scrolling || self.scroll.max <= 0.0 {
@@ -453,42 +490,14 @@ impl SettingsView {
     }
 }
 
-impl View for SettingsView {
-    fn resize(&mut self, width: f32, height: f32) {
-        if (width, height) != (self.w, self.h) {
-            self.w = width;
-            self.h = height;
-            self.relayout();
-        }
+impl SettingsView {
+    /// Hands the queued [`SettingsAction`]s to the host with the response.
+    fn flush(&mut self, mut r: Response) -> Response {
+        r.actions.extend(self.actions.drain(..).map(crate::view::UiAction::Settings));
+        r
     }
 
-    fn preferred_height(&self, _width: f32) -> f32 {
-        680.0
-    }
-
-    fn paint(&mut self, c: &mut dyn Canvas) {
-        let t = self.theme;
-        c.clear(t.background);
-        let vp = self.viewport();
-        c.push_clip(vp);
-        let pressed = match self.press {
-            Some(Press { target: PressTarget::Hit(i), mode: PressMode::Pending, .. }) => self.laid.hits.get(i),
-            _ => None,
-        };
-        let hovered = match self.hover {
-            Some(PressTarget::Hit(i)) if self.press.is_none() => self.laid.hits.get(i),
-            _ => None,
-        };
-        let anim = self.anim.as_ref().map(|a| (a.key.as_str(), a.pos));
-        let ctx = PaintCtx { t: &t, dy: self.content_dy(), pressed, hovered, switch_anim: anim };
-        paint_laid(c, &self.laid, &ctx, &|c, h, r| about::paint_hero(c, &t, h, r));
-        c.pop_clip();
-        self.paint_header(c);
-        self.paint_nav(c);
-        self.paint_scrollbar(c);
-    }
-
-    fn pointer(&mut self, e: PointerEvent) -> Response {
+    fn handle_pointer(&mut self, e: PointerEvent) -> Response {
         match e.phase {
             PointerPhase::Down => {
                 if self.press.is_some() {
@@ -527,13 +536,11 @@ impl View for SettingsView {
                 match p.mode {
                     PressMode::Scroll => repaint |= self.scroll.drag_to(dy),
                     PressMode::Slider => {
-                        if let PressTarget::Hit(i) = p.target {
-                            if let Target::Slider { row } = self.laid.hits[i].target {
-                                if let Some(v) = self.laid.rows.get(row).and_then(|lr| widgets::slider_value(lr, e.x)) {
+                        if let PressTarget::Hit(i) = p.target
+                            && let Target::Slider { row } = self.laid.hits[i].target
+                                && let Some(v) = self.laid.rows.get(row).and_then(|lr| widgets::slider_value(lr, e.x)) {
                                     repaint |= self.preview_slider(row, v);
                                 }
-                            }
-                        }
                     }
                     PressMode::Pending => {}
                 }
@@ -590,34 +597,7 @@ impl View for SettingsView {
         }
     }
 
-    fn timer(&mut self, now_ms: u64) -> Response {
-        let mut r = Response::none();
-        if self.scroll.step(now_ms) {
-            r.repaint = true;
-        }
-        if self.stop_anim_if_done(now_ms) {
-            r.repaint = true;
-        }
-        if self.scroll.animating() || self.anim.is_some() {
-            r.timer_ms = Some(FRAME_MS);
-        } else if r.repaint {
-            // Last frame: hide the scrollbar.
-            r.repaint = true;
-        }
-        r
-    }
-
-    fn wheel(&mut self, x: f32, y: f32, delta_y: f32) -> Response {
-        if !self.viewport().contains(x, y) {
-            return Response::none();
-        }
-        self.scroll.stop();
-        let old = self.scroll.offset;
-        self.scroll.offset = (old + delta_y).clamp(0.0, self.scroll.max);
-        if self.scroll.offset != old { Response::repaint() } else { Response::none() }
-    }
-
-    fn key(&mut self, vk: u32, down: bool) -> Response {
+    fn handle_key(&mut self, vk: u32, down: bool) -> Response {
         if !down {
             return Response::none();
         }
@@ -649,6 +629,79 @@ impl View for SettingsView {
         let old = self.scroll.offset;
         self.scroll.offset = (old + delta).clamp(0.0, self.scroll.max);
         if self.scroll.offset != old { Response::repaint() } else { Response::none() }
+    }
+}
+
+impl View for SettingsView {
+    fn resize(&mut self, width: f32, height: f32) {
+        if (width, height) != (self.w, self.h) {
+            self.w = width;
+            self.h = height;
+            self.relayout();
+        }
+    }
+
+    fn preferred_height(&self, _width: f32) -> f32 {
+        680.0
+    }
+
+    fn paint(&mut self, c: &mut dyn Canvas) {
+        let t = self.theme;
+        c.clear(t.background);
+        let vp = self.viewport();
+        c.push_clip(vp);
+        let pressed = match self.press {
+            Some(Press { target: PressTarget::Hit(i), mode: PressMode::Pending, .. }) => self.laid.hits.get(i),
+            _ => None,
+        };
+        let hovered = match self.hover {
+            Some(PressTarget::Hit(i)) if self.press.is_none() => self.laid.hits.get(i),
+            _ => None,
+        };
+        let anim = self.anim.as_ref().map(|a| (a.key.as_str(), a.pos));
+        let ctx = PaintCtx { t: &t, dy: self.content_dy(), pressed, hovered, switch_anim: anim };
+        paint_laid(c, &self.laid, &ctx, &|c, h, r| about::paint_hero(c, &t, h, r));
+        c.pop_clip();
+        self.paint_header(c);
+        self.paint_nav(c);
+        self.paint_scrollbar(c);
+        self.paint_toast(c);
+    }
+
+    fn pointer(&mut self, e: PointerEvent) -> Response {
+        let r = self.handle_pointer(e);
+        self.flush(r)
+    }
+
+    fn timer(&mut self, now_ms: u64) -> Response {
+        let mut r = Response::none();
+        if self.scroll.step(now_ms) {
+            r.repaint = true;
+        }
+        if self.stop_anim_if_done(now_ms) {
+            r.repaint = true;
+        }
+        if self.toast.as_ref().is_some_and(|(_, until)| now_ms >= *until) {
+            self.toast = None;
+            r.repaint = true;
+        }
+        r.timer_ms = self.next_timer(now_ms);
+        r
+    }
+
+    fn wheel(&mut self, x: f32, y: f32, delta_y: f32) -> Response {
+        if !self.viewport().contains(x, y) {
+            return Response::none();
+        }
+        self.scroll.stop();
+        let old = self.scroll.offset;
+        self.scroll.offset = (old + delta_y).clamp(0.0, self.scroll.max);
+        if self.scroll.offset != old { Response::repaint() } else { Response::none() }
+    }
+
+    fn key(&mut self, vk: u32, down: bool) -> Response {
+        let r = self.handle_key(vk, down);
+        self.flush(r)
     }
 
     fn hover(&mut self, x: f32, y: f32) -> Response {

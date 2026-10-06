@@ -92,8 +92,8 @@ mod demo {
                 PointerPhase::Up => {
                     let was = self.pressed.take();
                     let mut r = Response::repaint();
-                    if was.is_some() && was == hit {
-                        r.actions.push(UiAction::Paste(STRIP_BUTTONS[was.unwrap()].to_owned()));
+                    if let Some(i) = was.filter(|_| was == hit) {
+                        r.actions.push(UiAction::Paste(STRIP_BUTTONS[i].to_owned()));
                     }
                     r
                 }

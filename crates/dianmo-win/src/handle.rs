@@ -199,6 +199,43 @@ impl EdgeHandle {
         self.hwnd
     }
 
+    /// Where the ball sits (also after the user dragged it).
+    pub(crate) fn pos(&self) -> Option<BallPos> {
+        with(|b| b.pos)
+    }
+
+    /// Moves the ball to `pos` (shown at once if it is showing).
+    pub(crate) fn set_pos(&self, pos: BallPos) {
+        with(|b| {
+            let y_frac = if pos.y_frac.is_finite() { pos.y_frac.clamp(0.0, 1.0) } else { b.pos.y_frac };
+            b.pos = BallPos { y_frac, ..pos };
+            if b.shown {
+                b.present();
+            }
+        });
+    }
+
+    /// Brings the ball fully out of the screen edge and keeps it there for `ms` (instead of the
+    /// usual 3 s) before it tucks in again. False if the ball isn't showing.
+    pub(crate) fn reveal(&self, ms: u32) -> bool {
+        with(|b| {
+            if !b.shown {
+                return false;
+            }
+            if b.tucked {
+                b.tucked = false;
+                b.present();
+            }
+            if b.state == BallState::Idle && b.drag.is_none() {
+                unsafe {
+                    SetTimer(Some(b.hwnd), TIMER_IDLE, ms.max(1), None);
+                }
+            }
+            true
+        })
+        .unwrap_or(false)
+    }
+
     /// Shows the ball on its edge of `work` (physical px) at `scale` (DPI / 96).
     pub(crate) fn show(&self, work: RECT, scale: f32) {
         with(|b| {

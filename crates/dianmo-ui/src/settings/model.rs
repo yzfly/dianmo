@@ -217,27 +217,42 @@ pub enum VoiceEngineChoice {
     /// 微信输入法 (default).
     #[default]
     WeType,
-    /// 豆包语音 (DouBaoVoice tool).
+    /// 豆包输入法 (ByteDance's IME, its global voice shortcut).
+    DoubaoIme,
+    /// 豆包语音 (third-party DouBaoVoice tool).
     Doubao,
     /// Windows voice typing (Win+H).
     System,
 }
 
 impl VoiceEngineChoice {
-    pub const ALL: [VoiceEngineChoice; 3] = [VoiceEngineChoice::WeType, VoiceEngineChoice::Doubao, VoiceEngineChoice::System];
+    pub const ALL: [VoiceEngineChoice; 4] =
+        [VoiceEngineChoice::WeType, VoiceEngineChoice::DoubaoIme, VoiceEngineChoice::Doubao, VoiceEngineChoice::System];
 
     pub fn name(self) -> &'static str {
         match self {
             VoiceEngineChoice::WeType => "微信输入法",
+            VoiceEngineChoice::DoubaoIme => "豆包输入法",
             VoiceEngineChoice::Doubao => "豆包语音",
             VoiceEngineChoice::System => "系统语音",
+        }
+    }
+
+    /// Stable id (the value in `settings.ini`, row keys `engine_<key>`).
+    pub fn key(self) -> &'static str {
+        match self {
+            VoiceEngineChoice::WeType => "wetype",
+            VoiceEngineChoice::DoubaoIme => "doubao_ime",
+            VoiceEngineChoice::Doubao => "doubao",
+            VoiceEngineChoice::System => "system",
         }
     }
 
     pub fn blurb(self) -> &'static str {
         match self {
             VoiceEngineChoice::WeType => "识别准、带标点，需要先安装微信输入法",
-            VoiceEngineChoice::Doubao => "使用豆包语音小工具识别，需要先配置好它",
+            VoiceEngineChoice::DoubaoIme => "字节跳动的豆包输入法，需要在它的设置里打开全局语音快捷键",
+            VoiceEngineChoice::Doubao => "第三方的豆包语音小工具，需要先配置好它",
             VoiceEngineChoice::System => "Windows 自带的语音输入（Win+H），无需安装",
         }
     }
@@ -261,6 +276,7 @@ pub struct EngineStatus {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VoiceEngines {
     pub wetype: EngineStatus,
+    pub doubao_ime: EngineStatus,
     pub doubao: EngineStatus,
     pub system: EngineStatus,
 }
@@ -269,6 +285,7 @@ impl VoiceEngines {
     pub fn get(&self, e: VoiceEngineChoice) -> &EngineStatus {
         match e {
             VoiceEngineChoice::WeType => &self.wetype,
+            VoiceEngineChoice::DoubaoIme => &self.doubao_ime,
             VoiceEngineChoice::Doubao => &self.doubao,
             VoiceEngineChoice::System => &self.system,
         }
@@ -344,8 +361,6 @@ pub struct SettingsModel {
     // ---- 语音
     pub voice_engine: VoiceEngineChoice,
     pub engines: VoiceEngines,
-    /// Fall back to Win+H when the selected engine fails.
-    pub voice_fallback: bool,
     /// DouBaoVoice exe; empty = found automatically.
     pub doubao_exe: String,
 
@@ -362,6 +377,10 @@ pub struct SettingsModel {
     pub build_date: String,
     pub update: UpdateState,
     pub auto_update: bool,
+
+    /// Row keys whose setting is saved but takes effect only in a later version: they get a
+    /// 「下个版本生效」 tag (e.g. `candidate_size`).
+    pub coming_soon: Vec<String>,
 }
 
 impl Default for SettingsModel {
@@ -391,7 +410,6 @@ impl Default for SettingsModel {
             user_words: None,
             voice_engine: VoiceEngineChoice::WeType,
             engines: VoiceEngines::default(),
-            voice_fallback: true,
             doubao_exe: String::new(),
             clip_history: true,
             clip_limit: 50,
@@ -402,6 +420,7 @@ impl Default for SettingsModel {
             build_date: String::new(),
             update: UpdateState::Unknown,
             auto_update: true,
+            coming_soon: Vec::new(),
         }
     }
 }
@@ -451,7 +470,6 @@ pub enum SettingsAction {
     ClearUserDict,
     // 语音
     SetVoiceEngine(VoiceEngineChoice),
-    SetVoiceFallback(bool),
     /// Show a file picker for DouBaoVoice's exe.
     PickDoubaoExe,
     /// Forget the chosen exe (find it automatically).
@@ -512,7 +530,6 @@ impl SettingsModel {
             A::SetFuzzy(p, v) => set(&mut self.fuzzy[p.index()], v),
             A::SetShuangpin(v) => set(&mut self.shuangpin, v),
             A::SetVoiceEngine(v) => set(&mut self.voice_engine, v),
-            A::SetVoiceFallback(v) => set(&mut self.voice_fallback, v),
             A::ResetDoubaoExe => set(&mut self.doubao_exe, String::new()),
             A::SetClipHistory(v) => set(&mut self.clip_history, v),
             A::SetClipLimit(v) => set(&mut self.clip_limit, v),

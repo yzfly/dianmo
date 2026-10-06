@@ -2,12 +2,20 @@
 //!
 //!   dianmo.exe                    start (or show the keyboard of the running instance)
 //!   dianmo.exe --hidden           start with the keyboard hidden (tray / edge handle / auto-popup)
+//!   dianmo.exe --settings         open the settings window (of the running instance, or start
+//!                                 hidden and open it)
 //!   dianmo.exe --autostart        same as --hidden (old HKCU Run entries)
 //!   dianmo.exe --task             started by the scheduled task `Dianmo`: hidden, never hands over
 //!   dianmo.exe --no-elevate       don't hand over to the scheduled task
 //!   dianmo.exe --register-task    (elevated) create/update the task `Dianmo` for this exe
 //!   dianmo.exe --unregister-task  (elevated) delete the task
 //!   dianmo.exe --deploy <dir>     precompile Rime data in <dir> into <dir>\build (packaging)
+//!   dianmo.exe --quit             close the running 点墨 gracefully (installer; install.rs)
+//!   dianmo.exe --install [--quiet] [--no-run]   register this copy: shortcuts, 「应用和功能」,
+//!                                 task, start (run by DianmoSetup.exe; install.rs)
+//!   dianmo.exe --uninstall [--keep-data|--delete-data] [--quiet]   (install.rs)
+//!   dianmo.exe --check-update     print the GitHub release check (update.rs)
+//!   dianmo.exe --diagnostics      print the prefilled issue URL, export the zip (diag.rs)
 //!   dianmo.exe --version
 //!   --instance <name>             (tests) separate instance: own mutex, data dir, task name
 //!
@@ -23,16 +31,23 @@ mod basic;
 #[cfg(windows)]
 mod bubble;
 mod clipboard;
+mod diag;
 #[cfg(windows)]
 mod elevate;
+#[cfg(windows)]
+mod install;
+mod update;
 mod engine;
 mod log;
+mod prefs;
 mod settings;
 
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
 mod platform;
+#[cfg(windows)]
+mod shell;
 #[cfg(windows)]
 mod voice;
 
@@ -72,6 +87,7 @@ mod win {
         install_panic_hook();
 
         let mut hidden = false;
+        let mut open_settings = false;
         let mut from_task = false;
         let mut no_elevate = false;
         let mut it = args.iter();
@@ -85,7 +101,17 @@ mod win {
                 }
                 "--register-task" => return register_task(),
                 "--unregister-task" => return unregister_task(),
+                // Installer / uninstaller / updates (install.rs, update.rs).
+                "--quit" => return crate::install::cmd_quit(),
+                "--install" => return crate::install::cmd_install(&args),
+                "--uninstall" => return crate::install::cmd_uninstall(&args),
+                "--check-update" => return crate::update::cmd_check(),
+                "--diagnostics" => return crate::diag::cmd_diagnostics(),
                 "--hidden" | "--autostart" => hidden = true,
+                "--settings" => {
+                    open_settings = true;
+                    hidden = true;
+                }
                 elevate::TASK_ARG => {
                     from_task = true;
                     hidden = true;
@@ -99,15 +125,16 @@ mod win {
         }
 
         let Some(lock) = platform::acquire_single_instance() else {
-            let ok = platform::signal_running_instance();
-            log!("already running; asked it to show the keyboard (delivered: {ok})");
+            let ok = platform::signal_running_instance(open_settings);
+            let what = if open_settings { "open the settings" } else { "show the keyboard" };
+            log!("already running; asked it to {what} (delivered: {ok})");
             return 0;
         };
         let elevated = elevate::is_elevated();
         let lock = if elevated || from_task || no_elevate {
             lock
         } else {
-            match hand_over_to_task(lock, hidden, t0) {
+            match hand_over_to_task(lock, hidden, open_settings, t0) {
                 Ok(()) => return 0,
                 Err(Some(lock)) => lock,
                 Err(None) => return 0,
@@ -115,6 +142,9 @@ mod win {
         };
         let _lock = lock;
         log!("start {VERSION} {args:?} elevated={elevated}");
+        if open_settings {
+            platform::request_settings();
+        }
 
         let settings_path = data.join("settings.ini");
         let mut settings = Settings::load(&settings_path);
@@ -128,7 +158,8 @@ mod win {
         };
         take_over_system_keyboard(&mut settings, &settings_path);
 
-        let mut view = KeyboardView::new(KeyboardConfig { theme: settings.theme, schema: settings.schema, chinese: settings.chinese });
+        let theme = crate::prefs::effective_theme(settings.theme, dianmo_win::system_dark_mode());
+        let mut view = KeyboardView::new(KeyboardConfig { theme, schema: settings.schema, chinese: settings.chinese });
         view.set_height_scale(settings.height);
         let tray_tip = match &rime {
             RimeSetup::Unavailable(p) => format!("点墨 · 词库未加载（{p}）"),
@@ -141,7 +172,9 @@ mod win {
             appbar: settings.appbar,
             tray_tip,
             ball_pos,
-            edge_handle: !crate::app::disabled("ball"),
+            edge_handle: crate::app::ball_wanted(&settings),
+            // The app's menu has 显示/隐藏键盘 and 退出 itself (PRODUCT.md P8).
+            tray_builtins: false,
             ..HostOptions::default()
         };
         let _instance_window = platform::create_instance_window().map_err(|e| log!("instance window: {e}"));
@@ -161,11 +194,13 @@ mod win {
     }
 
     /// Not elevated: if the scheduled task runs this exe, start it (elevated 点墨, hidden) and ask
-    /// it to show the keyboard unless `hidden`. `Ok` = the elevated instance is up, exit;
-    /// `Err(Some(lock))` = run here without elevation; `Err(None)` = another instance appeared.
+    /// it to show the keyboard unless `hidden` (or to open the settings with `settings`). `Ok` =
+    /// the elevated instance is up, exit; `Err(Some(lock))` = run here without elevation;
+    /// `Err(None)` = another instance appeared.
     fn hand_over_to_task(
         lock: platform::InstanceLock,
         hidden: bool,
+        settings: bool,
         t0: Instant,
     ) -> Result<(), Option<platform::InstanceLock>> {
         let task = platform::task_name();
@@ -177,21 +212,21 @@ mod win {
         drop(lock);
         if let Err(e) = elevate::run(&task) {
             log!("starting task {task} failed: {e}; running without elevation");
-            return reacquire();
+            return reacquire(settings);
         }
-        if platform::wait_for_instance(Duration::from_secs(10), !hidden) {
+        if platform::wait_for_instance(Duration::from_secs(10), !hidden, settings) {
             log!("handed over to task {task} ({} ms)", t0.elapsed().as_millis());
             return Ok(());
         }
         log!("task {task} started but no instance appeared within 10 s; running without elevation");
-        reacquire()
+        reacquire(settings)
     }
 
-    fn reacquire() -> Result<(), Option<platform::InstanceLock>> {
+    fn reacquire(settings: bool) -> Result<(), Option<platform::InstanceLock>> {
         match platform::acquire_single_instance() {
             Some(lock) => Err(Some(lock)),
             None => {
-                platform::signal_running_instance();
+                platform::signal_running_instance(settings);
                 Err(None)
             }
         }

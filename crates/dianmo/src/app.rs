@@ -6,12 +6,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use dianmo_core::{Action, Engine, InputController, Schema};
+use dianmo_core::{Action, Engine, InputController};
+use dianmo_ui::settings::{InputMode, LayoutChoice, Page, SettingsModel, Status, ThemeChoice, UpdateState};
 use dianmo_ui::{InputState, KeyboardView, Response, ThemeKind, UiAction, View};
 use dianmo_win::tabtip::SystemKeyboardSettings;
 use dianmo_win::{
-    App, BallEdge, BallEvent, BallState, FieldKind, FocusEvent, FocusWatcher, HostControl, HostProxy, SendInputSink,
-    TrayItem, now_ms, start_focus_watcher,
+    App, BallEdge, BallEvent, BallState, FieldKind, FocusEvent, FocusWatcher, HostControl, HostProxy,
+    SendInputSink, TrayItem, WindowId, now_ms, start_focus_watcher,
 };
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
@@ -23,8 +24,17 @@ use crate::clipboard::{self, ClipEvent, ClipStore, ClipboardWatcher};
 use crate::engine::AnyEngine;
 use crate::log;
 use crate::platform;
+use crate::prefs;
 use crate::settings::Settings;
 use crate::voice::{Voice, VoiceEngine, VoiceState};
+
+mod settings_ui;
+
+/// The floating ball shows while the keyboard is hidden: the 显示悬浮球 setting, and always in
+/// voice mode (it is the voice button).
+pub fn ball_wanted(s: &Settings) -> bool {
+    (s.show_ball || s.input_mode == InputMode::VoiceBall) && !disabled("ball")
+}
 
 pub struct DianmoApp {
     ctl: InputController<AnyEngine, SendInputSink>,
@@ -69,6 +79,21 @@ pub struct DianmoApp {
     voice_unavailable: [Option<String>; ENGINES],
     /// The voice-mode hint (「点一下说话，长按展开键盘」) was shown in this run.
     voice_hint_shown: bool,
+    /// The engine availability above was checked at least once (else 「正在检测…」).
+    voice_checked: bool,
+    /// The settings window and the first-run onboarding, while open (TODO #33).
+    pub(crate) settings_win: Option<WindowId>,
+    pub(crate) onboarding_win: Option<WindowId>,
+    /// The model last sent to those windows (sent again only when it changes).
+    shown_model: Option<SettingsModel>,
+    /// 管理员窗口支持 (the scheduled task), checked in the background while settings are open.
+    admin_task: Status,
+    /// 检查更新 (P6).
+    pub(crate) update: UpdateState,
+    /// The newer release found by the last check (for 立即更新).
+    release: Option<crate::update::Release>,
+    /// Windows apps use the dark theme (for 主题「跟随系统」).
+    system_dark: bool,
 }
 
 const ENGINES: usize = VoiceEngine::ALL.len();
@@ -196,6 +221,14 @@ impl DianmoApp {
             voice_clip_quiet_until: None,
             voice_unavailable: Default::default(),
             voice_hint_shown: false,
+            voice_checked: false,
+            settings_win: None,
+            onboarding_win: None,
+            shown_model: None,
+            admin_task: Status::default(),
+            update: UpdateState::Unknown,
+            release: None,
+            system_dark: dianmo_win::system_dark_mode(),
         }
     }
 
@@ -225,12 +258,16 @@ impl DianmoApp {
         match ev {
             ClipEvent::Text(text) => {
                 self.clip_updates += 1;
-                if self.password_focus {
+                if self.password_focus && self.settings.clip_skip_passwords {
                     // Copied from / while in a password field: don't keep or show it.
                     kv.set_paste_preview(None);
                     return Response::repaint();
                 }
                 kv.set_paste_preview(Some(&text));
+                if !self.settings.clip_history {
+                    // 记录剪贴板历史 off: the paste key still shows what is on the clipboard.
+                    return Response::repaint();
+                }
                 if self.clips.add(text) {
                     kv.set_clips(self.clips.items().to_vec());
                 }
@@ -301,62 +338,68 @@ impl DianmoApp {
         r
     }
 
-    fn set_theme(&mut self, kind: ThemeKind, view: &mut dyn View) -> Response {
-        if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
-            kv.set_theme(kind);
-        }
-        if self.settings.theme != kind {
-            self.settings.theme = kind;
-            self.save();
-        }
-        Response::repaint()
+    /// The keyboard theme for the 主题 setting (跟随系统 resolves to the Windows app mode).
+    pub(crate) fn theme_kind(&self) -> ThemeKind {
+        prefs::effective_theme(self.settings.theme, self.system_dark)
     }
 
-    fn set_pc_keyboard(&mut self, on: bool, view: &mut dyn View) -> Response {
-        if on && self.ctl.is_composing() {
-            self.input(Action::Space, view);
-        }
-        if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
-            kv.set_pc_keyboard(on);
-        }
-        if self.settings.pc_keyboard != on {
-            self.settings.pc_keyboard = on;
-            self.save();
-        }
-        Response::repaint()
+    fn voice_mode(&self) -> bool {
+        self.settings.input_mode == InputMode::VoiceBall
     }
 
-    fn set_schema(&mut self, schema: Schema, view: &mut dyn View) -> Response {
-        self.set_pc_keyboard(false, view);
+    /// Switches the keyboard between the letter layouts (`LayoutChoice::English` = 英文) and
+    /// leaves the 电脑键盘 (the layout implies the keyboard mode; voice mode stays).
+    fn set_layout(&mut self, layout: LayoutChoice, view: &mut dyn View, host: &mut HostControl) -> Response {
+        let mut r = Response::repaint();
+        if self.settings.input_mode == InputMode::PcKeyboard {
+            r = merge(r, self.set_input_mode(InputMode::Keyboard, view, host));
+        }
         if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
             kv.show_letters();
         }
-        let mut r = Response::repaint();
+        let (schema, chinese) = prefs::layout_schema(layout, self.ctl.schema());
         if self.ctl.schema() != schema {
             r.actions.extend(self.input(Action::SetSchema(schema), view).actions);
         }
-        if !self.ctl.is_chinese() {
+        if self.ctl.is_chinese() != chinese {
             r.actions.extend(self.input(Action::ToggleChinese, view).actions);
         }
         r
     }
 
-    fn set_autostart(&mut self, on: bool) {
-        match platform::set_autostart(on) {
-            Ok(()) => {
-                self.settings.autostart = on;
-                self.save();
+    /// 键盘 / 语音球 / 电脑键盘 (settings, tray, the keyboard's 语音球 / 电脑键盘 tiles).
+    fn set_input_mode(&mut self, mode: InputMode, view: &mut dyn View, host: &mut HostControl) -> Response {
+        let was = self.settings.input_mode;
+        let pc = mode == InputMode::PcKeyboard;
+        let mut r = Response::none();
+        if pc && self.ctl.is_composing() {
+            r = self.input(Action::Space, view);
+        }
+        if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
+            r.repaint |= kv.set_pc_keyboard(pc);
+            r.repaint |= kv.set_voice_mode(mode == InputMode::VoiceBall);
+        }
+        if was != mode {
+            self.settings.input_mode = mode;
+            self.save();
+            log!("input mode {mode:?}");
+        }
+        host.set_ball_enabled(ball_wanted(&self.settings));
+        if mode == InputMode::VoiceBall {
+            if was != mode {
+                // Each time voice mode is turned on, the ball explains itself once more.
+                self.voice_hint_shown = false;
             }
-            Err(e) => log!("autostart {on}: {e}"),
+            if host.is_visible() {
+                // Shrink into the voice ball (the hint follows in `on_visibility_changed`).
+                host.hide();
+            } else {
+                host.proxy().post(VoiceIntro);
+            }
+        } else {
+            bubble::hide();
         }
-    }
-
-    fn engine_label(&self) -> String {
-        match &self.status {
-            EngineStatus::Rime => "词库：雾凇拼音（Rime）".to_owned(),
-            EngineStatus::Loading => "词库加载中".to_owned(),
-            EngineStatus::Off(p) => format!("词库未加载（{p}）"),
-        }
+        r
     }
 
     #[cfg(feature = "rime")]
@@ -436,9 +479,14 @@ impl App for DianmoApp {
         platform::set_proxy(host.proxy());
         if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
             kv.set_edit_area(self.settings.edit_area);
-            kv.set_pc_keyboard(self.settings.pc_keyboard);
+            kv.set_pc_keyboard(self.settings.input_mode == InputMode::PcKeyboard);
+            kv.set_voice_mode(self.voice_mode());
+            kv.set_key_popup(self.settings.key_popup);
+            kv.set_long_press_ms(self.settings.long_press.millis());
+        }
+        self.clips.set_limit(self.settings.clip_limit as usize);
+        if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
             kv.set_clips(self.clips.items().to_vec());
-            kv.set_voice_mode(self.settings.voice_mode);
         }
         if !disabled("clipboard") {
             self.start_clipboard(host);
@@ -448,10 +496,14 @@ impl App for DianmoApp {
         self.set_focus_watch(self.settings.auto_show && !disabled("focus"), host);
         VOICE_TIMER_PROXY.with(|p| p.set(Some(host.proxy())));
         self.check_voice_engines(host);
-        log!("voice engine {}, voice mode {}", self.voice.engine().as_setting(), self.settings.voice_mode);
-        if self.settings.voice_mode && !host.is_visible() {
+        log!("voice engine {}, input mode {:?}", self.voice.engine().as_setting(), self.settings.input_mode);
+        if self.voice_mode() && !host.is_visible() {
             host.proxy().post(VoiceIntro);
         }
+        if !self.settings.onboarded && !disabled("onboarding") {
+            self.open_onboarding(host);
+        }
+        self.start_updates(host);
         self.refresh_tray(host);
         log_memory("started");
         Response::repaint()
@@ -460,6 +512,7 @@ impl App for DianmoApp {
     fn on_action(&mut self, action: UiAction, view: &mut dyn View, host: &mut HostControl) -> Response {
         let r = self.action(action, view, host);
         self.refresh_tray(host);
+        self.sync_windows(host);
         if keymap_wanted() && host.is_visible() {
             dump_keymap(view);
         }
@@ -469,6 +522,7 @@ impl App for DianmoApp {
     fn on_event(&mut self, event: Box<dyn Any + Send>, view: &mut dyn View, host: &mut HostControl) -> Response {
         let r = self.event(event, view, host);
         self.refresh_tray(host);
+        self.sync_windows(host);
         if keymap_wanted() && host.is_visible() {
             dump_keymap(view);
         }
@@ -477,7 +531,7 @@ impl App for DianmoApp {
 
     fn on_visibility_changed(&mut self, visible: bool, view: &mut dyn View, host: &mut HostControl) -> Response {
         let mut voice = Response::none();
-        if !visible && !self.settings.voice_mode && self.voice_running() {
+        if !visible && !self.voice_mode() && self.voice_running() {
             // The mic key belongs to the keyboard: collapsing it ends the session, no result.
             // (In voice mode the ball runs voice input while the keyboard is hidden.)
             self.voice.cancel();
@@ -486,7 +540,7 @@ impl App for DianmoApp {
         log!("keyboard {}", if visible { "shown" } else { "hidden" });
         if visible {
             bubble::hide();
-        } else if self.settings.voice_mode && !self.voice_hint_shown {
+        } else if self.voice_mode() && !self.voice_hint_shown {
             // The ball is appearing: the first time in voice mode in this run, keep it out of the
             // edge and say how it works. Posted: the ball's window reaches its place only after
             // the host has finished hiding the keyboard.
@@ -514,13 +568,32 @@ impl App for DianmoApp {
     }
 
     fn on_tray_command(&mut self, id: u32, view: &mut dyn View, host: &mut HostControl) -> Response {
-        self.tray_command(id, view, host)
+        let r = self.tray_command(id, view, host);
+        self.sync_windows(host);
+        r
+    }
+
+    fn on_window_action(&mut self, id: WindowId, action: UiAction, view: &mut dyn View, host: &mut HostControl) -> Response {
+        self.window_action(id, action, view, host)
+    }
+
+    fn on_window_closed(&mut self, id: WindowId) {
+        self.window_closed(id);
+    }
+
+    fn on_system_theme_changed(&mut self, dark: bool, view: &mut dyn View, host: &mut HostControl) -> Response {
+        if dark == self.system_dark {
+            return Response::none();
+        }
+        self.system_dark = dark;
+        log!("Windows app theme: {}", if dark { "dark" } else { "light" });
+        if self.settings.theme == ThemeChoice::System { self.apply_theme(view, host) } else { Response::none() }
     }
 
     fn on_ball(&mut self, event: BallEvent, view: &mut dyn View, host: &mut HostControl) -> Response {
         let r = match event {
             // Voice mode: the ball is the voice button.
-            BallEvent::Tap if self.settings.voice_mode => self.voice_toggle(view, host),
+            BallEvent::Tap if self.voice_mode() => self.voice_toggle(view, host),
             BallEvent::Tap | BallEvent::LongPress => {
                 bubble::hide();
                 host.show();
@@ -533,6 +606,7 @@ impl App for DianmoApp {
             }
         };
         self.refresh_tray(host);
+        self.sync_windows(host);
         r
     }
 }
@@ -613,9 +687,9 @@ impl DianmoApp {
                 if host.is_visible() {
                     r = merge(r, kv.show_toast(msg, now_ms()));
                 } else {
-                    // Voice ball: the reason goes next to the ball.
-                    bubble::keep_ball_out(VOICE_FAIL_BUBBLE_MS);
-                    bubble::show(msg, VOICE_FAIL_BUBBLE_MS);
+                    // Voice ball: the reason goes next to the ball (once it is out of the edge).
+                    host.reveal_ball(VOICE_FAIL_BUBBLE_MS);
+                    host.proxy().post(ShowBubble(msg.clone(), VOICE_FAIL_BUBBLE_MS));
                 }
             }
         }
@@ -664,41 +738,30 @@ impl DianmoApp {
         self.voice_sync(view, host)
     }
 
-    /// Turns voice mode on (and shrinks into the voice ball) or off (the keyboard stays as it is;
-    /// the ball goes back to showing the keyboard).
+    /// Turns voice mode on (and shrinks into the voice ball) or off (back to the keyboard, or the
+    /// 电脑键盘 if that is what the keyboard shows; the ball goes back to showing the keyboard).
     fn set_voice_mode(&mut self, on: bool, view: &mut dyn View, host: &mut HostControl) -> Response {
-        if self.settings.voice_mode != on {
-            self.settings.voice_mode = on;
-            self.save();
-            log!("voice mode {on}");
-            // Each time voice mode is turned on, the ball explains itself once more.
-            self.voice_hint_shown = !on;
-        }
-        let repaint = view
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<KeyboardView>())
-            .is_some_and(|kv| kv.set_voice_mode(on));
-        if on && host.is_visible() {
-            // Shrink into the voice ball (the hint follows in `on_visibility_changed`).
-            host.hide();
-        } else if on {
-            host.proxy().post(VoiceIntro);
+        let mode = if on {
+            InputMode::VoiceBall
+        } else if view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()).is_some_and(|kv| kv.pc_keyboard()) {
+            InputMode::PcKeyboard
         } else {
-            bubble::hide();
-        }
-        if repaint { Response::repaint() } else { Response::none() }
+            InputMode::Keyboard
+        };
+        self.set_input_mode(mode, view, host)
     }
 
     /// Voice mode with the ball showing: keep the ball out of the screen edge for a while and say
-    /// how it works (once per run, and again each time voice mode is turned on).
-    fn voice_intro(&mut self) {
+    /// how it works (once per run, and again each time voice mode is turned on). The hint is
+    /// posted so that it is placed after the ball came out.
+    fn voice_intro(&mut self, host: &mut HostControl) {
         if self.voice_hint_shown {
             return;
         }
-        let out = bubble::keep_ball_out(VOICE_INTRO_MS);
-        let shown = bubble::show(VOICE_HINT, VOICE_INTRO_MS);
-        log!("voice mode hint (ball kept out: {out}, hint shown: {shown})");
-        self.voice_hint_shown = out || shown;
+        host.reveal_ball(VOICE_INTRO_MS);
+        host.proxy().post(ShowBubble(VOICE_HINT.to_owned(), VOICE_INTRO_MS));
+        log!("voice mode hint");
+        self.voice_hint_shown = true;
     }
 
     /// Checks which engines are usable on a short-lived thread (registry reads and a process
@@ -734,16 +797,30 @@ impl DianmoApp {
             return self.on_voice_tick(view, host);
         }
         if event.is::<VoiceIntro>() {
-            if self.settings.voice_mode && !host.is_visible() {
-                self.voice_intro();
+            if self.voice_mode() && !host.is_visible() {
+                self.voice_intro(host);
             }
             return Response::none();
         }
+        let event = match event.downcast::<ShowBubble>() {
+            Ok(b) => {
+                if !host.is_visible() {
+                    bubble::show(&b.0, b.1);
+                }
+                return Response::none();
+            }
+            Err(e) => e,
+        };
         let event = match event.downcast::<VoiceAvail>() {
             Ok(a) => {
                 self.voice_unavailable = a.0;
+                self.voice_checked = true;
                 return Response::none();
             }
+            Err(e) => e,
+        };
+        let event = match self.settings_event(event, view, host) {
+            Ok(r) => return r,
             Err(e) => e,
         };
         if let Some(CopyCheck(n)) = event.downcast_ref::<CopyCheck>() {
@@ -785,7 +862,7 @@ impl DianmoApp {
             UiAction::Voice => self.voice_toggle(view, host),
             // The 语音球 tile, or 「退出语音模式」 / 「退出语音球」 while in voice mode.
             UiAction::VoiceBall => {
-                let on = !self.settings.voice_mode;
+                let on = !self.voice_mode();
                 self.set_voice_mode(on, view, host)
             }
             UiAction::Hide => {
@@ -793,19 +870,25 @@ impl DianmoApp {
                 Response::none()
             }
             UiAction::ThemeChanged(kind) => {
-                if self.settings.theme != kind {
-                    self.settings.theme = kind;
+                // Chosen on the keyboard: an explicit light / dark (no longer 跟随系统).
+                let choice = if kind == ThemeKind::Dark { ThemeChoice::Dark } else { ThemeChoice::Light };
+                if self.settings.theme != choice {
+                    self.settings.theme = choice;
                     self.save();
+                    return self.apply_theme(view, host);
                 }
                 Response::none()
             }
             UiAction::PcKeyboard(on) => {
-                if self.settings.pc_keyboard != on {
-                    self.settings.pc_keyboard = on;
-                    self.save();
-                }
+                let mode = if on { InputMode::PcKeyboard } else { InputMode::Keyboard };
+                self.set_input_mode(mode, view, host)
+            }
+            UiAction::OpenSettings => {
+                self.open_settings(None, host);
                 Response::none()
             }
+            // Only app windows send these (`on_window_action`).
+            UiAction::Settings(_) => Response::none(),
             UiAction::Paste(text) => self.paste(text, view),
             UiAction::PinClip { id, pinned } => {
                 if self.clips.pin(id, pinned) {
@@ -904,31 +987,38 @@ mod tray_id {
     pub const PINYIN: u32 = 1;
     pub const SHUANGPIN: u32 = 2;
     pub const T9: u32 = 3;
-    pub const PC: u32 = 4;
-    pub const DARK: u32 = 10;
-    pub const AUTO_SHOW: u32 = 11;
-    pub const AUTOSTART: u32 = 12;
-    pub const EDIT_AREA: u32 = 13;
-    pub const VOICE_MODE: u32 = 14;
-    pub const VOICE_ENGINE_BASE: u32 = 40; // + index into VoiceEngine::ALL
-    pub const HEIGHT_BASE: u32 = 20; // + index into HEIGHTS
+    pub const ENGLISH: u32 = 5;
+    pub const TOGGLE: u32 = 10;
     pub const ABOUT: u32 = 30;
+    pub const SETTINGS: u32 = 31;
+    pub const QUIT: u32 = 32;
+    pub const VOICE_ENGINE_BASE: u32 = 40; // + index into VoiceEngine::ALL
+    pub const MODE_BASE: u32 = 60; // + index into InputMode::ALL
 }
-
-const HEIGHTS: [(f32, &str); 4] = [(0.85, "矮"), (1.0, "标准"), (1.15, "高"), (1.3, "更高")];
 
 /// Posted to ourselves to show the keyboard again after a height change (re-docks the window).
 struct ShowAgain;
 
+/// Posted to ourselves: show this hint next to the ball for this many ms (after the ball came out
+/// of the screen edge).
+struct ShowBubble(String, u32);
+
 impl DianmoApp {
-    fn tray_items(&self) -> Vec<TrayItem> {
+    /// The tray menu (PRODUCT.md P8): 显示/隐藏键盘、布局 ▸、语音引擎 ▸、输入模式 ▸、设置…、关于点墨、
+    /// 退出. Everything else is in the settings window.
+    fn tray_items(&self, visible: bool) -> Vec<TrayItem> {
         let cmd = |id: u32, label: &str, checked: bool| TrayItem::Command { id, label: label.to_owned(), checked };
-        let schema = self.ctl.schema();
-        let heights = HEIGHTS
-            .iter()
-            .enumerate()
-            .map(|(i, (h, label))| cmd(tray_id::HEIGHT_BASE + i as u32, label, (self.settings.height - h).abs() < 0.01))
-            .collect();
+        let layout = prefs::layout_choice(&self.settings);
+        let keyboard = self.settings.input_mode != InputMode::PcKeyboard;
+        let layouts = [
+            (tray_id::PINYIN, "全拼", LayoutChoice::Pinyin),
+            (tray_id::SHUANGPIN, "小鹤双拼", LayoutChoice::Shuangpin),
+            (tray_id::T9, "九宫格", LayoutChoice::T9),
+            (tray_id::ENGLISH, "English", LayoutChoice::English),
+        ]
+        .iter()
+        .map(|&(id, label, l)| cmd(id, label, keyboard && layout == l))
+        .collect();
         let voice_engines = VoiceEngine::ALL
             .iter()
             .enumerate()
@@ -937,28 +1027,37 @@ impl DianmoApp {
                 let label = match &self.voice_unavailable[i] {
                     None => name.to_owned(),
                     Some(why) if ["没有安装", "找不到", "没有配置"].iter().any(|w| why.contains(w)) => format!("{name}（未安装）"),
-                    Some(_) => format!("{name}（未运行）"),
+                    Some(_) => format!("{name}（未就绪）"),
                 };
                 cmd(tray_id::VOICE_ENGINE_BASE + i as u32, &label, self.voice.engine() == e)
             })
             .collect();
+        let modes = InputMode::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| {
+                let label = match m {
+                    InputMode::Keyboard => "键盘",
+                    InputMode::VoiceBall => "语音球（点一下说话）",
+                    InputMode::PcKeyboard => "电脑键盘（按键直通）",
+                };
+                cmd(tray_id::MODE_BASE + i as u32, label, self.settings.input_mode == m)
+            })
+            .collect();
         vec![
-            cmd(tray_id::PINYIN, "全拼", schema == Schema::Pinyin && !self.settings.pc_keyboard),
-            cmd(tray_id::SHUANGPIN, "小鹤双拼", schema == Schema::Shuangpin && !self.settings.pc_keyboard),
-            cmd(tray_id::T9, "九宫格", schema == Schema::T9 && !self.settings.pc_keyboard),
-            cmd(tray_id::PC, "电脑键盘（按键直通）", self.settings.pc_keyboard),
+            cmd(tray_id::TOGGLE, if visible { "隐藏键盘" } else { "显示键盘" }, false),
             TrayItem::Separator,
+            TrayItem::Submenu { label: "布局".to_owned(), items: layouts },
             TrayItem::Submenu { label: "语音引擎".to_owned(), items: voice_engines },
-            cmd(tray_id::VOICE_MODE, "语音模式（悬浮球点一下说话）", self.settings.voice_mode),
+            TrayItem::Submenu { label: "输入模式".to_owned(), items: modes },
             TrayItem::Separator,
-            cmd(tray_id::DARK, "深色主题", self.settings.theme == ThemeKind::Dark),
-            TrayItem::Submenu { label: "键盘高度".to_owned(), items: heights },
-            cmd(tray_id::EDIT_AREA, "横屏显示编辑区（复制、粘贴…）", self.settings.edit_area),
-            cmd(tray_id::AUTO_SHOW, "点输入框时自动弹出", self.settings.auto_show),
-            cmd(tray_id::AUTOSTART, "开机自动启动", self.settings.autostart),
+            cmd(tray_id::SETTINGS, "设置…", false),
+            match &self.update {
+                UpdateState::Available { version, .. } => cmd(tray_id::ABOUT, &format!("关于点墨（新版本 {version}）"), false),
+                _ => cmd(tray_id::ABOUT, "关于点墨", false),
+            },
             TrayItem::Separator,
-            cmd(tray_id::ABOUT, &format!("关于点墨 {} · {}", env!("CARGO_PKG_VERSION"), self.engine_label()), false),
-            TrayItem::Separator,
+            cmd(tray_id::QUIT, "退出点墨", false),
         ]
     }
 
@@ -968,7 +1067,7 @@ impl DianmoApp {
             self.settings.appbar = host.appbar_enabled();
             self.save();
         }
-        let items = self.tray_items();
+        let items = self.tray_items(host.is_visible());
         if items != self.tray_shown {
             host.set_tray_menu(items.clone());
             self.tray_shown = items;
@@ -1025,7 +1124,7 @@ impl DianmoApp {
                     }
                 }
                 // Voice mode: only the ball; the keyboard comes from a long press or the tray.
-                if by_touch && !host.is_visible() && !self.settings.voice_mode {
+                if by_touch && !host.is_visible() && !self.voice_mode() {
                     self.showing_for_focus = true;
                     host.show();
                 }
@@ -1044,56 +1143,33 @@ impl DianmoApp {
 
     fn tray_command(&mut self, id: u32, view: &mut dyn View, host: &mut HostControl) -> Response {
         let r = match id {
-            tray_id::PINYIN => self.set_schema(Schema::Pinyin, view),
-            tray_id::SHUANGPIN => self.set_schema(Schema::Shuangpin, view),
-            tray_id::T9 => self.set_schema(Schema::T9, view),
-            tray_id::PC => {
-                let on = !self.settings.pc_keyboard;
-                self.set_pc_keyboard(on, view)
-            }
-            tray_id::DARK => {
-                let next = if self.settings.theme == ThemeKind::Dark { ThemeKind::Light } else { ThemeKind::Dark };
-                self.set_theme(next, view)
-            }
-            tray_id::AUTO_SHOW => {
-                self.settings.auto_show = !self.settings.auto_show;
-                self.save();
-                self.set_focus_watch(self.settings.auto_show, host);
+            tray_id::TOGGLE => {
+                host.toggle();
                 Response::none()
             }
-            tray_id::AUTOSTART => {
-                self.set_autostart(!self.settings.autostart);
-                Response::none()
-            }
-            tray_id::VOICE_MODE => {
-                let on = !self.settings.voice_mode;
-                self.set_voice_mode(on, view, host)
+            tray_id::PINYIN => self.set_layout(LayoutChoice::Pinyin, view, host),
+            tray_id::SHUANGPIN => self.set_layout(LayoutChoice::Shuangpin, view, host),
+            tray_id::T9 => self.set_layout(LayoutChoice::T9, view, host),
+            tray_id::ENGLISH => self.set_layout(LayoutChoice::English, view, host),
+            id if (tray_id::MODE_BASE..tray_id::MODE_BASE + InputMode::ALL.len() as u32).contains(&id) => {
+                let mode = InputMode::ALL[(id - tray_id::MODE_BASE) as usize];
+                self.set_input_mode(mode, view, host)
             }
             id if (tray_id::VOICE_ENGINE_BASE..tray_id::VOICE_ENGINE_BASE + ENGINES as u32).contains(&id) => {
                 let e = VoiceEngine::ALL[(id - tray_id::VOICE_ENGINE_BASE) as usize];
                 self.set_voice_engine(e, view, host)
             }
-            tray_id::EDIT_AREA => {
-                self.settings.edit_area = !self.settings.edit_area;
-                self.save();
-                let changed = view
-                    .as_any_mut()
-                    .and_then(|a| a.downcast_mut::<KeyboardView>())
-                    .is_some_and(|kv| kv.set_edit_area(self.settings.edit_area));
-                if changed { Response::repaint() } else { Response::none() }
+            tray_id::SETTINGS => {
+                self.open_settings(None, host);
+                Response::none()
             }
-            id if (tray_id::HEIGHT_BASE..tray_id::HEIGHT_BASE + HEIGHTS.len() as u32).contains(&id) => {
-                let h = HEIGHTS[(id - tray_id::HEIGHT_BASE) as usize].0;
-                if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
-                    kv.set_height_scale(h);
-                }
-                self.settings.height = h;
-                self.save();
-                if host.is_visible() {
-                    // The host docks the window when it is shown: hide and show again to re-dock.
-                    host.hide();
-                    host.proxy().post(ShowAgain);
-                }
+            tray_id::ABOUT => {
+                self.open_settings(Some(Page::About), host);
+                Response::none()
+            }
+            tray_id::QUIT => {
+                log!("quit from the tray menu");
+                host.quit();
                 Response::none()
             }
             _ => Response::none(),

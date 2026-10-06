@@ -194,20 +194,25 @@ unsafe fn append(menu: HMENU, items: &[TrayItem], ids: &mut Vec<u32>) {
 
 /// Shows the tray menu at the cursor and returns the choice. `hwnd` is the (hidden) tray owner
 /// window. Runs a modal loop: call without holding host state.
-pub(crate) fn menu(hwnd: HWND, visible: bool, appbar: bool, items: &[TrayItem]) -> Choice {
+/// `builtins`: add 显示/隐藏, the AppBar switch and 退出 below the app's items.
+pub(crate) fn menu(hwnd: HWND, visible: bool, appbar: bool, items: &[TrayItem], builtins: bool) -> Choice {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return Choice::None };
         let mut ids = Vec::new();
         if !items.is_empty() {
             append(menu, items, &mut ids);
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            if builtins {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            }
         }
-        let toggle = if visible { w!("隐藏键盘") } else { w!("显示键盘") };
-        let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE as usize, toggle);
-        let check = if appbar { MF_CHECKED } else { MF_UNCHECKED };
-        let _ = AppendMenuW(menu, MF_STRING | check, CMD_APPBAR as usize, w!("让出屏幕空间（最大化窗口上移）"));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT as usize, w!("退出点墨"));
+        if builtins || items.is_empty() {
+            let toggle = if visible { w!("隐藏键盘") } else { w!("显示键盘") };
+            let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE as usize, toggle);
+            let check = if appbar { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(menu, MF_STRING | check, CMD_APPBAR as usize, w!("让出屏幕空间（最大化窗口上移）"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT as usize, w!("退出点墨"));
+        }
         let mut pt = Default::default();
         let _ = GetCursorPos(&mut pt);
         // Required so the menu closes when the user taps elsewhere (documented quirk). This

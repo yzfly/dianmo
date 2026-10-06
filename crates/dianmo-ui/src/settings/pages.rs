@@ -8,6 +8,20 @@ use super::model::InputMode;
 use super::widgets::{Art, Block, Button, ButtonKind, Card, Chip, Control, Row, SliderSpec, TagKind};
 
 pub(crate) fn build(page: Page, m: &SettingsModel) -> Vec<Block> {
+    let mut blocks = build_page(page, m);
+    if !m.coming_soon.is_empty() {
+        for b in &mut blocks {
+            if let Block::Group { rows, .. } = b {
+                for r in rows.iter_mut().filter(|r| r.tag.is_none() && m.coming_soon.contains(&r.key)) {
+                    r.tag = Some(("下个版本生效".into(), TagKind::Warning));
+                }
+            }
+        }
+    }
+    blocks
+}
+
+fn build_page(page: Page, m: &SettingsModel) -> Vec<Block> {
     match page {
         Page::General => general(m),
         Page::Keyboard => keyboard(m),
@@ -152,7 +166,7 @@ fn keyboard(m: &SettingsModel) -> Vec<Block> {
                     r.enabled = false;
                     r
                 },
-                Row::new("long_press", "长按时长").desc("长按按键输入上方小字、长按空格进入触控板所需的时间").segmented(lp_opts, lp_sel),
+                Row::new("long_press", "长按时长").desc("长按按键输入上方小字、弹出更多字符所需的时间").segmented(lp_opts, lp_sel),
             ],
         ),
         group(
@@ -250,7 +264,7 @@ fn voice(m: &SettingsModel) -> Vec<Block> {
                 Status::warn(st.detail.clone())
             };
             let desc = if st.note.is_empty() { e.blurb().to_string() } else { format!("{}\n{}", e.blurb(), st.note) };
-            let mut r = Row::new(format!("engine_{}", e as u8), e.name())
+            let mut r = Row::new(format!("engine_{}", e.key()), e.name())
                 .desc(desc)
                 .status(status)
                 .control(Control::Radio { selected: m.voice_engine == e })
@@ -258,11 +272,10 @@ fn voice(m: &SettingsModel) -> Vec<Block> {
             if e == rec && st.available {
                 r = r.tag("推荐", TagKind::Accent);
             }
-            if !st.available {
-                if let Some(url) = &st.download_url {
+            if !st.available
+                && let Some(url) = &st.download_url {
                     r = r.below(Control::Buttons(vec![Button::new("去下载", ButtonKind::Secondary, A::OpenUrl(url.clone()))]));
                 }
-            }
             r
         })
         .collect();
@@ -276,9 +289,6 @@ fn voice(m: &SettingsModel) -> Vec<Block> {
         group(
             "更多",
             vec![
-                Row::new("voice_fallback", "失败时改用系统语音")
-                    .desc("所选引擎没装或没有响应时，自动改用 Windows 自带的语音输入")
-                    .switch(m.voice_fallback, A::SetVoiceFallback),
                 Row::new("doubao_exe", "豆包语音的程序位置").desc(path).control(Control::Buttons(buttons)),
             ],
         ),

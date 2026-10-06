@@ -20,7 +20,7 @@
 #   RUNKEY      print the HKCU Run entry
 #   @x,y        tap at screen pixel x,y (for panels whose keys aren't in the keymap)
 #   SET:k=v     (before the test starts) write k=v into the test instance's settings.ini, e.g.
-#               SET:pc_keyboard=true to start on the 电脑键盘
+#               SET:input_mode=pc to start on the 电脑键盘 (onboarded=true is added unless given)
 #   ENV:k=v     (before the test starts) environment variable for the test instance
 #               (e.g. ENV:DIANMO_NO=clipboard,ball for memory measurements)
 #   BALL        print the floating ball's rect and visibility
@@ -128,11 +128,17 @@ function MicState { $root = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Cap
   $o = @(Get-ChildItem $root -ErrorAction SilentlyContinue | ? { $_.PSChildName -match 'wetype_update\.exe$|doubaovoice|#doubaoime#' } | % {
     $p = Get-ItemProperty $_.PSPath; "$((($_.PSChildName -split '#')[-1]).ToLower())=$($p.LastUsedTimeStop -eq 0)" })
   if ($o.Count) { $o -join ' ' } else { '(no engine has used the microphone)' } }
+# The first-run onboarding window would take the foreground: the test instance has seen it
+# (unless a step says SET:onboarded=false).
+if ($sets.Count -and -not ($sets | ? { $_ -like 'onboarded=*' })) { $sets += 'onboarded=true' }
 if ($sets.Count) {
   $ini = Join-Path $env:APPDATA "Dianmo-$instance\settings.ini"; New-Item -ItemType Directory -Force (Split-Path $ini) | Out-Null
   Set-Content $ini -Value $sets -Encoding UTF8; "test settings: $($sets -join ', ')"
 }
 $ini = Join-Path $env:APPDATA "Dianmo-$instance\settings.ini"
+if (-not $sets.Count -and -not (Select-String -Path $ini -Pattern '^onboarded=true' -Quiet -ErrorAction SilentlyContinue)) {
+  New-Item -ItemType Directory -Force (Split-Path $ini) | Out-Null; Add-Content $ini 'onboarded=true' -Encoding UTF8
+}
 $adm = $null
 $logLines0 = @(Get-Content $applog -ErrorAction SilentlyContinue).Count
 "tabtip before: $(TabTip)"
