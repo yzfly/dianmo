@@ -1,5 +1,5 @@
 //! Notification-area icon: tap toggles the keyboard, the menu (press-and-hold / right click) has
-//! show/hide, the AppBar switch and 退出.
+//! the app's own items ([`TrayItem`]) on top, then show/hide, the AppBar switch and 退出.
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -13,12 +13,12 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, HICON, ICONINFO, MF_CHECKED,
-    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, SM_CXSMICON, SetForegroundWindow, TPM_BOTTOMALIGN,
+    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, HICON, HMENU, ICONINFO, MF_CHECKED,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, SM_CXSMICON, SetForegroundWindow, TPM_BOTTOMALIGN,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL, CreateIconIndirect,
 };
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
-use windows::core::{PCWSTR, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 pub(crate) const CMD_TOGGLE: u32 = 1001;
 pub(crate) const CMD_APPBAR: u32 = 1002;
@@ -68,36 +68,89 @@ impl Tray {
 
 }
 
-/// Shows the tray menu at the cursor and returns the chosen command (0 = dismissed). `hwnd` is
-/// the (hidden) tray owner window. Runs a modal loop: call without holding host state.
-pub(crate) fn menu(hwnd: HWND, visible: bool, appbar: bool) -> u32 {
-    {
+/// An app-defined tray menu entry ([`crate::HostOptions::tray_menu`],
+/// [`crate::HostControl::set_tray_menu`]). Chosen commands arrive in [`crate::App::on_tray_command`].
+/// App items are listed above the built-in ones (显示/隐藏, AppBar, 退出).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TrayItem {
+    Command { id: u32, label: String, checked: bool },
+    Separator,
+    /// A submenu (e.g. 布局 ▸ 全拼 / 小鹤 / 九宫格).
+    Submenu { label: String, items: Vec<TrayItem> },
+}
+
+/// What the user picked in the tray menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Choice {
+    None,
+    Builtin(u32),
+    App(u32),
+}
+
+/// Menu ids of app items: `APP_BASE + index` in a depth-first walk (ids stay below 0x10000 for
+/// `TrackPopupMenu`), mapped back to the app's `id` afterwards.
+const APP_BASE: u32 = 2000;
+
+/// Appends `items` to `menu`; `ids` collects the app ids in menu-id order.
+unsafe fn append(menu: HMENU, items: &[TrayItem], ids: &mut Vec<u32>) {
+    for item in items {
         unsafe {
-            let Ok(menu) = CreatePopupMenu() else { return 0 };
-            let toggle = if visible { w!("隐藏键盘") } else { w!("显示键盘") };
-            let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE as usize, toggle);
-            let check = if appbar { MF_CHECKED } else { MF_UNCHECKED };
-            let _ = AppendMenuW(menu, MF_STRING | check, CMD_APPBAR as usize, w!("让出屏幕空间（最大化窗口上移）"));
+            match item {
+                TrayItem::Command { id, label, checked } => {
+                    if APP_BASE as usize + ids.len() >= 0xFFFF {
+                        continue;
+                    }
+                    let check = if *checked { MF_CHECKED } else { MF_UNCHECKED };
+                    let text = HSTRING::from(label.as_str());
+                    let _ = AppendMenuW(menu, MF_STRING | check, (APP_BASE as usize) + ids.len(), &text);
+                    ids.push(*id);
+                }
+                TrayItem::Separator => {
+                    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                }
+                TrayItem::Submenu { label, items } => {
+                    let Ok(sub) = CreatePopupMenu() else { continue };
+                    append(sub, items, ids);
+                    let text = HSTRING::from(label.as_str());
+                    // The parent menu owns (and destroys) the submenu.
+                    let _ = AppendMenuW(menu, MF_STRING | MF_POPUP, sub.0 as usize, &text);
+                }
+            }
+        }
+    }
+}
+
+/// Shows the tray menu at the cursor and returns the choice. `hwnd` is the (hidden) tray owner
+/// window. Runs a modal loop: call without holding host state.
+pub(crate) fn menu(hwnd: HWND, visible: bool, appbar: bool, items: &[TrayItem]) -> Choice {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return Choice::None };
+        let mut ids = Vec::new();
+        if !items.is_empty() {
+            append(menu, items, &mut ids);
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT as usize, w!("退出点墨"));
-            let mut pt = Default::default();
-            let _ = GetCursorPos(&mut pt);
-            // Required so the menu closes when the user taps elsewhere (documented quirk). This
-            // activates only the hidden tray window, after the user already left the target app
-            // by tapping the taskbar.
-            let _ = SetForegroundWindow(hwnd);
-            let cmd = TrackPopupMenu(
-                menu,
-                TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RETURNCMD,
-                pt.x,
-                pt.y,
-                None,
-                hwnd,
-                None,
-            );
-            let _ = PostMessageW(Some(hwnd), WM_NULL, Default::default(), Default::default());
-            let _ = DestroyMenu(menu);
-            cmd.0 as u32
+        }
+        let toggle = if visible { w!("隐藏键盘") } else { w!("显示键盘") };
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE as usize, toggle);
+        let check = if appbar { MF_CHECKED } else { MF_UNCHECKED };
+        let _ = AppendMenuW(menu, MF_STRING | check, CMD_APPBAR as usize, w!("让出屏幕空间（最大化窗口上移）"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT as usize, w!("退出点墨"));
+        let mut pt = Default::default();
+        let _ = GetCursorPos(&mut pt);
+        // Required so the menu closes when the user taps elsewhere (documented quirk). This
+        // activates only the hidden tray window, after the user already left the target app
+        // by tapping the taskbar.
+        let _ = SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RETURNCMD, pt.x, pt.y, None, hwnd, None);
+        let _ = PostMessageW(Some(hwnd), WM_NULL, Default::default(), Default::default());
+        let _ = DestroyMenu(menu);
+        let cmd = cmd.0 as u32;
+        match cmd {
+            0 => Choice::None,
+            CMD_TOGGLE | CMD_APPBAR | CMD_QUIT => Choice::Builtin(cmd),
+            c if c >= APP_BASE && ((c - APP_BASE) as usize) < ids.len() => Choice::App(ids[(c - APP_BASE) as usize]),
+            _ => Choice::None,
         }
     }
 }

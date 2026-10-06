@@ -28,9 +28,9 @@ use windows::Win32::UI::Input::Pointer::{EnableMouseInPointer, GetPointerType};
 use windows::Win32::UI::Shell::NIN_SELECT;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetMessageW,
-    GetWindowLongPtrW, HWND_TOPMOST, KillTimer, MA_NOACTIVATE, MSG, PA_NOACTIVATE, POINTER_INPUT_TYPE, PT_MOUSE,
+    GetWindowLongPtrW, HWND_BOTTOM, HWND_TOPMOST, KillTimer, MA_NOACTIVATE, MSG, PA_NOACTIVATE, POINTER_INPUT_TYPE, PT_MOUSE,
     PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SPI_SETWORKAREA, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, TranslateMessage, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_ENDSESSION, WM_MOUSEACTIVATE, WM_PAINT, WM_POINTERACTIVATE, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN,
     WM_POINTERUP, WM_POINTERUPDATE, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW,
@@ -38,16 +38,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{Result, w};
 
-use crate::appbar::{ABN_POSCHANGED, ABN_STATECHANGE, AppBar};
+use crate::appbar::{ABN_FULLSCREENAPP, ABN_POSCHANGED, ABN_STATECHANGE, AppBar};
 use crate::canvas::Renderer;
 use crate::clock::now_ms;
 use crate::handle::EdgeHandle;
-use crate::tray::{self, Tray};
+use crate::tray::{self, Choice, Tray, TrayItem};
 
 pub(crate) const WM_APP_CMD: u32 = WM_APP + 1;
 const WM_APP_EVENT: u32 = WM_APP + 2;
 const WM_APP_APPBAR: u32 = WM_APP + 3;
 const WM_APP_TRAY: u32 = WM_APP + 4;
+const WM_APP_TRAY_CMD: u32 = WM_APP + 5;
+const WM_APP_FULLSCREEN: u32 = WM_APP + 6;
 
 pub(crate) const CMD_SHOW: usize = 1;
 const CMD_HIDE: usize = 2;
@@ -84,6 +86,9 @@ pub struct HostOptions {
     /// Render on the GPU driver instead of WARP. Off by default: on the Surface the driver costs
     /// ~47 MB private memory for no measurable CPU gain. Env `DIANMO_D3D=hardware|warp` overrides.
     pub hardware_gpu: bool,
+    /// App items for the tray menu, shown above the built-in ones. Change at runtime with
+    /// [`HostControl::set_tray_menu`]; choices arrive in [`App::on_tray_command`].
+    pub tray_menu: Vec<TrayItem>,
 }
 
 impl Default for HostOptions {
@@ -96,6 +101,7 @@ impl Default for HostOptions {
             tray_tip: "点墨 · 触屏输入法".to_owned(),
             max_height_fraction: 0.5,
             hardware_gpu: false,
+            tray_menu: Vec::new(),
         }
     }
 }
@@ -103,6 +109,13 @@ impl Default for HostOptions {
 /// The application behind the keyboard: turns [`UiAction`]s into input (e.g. through
 /// `dianmo_core::InputController` with a [`crate::SendInputSink`]) and tells the host what to do.
 pub trait App {
+    /// Called once after the window, tray icon and edge handle exist, before the keyboard is
+    /// first shown (e.g. to start [`crate::start_focus_watcher`] with `host.proxy()`).
+    fn on_start(&mut self, view: &mut dyn View, host: &mut HostControl) -> Response {
+        let _ = (view, host);
+        Response::none()
+    }
+
     /// Handles one action from the view. The returned response is merged like a view response
     /// (repaint / timer / nested actions, which come back here).
     fn on_action(&mut self, action: UiAction, view: &mut dyn View, host: &mut HostControl) -> Response;
@@ -118,6 +131,12 @@ pub trait App {
         let _ = (visible, view, host);
         Response::none()
     }
+
+    /// An app item of the tray menu ([`TrayItem::Command`]) was chosen.
+    fn on_tray_command(&mut self, id: u32, view: &mut dyn View, host: &mut HostControl) -> Response {
+        let _ = (id, view, host);
+        Response::none()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -125,6 +144,8 @@ struct Requests {
     visible: Option<bool>,
     appbar: Option<bool>,
     quit: bool,
+    /// Applied by `Host::process` itself (no window operations involved).
+    tray_menu: Option<Vec<TrayItem>>,
 }
 
 impl Requests {
@@ -138,6 +159,7 @@ impl Requests {
 pub struct HostControl {
     visible: bool,
     appbar: bool,
+    fullscreen: bool,
     req: Requests,
     proxy: HostProxy,
 }
@@ -180,6 +202,18 @@ impl HostControl {
     /// A handle other threads can use to post work to the UI thread.
     pub fn proxy(&self) -> HostProxy {
         self.proxy
+    }
+
+    /// Replaces the app's tray menu items (shown above the built-in ones).
+    pub fn set_tray_menu(&mut self, items: Vec<TrayItem>) {
+        self.req.tray_menu = Some(items);
+    }
+
+    /// A full-screen app (video, game, F11 browser, slideshow) is in the foreground, as reported
+    /// by the shell (`ABN_FULLSCREENAPP`). The keyboard then drops out of the topmost band and
+    /// the edge handle hides; showing the keyboard still puts it on top.
+    pub fn fullscreen_app(&self) -> bool {
+        self.fullscreen
     }
 }
 
@@ -246,6 +280,14 @@ struct Host {
     tray: Option<Tray>,
     handle: Option<EdgeHandle>,
     paint_failures: u32,
+    tray_menu: Vec<TrayItem>,
+    /// Shell says a full-screen app is in front.
+    fullscreen: bool,
+    /// The visible keyboard was pushed out of the topmost band for a full-screen app.
+    demoted: bool,
+    /// The tray window is registered as a (zero-size) AppBar to receive `ABN_FULLSCREENAPP`
+    /// even while the keyboard itself isn't an AppBar.
+    notifier: bool,
 }
 
 thread_local! {
@@ -369,6 +411,8 @@ pub fn run_with(view: Box<dyn View>, app: Box<dyn App>, opts: HostOptions) -> Re
         let handle = if opts.edge_handle { EdgeHandle::new(hwnd).ok() } else { None };
         let start_visible = opts.start_visible;
         let appbar_on = opts.appbar;
+        let tray_menu = opts.tray_menu.clone();
+        let notifier = register_notifier(tray_hwnd);
         HOST.with(|cell| {
             *cell.borrow_mut() = Some(Host {
                 hwnd,
@@ -386,8 +430,20 @@ pub fn run_with(view: Box<dyn View>, app: Box<dyn App>, opts: HostOptions) -> Re
                 tray,
                 handle,
                 paint_failures: 0,
+                tray_menu,
+                fullscreen: false,
+                demoted: false,
+                notifier,
             })
         });
+
+        if let Some(req) = with(|h| {
+            let mut ctl = h.control();
+            let r = h.app.on_start(&mut *h.view, &mut ctl);
+            h.process(ctl, r)
+        }) {
+            apply(req);
+        }
 
         if start_visible {
             apply(Requests { visible: Some(true), ..Default::default() });
@@ -425,6 +481,7 @@ impl Host {
         HostControl {
             visible: self.visible,
             appbar: self.appbar_on,
+            fullscreen: self.fullscreen,
             req: Requests::default(),
             proxy: HostProxy { hwnd: self.hwnd.0 as isize },
         }
@@ -433,6 +490,14 @@ impl Host {
     /// Executes a response: actions go to the app (their responses are merged in turn), then
     /// repaint and timer requests are honoured. Returns the app's host requests.
     fn process(&mut self, mut ctl: HostControl, first: Response) -> Requests {
+        self.process_inner(&mut ctl, first);
+        if let Some(menu) = ctl.req.tray_menu.take() {
+            self.tray_menu = menu;
+        }
+        ctl.req
+    }
+
+    fn process_inner(&mut self, ctl: &mut HostControl, first: Response) {
         let mut repaint = false;
         let mut timer = None;
         let mut queue = VecDeque::new();
@@ -450,7 +515,7 @@ impl Host {
             if budget == 0 {
                 break;
             }
-            let r = self.app.on_action(action, &mut *self.view, &mut ctl);
+            let r = self.app.on_action(action, &mut *self.view, ctl);
             merge(r, &mut queue);
         }
         unsafe {
@@ -461,7 +526,6 @@ impl Host {
                 SetTimer(Some(self.hwnd), TIMER_ID, ms.clamp(1, u32::MAX as u64) as u32, None);
             }
         }
-        ctl.req
     }
 
     fn respond(&mut self, r: Response) -> Requests {
@@ -593,15 +657,26 @@ fn set_appbar(on: bool) {
 }
 
 fn set_visible(visible: bool) -> Requests {
-    let Some((hwnd, was, appbar_on)) = with(|h| (h.hwnd, h.visible, h.appbar_on)) else {
+    let Some((hwnd, was, appbar_on, demoted)) = with(|h| (h.hwnd, h.visible, h.appbar_on, h.demoted)) else {
         return Requests::default();
     };
     if was == visible {
+        if visible && demoted {
+            // Shown again while pushed behind a full-screen app (e.g. a field in it was tapped).
+            with(|h| h.demoted = false);
+            unsafe {
+                let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+            }
+        }
         return Requests::default();
     }
     let mut req = Requests::default();
     if visible {
-        with(|h| h.visible = true);
+        // An explicit show goes on top even over a full-screen app.
+        with(|h| {
+            h.visible = true;
+            h.demoted = false;
+        });
         if appbar_on {
             appbar_op(|ab, hwnd| ab.register(hwnd, WM_APP_APPBAR));
         }
@@ -612,6 +687,7 @@ fn set_visible(visible: bool) -> Requests {
     } else {
         if let Some(r) = with(|h| {
             h.visible = false;
+            h.demoted = false;
             unsafe {
                 let _ = KillTimer(Some(h.hwnd), TIMER_ID);
             }
@@ -638,9 +714,9 @@ fn set_visible(visible: bool) -> Requests {
 /// Docks the window at the bottom of its monitor (AppBar-negotiated when registered), sizes it
 /// for the view, and places the edge handle when hidden.
 fn layout() {
-    let Some((hwnd, visible, registered, max_frac)) =
-        with(|h| (h.hwnd, h.visible, h.appbar.is_registered(), h.opts.max_height_fraction))
-    else {
+    let Some((hwnd, visible, registered, max_frac, demoted, fullscreen)) = with(|h| {
+        (h.hwnd, h.visible, h.appbar.is_registered(), h.opts.max_height_fraction, h.demoted, h.fullscreen)
+    }) else {
         return;
     };
     unsafe {
@@ -669,7 +745,7 @@ fn layout() {
         let flags = if visible { SWP_NOACTIVATE | SWP_SHOWWINDOW } else { SWP_NOACTIVATE | SWP_NOZORDER };
         let _ = SetWindowPos(
             hwnd,
-            Some(HWND_TOPMOST),
+            Some(if demoted { HWND_BOTTOM } else { HWND_TOPMOST }),
             rect.left,
             rect.top,
             rect.right - rect.left,
@@ -679,7 +755,7 @@ fn layout() {
         sync_client_size(hwnd);
         with(|h| {
             if let Some(handle) = &h.handle {
-                if visible { handle.hide() } else { handle.show(mi.rcWork, scale) }
+                if visible || fullscreen { handle.hide() } else { handle.show(mi.rcWork, scale) }
             }
         });
     }
@@ -698,6 +774,9 @@ fn sync_client_size(hwnd: HWND) {
 fn teardown() {
     let Some(mut host) = HOST.with(|cell| cell.try_borrow_mut().ok().and_then(|mut g| g.take())) else { return };
     host.appbar.remove(host.hwnd);
+    if host.notifier {
+        crate::appbar::remove_notifier(host.tray_hwnd);
+    }
     host.tray = None;
     unsafe {
         if let Some(handle) = host.handle.take() {
@@ -731,6 +810,40 @@ fn command(hwnd: HWND, cmd: usize) {
             let _ = InvalidateRect(Some(hwnd), None, false);
         },
         _ => {}
+    }
+}
+
+/// Registers the hidden tray window as a zero-size AppBar: it reserves no space but gets
+/// `ABN_FULLSCREENAPP` from the shell.
+fn register_notifier(tray_hwnd: HWND) -> bool {
+    crate::appbar::register_notifier(tray_hwnd, WM_APP_FULLSCREEN)
+}
+
+/// The shell reported a full-screen app opening (`on`) or closing: drop the visible keyboard out
+/// of the topmost band (it stays shown, behind the full-screen window) and hide the edge handle;
+/// restore both afterwards.
+fn set_fullscreen(on: bool) {
+    let Some((hwnd, visible, changed)) = with(|h| {
+        let changed = h.fullscreen != on;
+        if changed {
+            h.fullscreen = on;
+            h.demoted = on && h.visible;
+        }
+        (h.hwnd, h.visible, changed)
+    }) else {
+        return;
+    };
+    if !changed {
+        return;
+    }
+    unsafe {
+        let flags = SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE;
+        if visible {
+            let _ = SetWindowPos(hwnd, Some(if on { HWND_BOTTOM } else { HWND_TOPMOST }), 0, 0, 0, 0, flags);
+        }
+    }
+    if !visible {
+        layout();
     }
 }
 
@@ -823,6 +936,21 @@ extern "system" fn keyboard_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 command(hwnd, wp.0);
                 LRESULT(0)
             }
+            WM_APP_TRAY_CMD => {
+                let id = wp.0 as u32;
+                if let Some(req) = with(|h| {
+                    let mut ctl = h.control();
+                    let r = h.app.on_tray_command(id, &mut *h.view, &mut ctl);
+                    h.process(ctl, r)
+                }) {
+                    apply(req);
+                }
+                LRESULT(0)
+            }
+            WM_APP_FULLSCREEN => {
+                set_fullscreen(wp.0 != 0);
+                LRESULT(0)
+            }
             WM_APP_EVENT => {
                 let event = *Box::from_raw(lp.0 as *mut Box<dyn Any + Send>);
                 if let Some(req) = with(|h| {
@@ -855,6 +983,10 @@ extern "system" fn keyboard_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                     }
                 });
                 appbar_op(|ab, hwnd| ab.reregister(hwnd, WM_APP_APPBAR));
+                if let Some(tray_hwnd) = with(|h| h.tray_hwnd) {
+                    let ok = register_notifier(tray_hwnd);
+                    with(|h| h.notifier = ok);
+                }
                 post_cmd(hwnd, CMD_LAYOUT);
                 LRESULT(0)
             }
@@ -865,20 +997,31 @@ extern "system" fn keyboard_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
 
 extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
+        let keyboard = HWND(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut _);
         if msg == WM_APP_TRAY {
-            let keyboard = HWND(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut _);
             match (lp.0 & 0xFFFF) as u32 {
                 NIN_SELECT | NIN_KEYSELECT => post_cmd(keyboard, CMD_TOGGLE),
                 WM_CONTEXTMENU => {
-                    let (visible, appbar) = with(|h| (h.visible, h.appbar_on)).unwrap_or((false, false));
-                    match tray::menu(hwnd, visible, appbar) {
-                        tray::CMD_TOGGLE => post_cmd(keyboard, CMD_TOGGLE),
-                        tray::CMD_APPBAR => post_cmd(keyboard, CMD_APPBAR_TOGGLE),
-                        tray::CMD_QUIT => post_cmd(keyboard, CMD_QUIT),
+                    let (visible, appbar, items) =
+                        with(|h| (h.visible, h.appbar_on, h.tray_menu.clone())).unwrap_or_default();
+                    match tray::menu(hwnd, visible, appbar, &items) {
+                        Choice::Builtin(tray::CMD_TOGGLE) => post_cmd(keyboard, CMD_TOGGLE),
+                        Choice::Builtin(tray::CMD_APPBAR) => post_cmd(keyboard, CMD_APPBAR_TOGGLE),
+                        Choice::Builtin(tray::CMD_QUIT) => post_cmd(keyboard, CMD_QUIT),
+                        Choice::App(id) => {
+                            let _ = PostMessageW(Some(keyboard), WM_APP_TRAY_CMD, WPARAM(id as usize), LPARAM(0));
+                        }
                         _ => {}
                     }
                 }
                 _ => {}
+            }
+            return LRESULT(0);
+        }
+        if msg == WM_APP_FULLSCREEN {
+            // Notifier AppBar callback: wParam = ABN_*, lParam = TRUE when a full-screen app opens.
+            if wp.0 == ABN_FULLSCREENAPP {
+                let _ = PostMessageW(Some(keyboard), WM_APP_FULLSCREEN, WPARAM((lp.0 != 0) as usize), LPARAM(0));
             }
             return LRESULT(0);
         }

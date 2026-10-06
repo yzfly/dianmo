@@ -1,6 +1,9 @@
 //! Typing into the focused app with `SendInput` (DESIGN.md §3 输入架构).
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use dianmo_core::{EditKey, TextSink};
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN,
@@ -81,8 +84,13 @@ fn send(events: &[INPUT]) -> bool {
         return true;
     }
     let n = unsafe { SendInput(events, size_of::<INPUT>() as i32) };
+    LAST_SEND_TICK.store(unsafe { GetTickCount() }.max(1), Ordering::Relaxed);
     n as usize == events.len()
 }
+
+/// `GetTickCount()` right after our last `SendInput` (0 = never), so the focus watcher can tell
+/// our own key presses from touch input (`GetLastInputInfo` sees both).
+pub(crate) static LAST_SEND_TICK: AtomicU32 = AtomicU32::new(0);
 
 /// Types `text` into the focused window in a single `SendInput` call. Returns false if the
 /// system blocked some of the events (e.g. the target is elevated).

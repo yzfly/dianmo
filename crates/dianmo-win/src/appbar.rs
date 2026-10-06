@@ -116,4 +116,19 @@ fn install_panic_hook() {
 /// `ABN_*` notification codes (wParam of the callback message).
 pub(crate) const ABN_STATECHANGE: usize = 0;
 pub(crate) const ABN_POSCHANGED: usize = 1;
+pub(crate) const ABN_FULLSCREENAPP: usize = 2;
+
+/// Registers `hwnd` (a hidden window) as an AppBar that never sets a position: it reserves no
+/// screen space, but the shell sends it `ABN_FULLSCREENAPP` through `callback` (wParam = 2,
+/// lParam = TRUE/FALSE). Survives only as long as Explorer; call again after `TaskbarCreated`.
+pub(crate) fn register_notifier(hwnd: HWND, callback: u32) -> bool {
+    let mut d = data(hwnd);
+    d.uCallbackMessage = callback;
+    unsafe { SHAppBarMessage(ABM_NEW, &mut d) != 0 }
+}
+
+pub(crate) fn remove_notifier(hwnd: HWND) {
+    let mut d = data(hwnd);
+    unsafe { SHAppBarMessage(ABM_REMOVE, &mut d) };
+}
 

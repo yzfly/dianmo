@@ -1,9 +1,16 @@
 //! End-to-end check of the platform layer: a few big keys and a candidate-like strip that type
 //! into the focused app through `SendInputSink`, without ever taking focus.
 //!
-//!   demo.exe [--no-appbar] [--hidden] [--no-tray] [--no-handle]
+//!   demo.exe [--no-appbar] [--hidden] [--no-tray] [--no-handle] [--focus] [--auto] [--tray-menu]
 //!
-//! With `DIANMO_DEMO_LOG=<file>` every pointer event is appended to that file (for tests).
+//! - `--focus`: start the UI Automation focus watcher and log every `FocusEvent`.
+//! - `--auto`: with `--focus`, show the keyboard on `Editable { by_touch: true }` and hide it on
+//!   `NotEditable { by_touch: true }` (the auto show/hide rule of DESIGN.md §2).
+//! - `--tray-menu`: app items in the tray menu (a 布局 submenu with radio-like checks, a 深色主题
+//!   switch); choices are logged.
+//!
+//! With `DIANMO_DEMO_LOG=<file>` every pointer event, focus event, tray command and visibility
+//! change is appended to that file (for tests).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(not(windows))]
@@ -24,7 +31,19 @@ mod demo {
     use dianmo_ui::{
         Align, Canvas, Color, Font, InputState, PointerEvent, PointerPhase, Rect, Response, TextStyle, UiAction, View,
     };
-    use dianmo_win::{App, HostControl, HostOptions, SendInputSink, start_voice_typing};
+    use dianmo_win::{
+        App, FocusEvent, FocusWatcher, HostControl, HostOptions, SendInputSink, TrayItem, now_ms, start_focus_watcher,
+        start_voice_typing,
+    };
+
+    /// Appends a line to `DIANMO_DEMO_LOG` (if set).
+    fn log_line(line: &str) {
+        if let Some(path) = std::env::var_os("DIANMO_DEMO_LOG")
+            && let Ok(mut f) = File::options().create(true).append(true).open(path)
+        {
+            let _ = writeln!(f, "{} {}", now_ms(), line);
+        }
+    }
 
     const BG: Color = Color::rgb(0xD5, 0xD8, 0xDE);
     const KEY: Color = Color::rgb(0xFF, 0xFF, 0xFF);
@@ -68,7 +87,8 @@ mod demo {
 
     impl DemoView {
         fn new() -> Self {
-            let log = std::env::var_os("DIANMO_DEMO_LOG").and_then(|p| File::create(p).ok());
+            let log = std::env::var_os("DIANMO_DEMO_LOG")
+                .and_then(|p| File::options().create(true).append(true).open(p).ok());
             Self {
                 width: 0.0,
                 keys: Vec::new(),
@@ -265,11 +285,86 @@ mod demo {
         }
     }
 
+    const LAYOUTS: [&str; 3] = ["全拼", "小鹤双拼", "九宫格"];
+    const CMD_LAYOUT: u32 = 10;
+    const CMD_DARK: u32 = 20;
+    const CMD_ABOUT: u32 = 30;
+
     struct DemoApp {
         sink: SendInputSink,
+        focus: bool,
+        auto: bool,
+        watcher: Option<FocusWatcher>,
+        layout: usize,
+        dark: bool,
+        tray_menu: bool,
+    }
+
+    impl DemoApp {
+        fn tray_items(&self) -> Vec<TrayItem> {
+            let layouts = LAYOUTS
+                .iter()
+                .enumerate()
+                .map(|(i, l)| TrayItem::Command { id: CMD_LAYOUT + i as u32, label: (*l).to_owned(), checked: i == self.layout })
+                .collect();
+            vec![
+                TrayItem::Submenu { label: "布局".to_owned(), items: layouts },
+                TrayItem::Command { id: CMD_DARK, label: "深色主题".to_owned(), checked: self.dark },
+                TrayItem::Separator,
+                TrayItem::Command { id: CMD_ABOUT, label: "关于点墨 demo".to_owned(), checked: false },
+            ]
+        }
     }
 
     impl App for DemoApp {
+        fn on_start(&mut self, _view: &mut dyn View, host: &mut HostControl) -> Response {
+            if self.focus {
+                let t0 = now_ms();
+                match start_focus_watcher(host.proxy()) {
+                    Ok(w) => {
+                        log_line(&format!("focus watcher started in {}ms", now_ms() - t0));
+                        self.watcher = Some(w);
+                    }
+                    Err(e) => log_line(&format!("focus watcher failed: {e}")),
+                }
+            }
+            Response::none()
+        }
+
+        fn on_event(&mut self, event: Box<dyn std::any::Any + Send>, _view: &mut dyn View, host: &mut HostControl) -> Response {
+            if let Ok(ev) = event.downcast::<FocusEvent>() {
+                log_line(&format!("focus {:?} fullscreen={}", *ev, host.fullscreen_app()));
+                if self.auto {
+                    match *ev {
+                        FocusEvent::Editable { by_touch: true, .. } => host.show(),
+                        FocusEvent::NotEditable { by_touch: true } => host.hide(),
+                        _ => {}
+                    }
+                }
+            }
+            Response::none()
+        }
+
+        fn on_visibility_changed(&mut self, visible: bool, _view: &mut dyn View, _host: &mut HostControl) -> Response {
+            log_line(&format!("visible {visible}"));
+            Response::none()
+        }
+
+        fn on_tray_command(&mut self, id: u32, _view: &mut dyn View, host: &mut HostControl) -> Response {
+            log_line(&format!("tray command {id}"));
+            match id {
+                CMD_DARK => self.dark = !self.dark,
+                id if (CMD_LAYOUT..CMD_LAYOUT + LAYOUTS.len() as u32).contains(&id) => {
+                    self.layout = (id - CMD_LAYOUT) as usize
+                }
+                _ => {}
+            }
+            if self.tray_menu {
+                host.set_tray_menu(self.tray_items());
+            }
+            Response::none()
+        }
+
         fn on_action(&mut self, action: UiAction, _view: &mut dyn View, host: &mut HostControl) -> Response {
             match action {
                 UiAction::Input(Action::Text(t)) => self.sink.commit_text(&t),
@@ -291,13 +386,23 @@ mod demo {
     pub fn main() -> windows::core::Result<()> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let has = |f: &str| args.iter().any(|a| a == f);
+        let app = DemoApp {
+            sink: SendInputSink::new(),
+            focus: has("--focus") || has("--auto"),
+            auto: has("--auto"),
+            watcher: None,
+            layout: 0,
+            dark: false,
+            tray_menu: has("--tray-menu"),
+        };
         let opts = HostOptions {
             appbar: !has("--no-appbar"),
             start_visible: !has("--hidden"),
             tray: !has("--no-tray"),
             edge_handle: !has("--no-handle"),
+            tray_menu: if app.tray_menu { app.tray_items() } else { Vec::new() },
             ..HostOptions::default()
         };
-        dianmo_win::run_with(Box::new(DemoView::new()), Box::new(DemoApp { sink: SendInputSink::new() }), opts)
+        dianmo_win::run_with(Box::new(DemoView::new()), Box::new(app), opts)
     }
 }
