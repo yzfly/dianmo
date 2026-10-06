@@ -6,20 +6,35 @@
 //! - Long-press (350 ms) or swipe-up on a key enters its secondary (shown in the top-right
 //!   corner); keys with several alternates open a popup where sliding picks one.
 //! - Backspace fires on press and repeats with acceleration; swipe left clears the composition.
-//! - Dragging along the space bar moves the cursor; holding it starts voice typing.
+//! - Dragging along the space bar moves the cursor; holding it turns the keyboard into a trackpad
+//!   (drag = move the caret, a second finger's tap = start selecting).
+//! - Modifiers (Shift, Ctrl, Alt, Win, Fn): tap = next key only, double tap = locked, held
+//!   while another finger taps = a real chord. A lone Win tap presses Win; long-press latches it.
+//! - Edit keys (arrows, Tab, Del) fire on press and repeat; keys with a hold action (Tab → Esc,
+//!   toolbar ← → line start/end) fire on release instead.
 //! - The candidate strip, the T9 column and the grids scroll by dragging, with a short fling.
+//! - 电脑键盘 (`pc.rs`): every key is a real key press, down on press and up on release, repeating
+//!   while held; held modifiers are really held.
 
-use dianmo_core::{Action, Candidate, EditKey, Schema, Snapshot};
+use dianmo_core::{Action, Candidate, EditKey, KeyChord, KeyCode, Schema, Snapshot};
 
 use crate::canvas::{Canvas, Rect, TextStyle};
-use crate::layout::{self, BuildCtx, ColumnKind, Key, KeyAction, Layout, Metrics, Shift, SymTab, Tone};
+use crate::clip::{extends_selection, horizontal};
+use crate::layout::{
+    self, BuildCtx, ColumnKind, Key, KeyAction, Latch, Layout, Metrics, Modifier, Mods, SelAct, SymTab, Tone,
+};
 use crate::scroll::{FRAME_MS, Scroller, VelocityTracker};
 use crate::theme::{Theme, ThemeKind};
-use crate::view::{InputState, PointerEvent, PointerPhase, Response, UiAction, View};
+use crate::view::{ClipItem, InputState, PointerEvent, PointerPhase, Response, UiAction, View};
 
 pub(crate) const LONG_PRESS_MS: u64 = 350;
-pub(crate) const VOICE_PRESS_MS: u64 = 600;
+/// Holding the space bar this long turns the keyboard into a trackpad.
+pub(crate) const TRACKPAD_PRESS_MS: u64 = 450;
 pub(crate) const REPEAT_DELAY_MS: u64 = 400;
+/// 电脑键盘 auto-repeat interval (like a physical keyboard's typematic rate).
+pub(crate) const PC_REPEAT_MS: u64 = 40;
+/// How long the 「已复制」 toast stays.
+pub(crate) const TOAST_MS: u64 = 1000;
 const DOUBLE_TAP_MS: u64 = 350;
 /// Candidates requested per `WantMoreCandidates`.
 pub const MORE_BATCH: usize = 60;
@@ -54,6 +69,10 @@ pub(crate) enum Panel {
     Candidates,
     /// Layout / theme picker.
     Menu,
+    /// 电脑键: Esc, Tab, modifiers, arrows, F1–F12.
+    PcKeys,
+    /// Clipboard history, full-screen cards.
+    Clipboard,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -69,6 +88,14 @@ pub(crate) enum Target {
     SymGrid(Option<usize>),
     /// Outside the menu tiles: closes the menu.
     CloseMenu,
+    /// Clipboard card in the bar (index into `clips`).
+    ClipCard(Option<usize>),
+    /// Clipboard panel card (index into `clip_panel_order()`).
+    ClipGrid(Option<usize>),
+    /// 固定 / 删除 button of the panel card whose menu is open.
+    ClipBtn { id: u64, delete: bool },
+    /// Another finger while the keyboard is a trackpad: a tap starts selecting.
+    PadAux,
     None,
 }
 
@@ -84,8 +111,9 @@ pub(crate) enum Mode {
     Scroll,
     /// Space-bar drag: `steps` cursor moves emitted so far (negative = left).
     Cursor { steps: i32 },
-    /// Space held: release starts voice typing.
-    Voice,
+    /// Space held: the keyboard is a trackpad. Accumulated movement (DIPs, scaled by speed) not
+    /// yet turned into caret steps, and the last finger sample.
+    Trackpad { acc_x: f32, acc_y: f32, lx: f32, ly: f32, lt: u64 },
     /// Backspace swiped left: release clears the composition.
     ClearArmed,
 }
@@ -107,6 +135,14 @@ pub(crate) struct Touch {
     pub vel: VelocityTracker,
     /// The press stopped a fling: release must not select.
     pub stopped_fling: bool,
+    /// A held modifier was used for a chord (or latched by a long press): release does not
+    /// toggle it.
+    pub used: bool,
+    /// What a press-fired key (backspace, arrows) repeats.
+    pub repeat_action: Option<Action>,
+    /// 电脑键盘: this held modifier is really pressed (sent down): another key was pressed while
+    /// it was held, or it was long-pressed (Shift / Ctrl / Alt).
+    pub engaged: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -127,8 +163,11 @@ pub struct KeyboardView {
     pub(crate) schema: Schema,
     pub(crate) snapshot: Snapshot,
     pub(crate) panel: Panel,
-    pub(crate) shift: Shift,
-    last_shift_tap: Option<u64>,
+    /// Latched modifiers, indexed by [`Modifier::index`].
+    pub(crate) latch: [Latch; 5],
+    last_mod_tap: [Option<u64>; 5],
+    /// Wide 26-key layout shows the edit area (user setting).
+    pub(crate) edit_area: bool,
     pub(crate) keys: Vec<Key>,
     pub(crate) bar_keys: Vec<Key>,
     pub(crate) column: Option<(Rect, ColumnKind)>,
@@ -145,9 +184,33 @@ pub struct KeyboardView {
     pub(crate) sym_scroll: Scroller,
     pub(crate) spellings: Vec<String>,
     pub(crate) touches: Vec<Touch>,
-    now: u64,
+    pub(crate) now: u64,
     /// Multiplier on the preferred height (user setting).
     height_scale: f32,
+    /// 电脑键盘 (pass-through) layout.
+    pub(crate) pc: bool,
+    /// 电脑键盘: Caps Lock as toggled by our Caps key.
+    pub(crate) pc_caps: bool,
+    /// 电脑键盘: modifiers we sent down and not yet up (by [`Modifier::index`]; Fn is never sent).
+    pub(crate) pc_down: [bool; 5],
+    /// Selection mode: the selection bar replaces the toolbar; arrows extend the selection.
+    pub(crate) selecting: bool,
+    /// Trackpad: a second finger's tap started selecting (moves carry Shift).
+    pub(crate) pad_select: bool,
+    /// Trackpad: something was selected in this trackpad session.
+    pub(crate) pad_selected: bool,
+    /// Clipboard history from the host, most recent first.
+    pub(crate) clips: Vec<ClipItem>,
+    /// The idle bar shows the clipboard cards (after a copy) instead of the toolbar.
+    pub(crate) clip_bar: bool,
+    /// Preview of the system clipboard's text, shown small on the paste key.
+    pub(crate) paste_preview: Option<String>,
+    pub(crate) clip_strip: Scroller,
+    pub(crate) clip_scroll: Scroller,
+    /// Clipboard panel: the card showing its 固定 / 删除 buttons.
+    pub(crate) clip_menu: Option<u64>,
+    /// A short message (「已复制」) and when it goes away.
+    pub(crate) toast: Option<(String, u64)>,
 }
 
 impl Default for KeyboardView {
@@ -167,8 +230,9 @@ impl KeyboardView {
             schema: config.schema,
             snapshot: Snapshot::default(),
             panel: Panel::Keys,
-            shift: Shift::Off,
-            last_shift_tap: None,
+            latch: [Latch::Off; 5],
+            last_mod_tap: [None; 5],
+            edit_area: true,
             keys: Vec::new(),
             bar_keys: Vec::new(),
             column: None,
@@ -186,6 +250,19 @@ impl KeyboardView {
             touches: Vec::new(),
             now: 0,
             height_scale: 1.0,
+            pc: false,
+            pc_caps: false,
+            pc_down: [false; 5],
+            selecting: false,
+            pad_select: false,
+            pad_selected: false,
+            clips: Vec::new(),
+            clip_bar: false,
+            paste_preview: None,
+            clip_strip: Scroller::default(),
+            clip_scroll: Scroller::default(),
+            clip_menu: None,
+            toast: None,
         };
         v.rebuild();
         v
@@ -214,6 +291,26 @@ impl KeyboardView {
         self.height_scale
     }
 
+    /// Shows or hides the edit area of the wide layout (user setting). Returns true if it
+    /// changed; the caller repaints.
+    pub fn set_edit_area(&mut self, on: bool) -> bool {
+        let changed = self.edit_area != on;
+        self.edit_area = on;
+        if changed {
+            self.rebuild();
+        }
+        changed
+    }
+
+    pub fn edit_area(&self) -> bool {
+        self.edit_area
+    }
+
+    /// Whether the current size uses the wide (Surface landscape) layout.
+    pub fn is_wide(&self) -> bool {
+        self.m.wide
+    }
+
     /// Opens the number pad (e.g. when a numeric field gets focus). Returns true if it changed.
     pub fn show_numbers(&mut self) -> bool {
         let changed = self.panel != Panel::Numbers;
@@ -231,23 +328,79 @@ impl KeyboardView {
 
     /// The letter layout currently shown (or that the keyboard returns to).
     pub fn layout(&self) -> Layout {
-        Layout::of(self.chinese, self.schema)
+        if self.pc { Layout::Pc } else { Layout::of(self.chinese, self.schema) }
     }
 
     /// Centre of a visible key, for automated GUI tests. `name` is a key label ("a", "，",
-    /// "符号", "123") or one of "shift", "backspace", "enter", "space", "layout", "toggle",
-    /// "expand", "voice", "hide".
+    /// "符号", "123", "F5") or one of the names below (`clip0`, `clip1` … are clipboard cards in
+    /// the bar, or in the clipboard panel when it is open).
     pub fn key_center(&self, name: &str) -> Option<(f32, f32)> {
+        if let Some(i) = name.strip_prefix("clip").and_then(|n| n.parse::<usize>().ok()) {
+            return self.clip_card_center(i);
+        }
+        let edit = |e: EditKey| move |k: &Key| k.action == KeyAction::Edit(e) || k.action == KeyAction::Raw(KeyCode::Edit(e));
+        let chord = |c: KeyChord| move |k: &Key| k.action == KeyAction::Chord(c);
+        let press = |e: EditKey, ctrl: bool| {
+            move |k: &Key| k.action == KeyAction::Press(KeyChord { ctrl, shift: true, ..KeyChord::key(KeyCode::Edit(e)) })
+        };
         let named = |k: &Key| match name {
-            "shift" => k.action == KeyAction::Shift,
-            "backspace" => k.action == KeyAction::Backspace,
-            "enter" => k.action == KeyAction::Enter,
-            "space" => k.action == KeyAction::Space,
+            "shift" => k.action == KeyAction::Mod(Modifier::Shift),
+            "ctrl" => k.action == KeyAction::Mod(Modifier::Ctrl),
+            "alt" => k.action == KeyAction::Mod(Modifier::Alt),
+            "win" => k.action == KeyAction::Mod(Modifier::Win),
+            "fn" => k.action == KeyAction::Mod(Modifier::Fn),
+            "caps" => k.action == KeyAction::CapsLock || k.action == KeyAction::Raw(KeyCode::CapsLock),
+            "esc" => edit(EditKey::Escape)(k),
+            "tab" => edit(EditKey::Tab)(k),
+            "del" => edit(EditKey::Delete)(k),
+            "left" => edit(EditKey::Left)(k),
+            "right" => edit(EditKey::Right)(k),
+            "up" => edit(EditKey::Up)(k),
+            "down" => edit(EditKey::Down)(k),
+            "home" => edit(EditKey::Home)(k),
+            "end" => edit(EditKey::End)(k),
+            "undo" => chord(KeyChord::UNDO)(k),
+            "redo" => chord(KeyChord::REDO)(k),
+            "selectall" => chord(KeyChord::SELECT_ALL)(k),
+            "copy" => chord(KeyChord::COPY)(k),
+            "paste" => chord(KeyChord::PASTE)(k),
+            "cut" => chord(KeyChord::CUT)(k),
+            "delword" => chord(KeyChord::DELETE_WORD)(k),
+            "clear" => k.action == KeyAction::ClearAll,
+            "pc" => k.action == KeyAction::PcKeys,
+            "pageup" => k.action == KeyAction::PageUp,
+            "pagedown" => k.action == KeyAction::PageDown,
+            "backspace" => k.action == KeyAction::Backspace || k.action == KeyAction::Raw(KeyCode::Edit(EditKey::Backspace)),
+            "enter" => k.action == KeyAction::Enter || k.action == KeyAction::Raw(KeyCode::Edit(EditKey::Enter)),
+            "space" => k.action == KeyAction::Space || k.action == KeyAction::Raw(KeyCode::Char(' ')),
             "layout" => k.action == KeyAction::LayoutMenu,
             "toggle" => k.action == KeyAction::ToggleChinese,
             "expand" => k.action == KeyAction::ExpandCandidates,
             "voice" => k.action == KeyAction::Voice,
             "hide" => k.action == KeyAction::Hide,
+            "symbols" => k.action == KeyAction::Symbols,
+            "numbers" => k.action == KeyAction::Numbers,
+            "back" => k.action == KeyAction::Back,
+            "pcmode" => k.action == KeyAction::SetLayout(Layout::Pc),
+            "pcback" => k.action == KeyAction::PcBack,
+            "prtsc" => k.action == KeyAction::Raw(KeyCode::PrintScreen),
+            "select" => k.action == KeyAction::SelectMode,
+            "clipboard" => k.action == KeyAction::ClipPanel,
+            "clipclose" => k.action == KeyAction::CloseClipBar,
+            "clearclips" => k.action == KeyAction::ClearClips,
+            "sel_left" => press(EditKey::Left, false)(k),
+            "sel_right" => press(EditKey::Right, false)(k),
+            "sel_wordleft" => press(EditKey::Left, true)(k),
+            "sel_wordright" => press(EditKey::Right, true)(k),
+            "sel_up" => press(EditKey::Up, false)(k),
+            "sel_down" => press(EditKey::Down, false)(k),
+            "sel_home" => press(EditKey::Home, false)(k),
+            "sel_end" => press(EditKey::End, false)(k),
+            "sel_copy" => k.action == KeyAction::Sel(SelAct::Copy),
+            "sel_cut" => k.action == KeyAction::Sel(SelAct::Cut),
+            "sel_paste" => k.action == KeyAction::Sel(SelAct::Paste),
+            "sel_delete" => k.action == KeyAction::Sel(SelAct::Delete),
+            "sel_done" => k.action == KeyAction::Sel(SelAct::Done),
             _ => !k.icon && (k.label == name || k.label.eq_ignore_ascii_case(name) && k.label.len() == 1),
         };
         self.keys.iter().chain(&self.bar_keys).find(|k| named(k)).map(|k| (k.cell.x + k.cell.w / 2.0, k.cell.y + k.cell.h / 2.0))
@@ -257,21 +410,115 @@ impl KeyboardView {
         self.snapshot.is_composing()
     }
 
+    /// Latched modifiers plus the ones a finger is holding down.
+    pub(crate) fn mods(&self) -> Mods {
+        let mut held = [false; 5];
+        for t in &self.touches {
+            if let (false, Target::Key(Key { action: KeyAction::Mod(m), .. })) = (t.consumed, &t.target) {
+                held[m.index()] = true;
+            }
+        }
+        Mods { latch: self.latch, held }
+    }
+
+    /// `key` with the active modifiers.
+    fn chord(&self, key: KeyCode) -> KeyChord {
+        let m = self.mods();
+        KeyChord {
+            ctrl: m.on(Modifier::Ctrl),
+            shift: m.on(Modifier::Shift),
+            alt: m.on(Modifier::Alt),
+            win: m.on(Modifier::Win),
+            key: Some(key),
+        }
+    }
+
+    /// After a key was sent: one-shot modifiers turn off; held ones count as used.
+    fn after_key(&mut self) {
+        let mut changed = false;
+        for l in &mut self.latch {
+            if *l == Latch::Once {
+                *l = Latch::Off;
+                changed = true;
+            }
+        }
+        for t in &mut self.touches {
+            if let Target::Key(Key { action: KeyAction::Mod(_), .. }) = &t.target {
+                t.used = true;
+                t.long_at = None;
+            }
+        }
+        if changed {
+            self.rebuild();
+        }
+    }
+
+    /// What a press-fired key (backspace, arrows, Del) sends.
+    fn press_input(&self, k: &Key) -> Action {
+        let m = self.mods();
+        match k.action {
+            KeyAction::Press(c) => Action::Key(c),
+            KeyAction::Edit(e) if self.selecting && extends_selection(e) => {
+                Action::Key(KeyChord { shift: true, ..self.chord(KeyCode::Edit(e)) })
+            }
+            KeyAction::Edit(e) if m.chording() || m.on(Modifier::Shift) => Action::Key(self.chord(KeyCode::Edit(e))),
+            KeyAction::Edit(e) => Action::Edit(e),
+            _ if m.chording() => Action::Key(self.chord(KeyCode::Edit(EditKey::Backspace))),
+            _ => Action::Backspace,
+        }
+    }
+
+    /// A modifier key was released after a tap (not used for a chord).
+    fn mod_tapped(&mut self, m: Modifier, r: &mut Response) {
+        let i = m.index();
+        let others = Modifier::ALL.iter().any(|&o| o != m && self.latch[o.index()] != Latch::Off);
+        if m == Modifier::Win && self.latch[i] == Latch::Off && !others {
+            // A lone Win tap presses Win (Start menu); long-press latches it instead.
+            r.actions.push(UiAction::Input(Action::Key(KeyChord::win_alone())));
+            return;
+        }
+        let quick = self.last_mod_tap[i].is_some_and(|t| self.now.saturating_sub(t) <= DOUBLE_TAP_MS);
+        self.latch[i] = match self.latch[i] {
+            Latch::Off => Latch::Once,
+            Latch::Once if quick => Latch::Locked,
+            Latch::Once | Latch::Locked => Latch::Off,
+        };
+        self.last_mod_tap[i] = Some(self.now);
+    }
+
     // -----------------------------------------------------------------------------------------
     // Building
     // -----------------------------------------------------------------------------------------
 
     pub(crate) fn rebuild(&mut self) {
-        let ctx = BuildCtx { layout: self.layout(), chinese: self.chinese, composing: self.composing(), shift: self.shift };
+        let ctx = BuildCtx {
+            layout: self.layout(),
+            chinese: self.chinese,
+            composing: self.composing(),
+            mods: self.mods(),
+            edit_area: self.edit_area,
+            caps: self.pc_caps,
+        };
         let built = match self.panel {
+            Panel::Keys if self.pc => layout::build_pc_keyboard(&self.m, &ctx),
             Panel::Keys if ctx.layout == Layout::T9 => layout::build_t9(&self.m, &ctx),
             Panel::Keys => layout::build_letters(&self.m, &ctx),
             Panel::Numbers => layout::build_numbers(&self.m, &ctx),
             Panel::Symbols(tab) => layout::build_symbols(&self.m, tab),
             Panel::Candidates => layout::build_candidate_grid(&self.m),
             Panel::Menu => layout::build_menu(&self.m, ctx.layout, self.theme_kind == ThemeKind::Dark),
+            Panel::PcKeys => layout::build_pc_keys(&self.m, &ctx),
+            Panel::Clipboard => layout::build_clipboard_panel(&self.m),
         };
         self.keys = built.keys;
+        for k in &mut self.keys {
+            match k.action {
+                KeyAction::SelectMode if self.selecting => k.tone = Tone::Active,
+                // The paste key previews what it will paste.
+                KeyAction::Chord(c) if c == KeyChord::PASTE && !k.icon => k.sub = self.paste_preview.clone(),
+                _ => {}
+            }
+        }
         self.column = built.column;
         self.grid = built.grid;
         self.bar_keys = self.build_bar();
@@ -284,12 +531,16 @@ impl KeyboardView {
             let rows = layout::symbols(tab).len().div_ceil(cols) as f32;
             self.sym_scroll.set_max(rows * cell_h - grid.h);
         }
+        self.update_clip_scroll();
     }
 
     fn build_bar(&self) -> Vec<Key> {
         let m = &self.m;
         let cw = self.chevron_w();
         let right = Rect::new(m.w - cw - m.pad_x, 0.0, cw, m.bar_h);
+        if self.pc {
+            return self.build_pc_bar(right);
+        }
         if self.panel == Panel::Candidates {
             let mut k = Key::icon(KeyAction::CollapseCandidates, layout::icon::CHEVRON_UP, Tone::Flat);
             k.cell = right;
@@ -300,16 +551,68 @@ impl KeyboardView {
             k.cell = right;
             return vec![k];
         }
-        let w = m.bar_h * 1.25;
+        if self.selecting {
+            return self.build_select_bar();
+        }
+        if self.clip_bar_shown() {
+            return self.build_clip_bar(right);
+        }
+        self.build_toolbar(right)
+    }
+
+    /// The idle toolbar. Edit tools (undo … paste, ← →) on the left unless the wide edit area
+    /// already has them; voice, layout, 电脑键, emoji next; hide on the far right.
+    fn build_toolbar(&self, right: Rect) -> Vec<Key> {
+        let m = &self.m;
+        let wide26 = m.wide && self.layout() != Layout::T9;
+        let icon_w = m.bar_h * 1.2;
+        let tool_w = m.bar_h * 1.6;
+        let arrow_w = m.bar_h * 1.1;
+        let flat = |action: KeyAction, glyph: &str| Key::icon(action, glyph, Tone::Flat);
+        let mut apps = vec![flat(KeyAction::Voice, layout::icon::MIC), flat(KeyAction::LayoutMenu, layout::icon::KEYBOARD)];
+        if !wide26 {
+            apps.push(flat(KeyAction::PcKeys, layout::icon::KEYBOARD).with_sub("电脑键"));
+        }
+        apps.push(flat(KeyAction::ClipPanel, layout::icon::CLIPBOARD));
+        apps.push(flat(KeyAction::Tab(SymTab::Emoji), layout::icon::EMOJI));
+        let app_w = |k: &Key| if k.sub.is_some() { tool_w * 1.15 } else { icon_w };
+        let apps_w: f32 = apps.iter().map(app_w).sum();
+        let mut tools = Vec::new();
+        if !(wide26 && self.edit_area) {
+            let t = |c: KeyChord, glyph: &str, cap: &str| flat(KeyAction::Chord(c), glyph).with_sub(cap);
+            tools = vec![
+                (tool_w, t(KeyChord::UNDO, layout::icon::UNDO, "撤销")),
+                (tool_w, t(KeyChord::REDO, layout::icon::REDO, "重做")),
+                (tool_w, flat(KeyAction::SelectMode, layout::icon::SELECT).with_sub("选择")),
+                (tool_w, t(KeyChord::SELECT_ALL, layout::icon::SELECT_ALL, "全选")),
+                (tool_w, t(KeyChord::CUT, layout::icon::CUT, "剪切")),
+                (tool_w, t(KeyChord::COPY, layout::icon::COPY, "复制")),
+                (tool_w, t(KeyChord::PASTE, layout::icon::PASTE, "粘贴")),
+            ];
+            if !wide26 {
+                let arrow = |e: EditKey, glyph: &str, hold: EditKey| flat(KeyAction::Edit(e), glyph).with_hold(Action::Edit(hold), "");
+                tools.push((arrow_w, arrow(EditKey::Left, layout::icon::CHEVRON_LEFT, EditKey::Home)));
+                tools.push((arrow_w, arrow(EditKey::Right, layout::icon::CHEVRON_RIGHT, EditKey::End)));
+            }
+            // Drop what does not fit (narrow windows): arrows first, then the tools.
+            let room = right.x - m.pad_x - apps_w - 16.0 * m.s;
+            while !tools.is_empty() && tools.iter().map(|(w, _)| w).sum::<f32>() > room {
+                tools.pop();
+            }
+        }
         let mut keys = Vec::new();
-        let items = [
-            (KeyAction::Voice, layout::icon::MIC),
-            (KeyAction::LayoutMenu, layout::icon::KEYBOARD),
-            (KeyAction::Tab(SymTab::Emoji), layout::icon::EMOJI),
-        ];
-        for (i, (action, glyph)) in items.into_iter().enumerate() {
-            let mut k = Key::icon(action, glyph, Tone::Flat);
-            k.cell = Rect::new(m.pad_x + 6.0 * m.s + i as f32 * w, 0.0, w, m.bar_h);
+        let mut x = m.pad_x + 6.0 * m.s;
+        for (w, mut k) in tools.iter().cloned() {
+            k.cell = Rect::new(x, 0.0, w, m.bar_h);
+            x += w;
+            keys.push(k);
+        }
+        // Apps go right-aligned before the hide chevron when there are tools, else left.
+        let mut ax = if tools.is_empty() { m.pad_x + 6.0 * m.s } else { right.x - apps_w };
+        for mut k in apps {
+            let w = app_w(&k);
+            k.cell = Rect::new(ax, 0.0, w, m.bar_h);
+            ax += w;
             keys.push(k);
         }
         let mut hide = Key::icon(KeyAction::Hide, layout::icon::CHEVRON_DOWN, Tone::Flat);
@@ -332,16 +635,38 @@ impl KeyboardView {
         self.m.pad_x + 8.0 * self.m.s
     }
 
+    /// Font scale of the candidate bar: wide bars use fixed sizes (24-DIP candidates at the
+    /// 58-DIP bar of a 1440-wide screen), phone bars follow the key rows.
+    pub(crate) fn bar_s(&self) -> f32 {
+        if self.pc {
+            // The 电脑键盘's thin bar: text as big as on the keys.
+            self.m.s
+        } else if self.m.wide {
+            self.m.bar_h / 57.6
+        } else {
+            self.m.s
+        }
+    }
+
     pub(crate) fn cand_style(&self) -> TextStyle {
-        TextStyle { size: 21.0 * self.m.s, color: self.theme.text, align: crate::Align::Start, bold: false, font: crate::Font::Ui }
+        let size = if self.m.wide { 24.0 * self.bar_s() } else { 21.0 * self.m.s };
+        TextStyle { size, color: self.theme.text, align: crate::Align::Start, bold: false, font: crate::Font::Ui }
     }
 
     pub(crate) fn comment_style(&self) -> TextStyle {
-        TextStyle { size: 12.5 * self.m.s, color: self.theme.text_faint, ..self.cand_style() }
+        let size = if self.m.wide { 14.0 * self.bar_s() } else { 12.5 * self.m.s };
+        TextStyle { size, color: self.theme.text_faint, ..self.cand_style() }
     }
 
     pub(crate) fn grid_cell_h(&self) -> f32 {
-        self.m.row_h * 0.92
+        if self.m.wide { self.m.row_h } else { self.m.row_h * 0.92 }
+    }
+
+    /// Scroll distance of one candidate-grid page: the whole rows that fit.
+    fn grid_page(&self) -> f32 {
+        let h = self.grid.map_or(0.0, |g| g.h);
+        let cell = self.grid_cell_h();
+        ((h / cell).floor() * cell).max(cell)
     }
 
     pub(crate) fn column_item_h(&self) -> f32 {
@@ -375,11 +700,11 @@ impl KeyboardView {
         if (cur.0, cur.1, cur.2, cur.3) == (key.0, key.1, key.2, key.3) && (cur.4 || !measured) {
             return;
         }
-        let s = self.m.s;
+        let s = self.bar_s();
         let style = self.cand_style();
         let cstyle = self.comment_style();
-        let pad = 15.0 * s;
-        let min_w = 50.0 * s;
+        let pad = if self.m.wide { 17.0 * s } else { 15.0 * s };
+        let min_w = if self.m.wide { 58.0 * s } else { 50.0 * s };
         let mut strip = Vec::with_capacity(self.cands.len());
         let mut x = self.strip_lead();
         let mut widths = Vec::with_capacity(self.cands.len());
@@ -398,7 +723,7 @@ impl KeyboardView {
 
         let mut grid = Vec::with_capacity(self.cands.len());
         if let Some(area) = self.grid.filter(|_| self.panel == Panel::Candidates) {
-            let target = self.m.row_h * 1.7;
+            let target = self.m.row_h * if self.m.wide { 2.0 } else { 1.7 };
             let cols = ((area.w / target).floor() as usize).max(3);
             let unit = area.w / cols as f32;
             let cell_h = self.grid_cell_h();
@@ -456,15 +781,30 @@ impl KeyboardView {
     // -----------------------------------------------------------------------------------------
 
     pub(crate) fn hit(&mut self, x: f32, y: f32) -> Target {
+        if self.trackpad_active() {
+            return Target::PadAux;
+        }
         if y < self.m.bar_h {
             if let Some(k) = self.bar_keys.iter().find(|k| k.cell.contains(x, y)) {
                 return Target::Bar(k.clone());
+            }
+            if self.pc {
+                return Target::None;
             }
             if self.composing() && self.panel != Panel::Candidates {
                 self.ensure_cand_layout_estimated();
                 return Target::Strip(self.strip_item_at(x));
             }
+            if self.clip_bar_shown() && self.clip_bar_rect().contains(x, y) {
+                return Target::ClipCard(self.clip_card_at(x));
+            }
             return Target::None;
+        }
+        if self.panel == Panel::Clipboard {
+            if let Some(k) = self.keys.iter().find(|k| k.cell.contains(x, y)) {
+                return Target::Key(k.clone());
+            }
+            return self.clip_grid_hit(x, y);
         }
         if self.panel == Panel::Menu {
             return match self.keys.iter().find(|k| k.cell.contains(x, y)) {
@@ -509,9 +849,15 @@ impl KeyboardView {
     // -----------------------------------------------------------------------------------------
 
     fn on_down(&mut self, e: PointerEvent, r: &mut Response) {
-        self.touches.retain(|t| t.id != e.id);
+        if self.touches.iter().any(|t| t.id == e.id) {
+            // A stale contact with the same id (lost up): drop it cleanly.
+            self.cancel_touch(e.id, r);
+        }
         let target = self.hit(e.x, e.y);
         r.repaint = true;
+        if self.clip_menu.is_some() && !matches!(target, Target::ClipBtn { .. } | Target::ClipGrid(_)) {
+            self.clip_menu = None;
+        }
 
         // Rollover: a new character press commits the characters other fingers still hold.
         if matches!(&target, Target::Key(k) if k.bubble) {
@@ -544,19 +890,48 @@ impl KeyboardView {
             repeats: 0,
             vel: VelocityTracker::default(),
             stopped_fling: false,
+            used: false,
+            repeat_action: None,
+            engaged: false,
         };
-        match &t.target {
-            Target::Key(k) => match k.action {
-                KeyAction::Backspace => {
-                    r.actions.push(UiAction::Input(Action::Backspace));
-                    t.repeat_at = Some(e.time_ms + REPEAT_DELAY_MS);
+        let mut is_mod = false;
+        match t.target.clone() {
+            Target::Key(Key { action: KeyAction::Raw(code), .. }) => {
+                self.touches.push(t);
+                self.pc_key_down(e.id, code, e.time_ms, r);
+                return;
+            }
+            Target::Key(k) | Target::Bar(k) if k.fires_on_press() => {
+                if k.action == KeyAction::Backspace {
+                    self.typed();
                 }
-                KeyAction::Space => t.long_at = Some(e.time_ms + VOICE_PRESS_MS),
+                let a = self.press_input(&k);
+                r.actions.push(UiAction::Input(a.clone()));
+                t.repeat_action = Some(a);
+                t.repeat_at = Some(e.time_ms + REPEAT_DELAY_MS);
+                self.after_key();
+            }
+            Target::Key(k) => match k.action {
+                KeyAction::Space => t.long_at = Some(e.time_ms + TRACKPAD_PRESS_MS),
+                KeyAction::Mod(m) => {
+                    is_mod = true;
+                    // Win: long-press latches. 电脑键盘: a long-pressed Shift / Ctrl / Alt is
+                    // really held down.
+                    if m == Modifier::Win || self.pc && m != Modifier::Fn {
+                        t.long_at = Some(e.time_ms + LONG_PRESS_MS);
+                    }
+                }
                 _ if k.has_long_press() => t.long_at = Some(e.time_ms + LONG_PRESS_MS),
                 _ => {}
             },
-            Target::Strip(_) | Target::Column(_) | Target::Grid(_) | Target::SymGrid(_) => {
-                let horizontal = matches!(t.target, Target::Strip(_));
+            Target::Bar(k) if k.hold.is_some() => t.long_at = Some(e.time_ms + LONG_PRESS_MS),
+            Target::ClipGrid(Some(_)) => {
+                t.long_at = Some(e.time_ms + LONG_PRESS_MS);
+                t.stopped_fling = self.clip_scroll.stop();
+                t.vel.push(e.y, e.time_ms);
+            }
+            Target::Strip(_) | Target::Column(_) | Target::Grid(_) | Target::SymGrid(_) | Target::ClipCard(_) | Target::ClipGrid(_) => {
+                let horizontal = horizontal(&t.target);
                 if let Some(s) = self.scroller_mut(&t.target) {
                     t.stopped_fling = s.stop();
                 }
@@ -565,6 +940,10 @@ impl KeyboardView {
             _ => {}
         }
         self.touches.push(t);
+        if is_mod {
+            // Held modifiers change labels (uppercase, F keys, Ctrl hints).
+            self.rebuild();
+        }
     }
 
     fn on_move(&mut self, e: PointerEvent, r: &mut Response) {
@@ -579,7 +958,7 @@ impl KeyboardView {
         let row_h = self.m.row_h;
         match (&t.mode, &t.target) {
             (Mode::Press, Target::Key(k)) => match k.action {
-                KeyAction::Backspace => {
+                KeyAction::Backspace if t.repeat_action == Some(Action::Backspace) => {
                     if dx < -self.clear_threshold(k) {
                         t.mode = Mode::ClearArmed;
                         t.repeat_at = None;
@@ -623,13 +1002,7 @@ impl KeyboardView {
                     r.repaint = true;
                 }
             }
-            (Mode::Voice, _) => {
-                if dx.abs() > SPACE_SLOP {
-                    t.mode = Mode::Cursor { steps: 0 };
-                    r.repaint = true;
-                    self.cursor_steps(&mut t, r);
-                }
-            }
+            (Mode::Trackpad { .. }, _) => self.trackpad_move(&mut t, e, r),
             (Mode::Cursor { .. }, _) => self.cursor_steps(&mut t, r),
             (Mode::Long { alts, sel, first, anchor_x, popup, cell_w }, _) => {
                 let n = alts.len() as i32;
@@ -641,13 +1014,17 @@ impl KeyboardView {
                     r.repaint = true;
                 }
             }
-            (Mode::Press, Target::Strip(_) | Target::Column(_) | Target::Grid(_) | Target::SymGrid(_)) => {
-                let horizontal = matches!(t.target, Target::Strip(_));
+            (
+                Mode::Press,
+                Target::Strip(_) | Target::Column(_) | Target::Grid(_) | Target::SymGrid(_) | Target::ClipCard(_) | Target::ClipGrid(_),
+            ) => {
+                let horizontal = horizontal(&t.target);
                 t.vel.push(if horizontal { e.x } else { e.y }, e.time_ms);
                 let d = if horizontal { dx } else { dy };
                 if d.abs() > SLOP {
                     // Start the drag from the slop boundary so the content does not jump.
                     t.mode = Mode::Scroll;
+                    t.long_at = None;
                     let origin = d.signum() * SLOP;
                     if let Some(s) = self.scroller_mut(&t.target) {
                         s.begin_drag();
@@ -663,7 +1040,7 @@ impl KeyboardView {
                 }
             }
             (Mode::Scroll, _) => {
-                let horizontal = matches!(t.target, Target::Strip(_));
+                let horizontal = horizontal(&t.target);
                 t.vel.push(if horizontal { e.x } else { e.y }, e.time_ms);
                 let d = if horizontal { dx } else { dy };
                 if let Some(s) = self.scroller_mut(&t.target) {
@@ -682,26 +1059,51 @@ impl KeyboardView {
         let Some(i) = self.touches.iter().position(|t| t.id == e.id) else { return };
         let t = self.touches.remove(i);
         r.repaint = true;
+        if let Target::Key(Key { action: KeyAction::Raw(code), .. }) = &t.target {
+            self.pc_key_up(*code, r);
+            return;
+        }
+        if let Target::Key(Key { action: KeyAction::Mod(m), .. }) = &t.target {
+            if !t.consumed && !t.used {
+                self.mod_tapped(*m, r);
+            }
+            if self.pc {
+                self.pc_sync(r);
+            }
+            self.rebuild();
+            return;
+        }
+        if let Mode::Trackpad { .. } = t.mode {
+            self.trackpad_end(r);
+            return;
+        }
         if t.consumed {
             return;
         }
         match (t.mode, t.target) {
             (Mode::Press, Target::Key(k)) => {
-                if k.action != KeyAction::Backspace {
+                if !k.fires_on_press() {
                     self.tap_key(&k, r);
                 }
             }
             (Mode::SwipeUp, Target::Key(k)) => {
                 if let Some(s) = k.secondary {
                     r.actions.push(UiAction::Input(Action::Text(s)));
+                    self.after_key();
+                    self.typed();
                 }
             }
             (Mode::Long { alts, sel, .. }, _) => {
                 r.actions.push(UiAction::Input(Action::Text(alts[sel].clone())));
+                self.after_key();
+                self.typed();
             }
             (Mode::ClearArmed, _) => r.actions.push(UiAction::Input(Action::ClearComposition)),
-            (Mode::Voice, _) => r.actions.push(UiAction::Voice),
-            (Mode::Press, Target::Bar(k)) => self.tap_key(&k, r),
+            (Mode::Press, Target::Bar(k)) => {
+                if !k.fires_on_press() {
+                    self.tap_key(&k, r);
+                }
+            }
             (Mode::Press, Target::Strip(Some(idx))) if !t.stopped_fling => {
                 r.actions.push(UiAction::Input(Action::Select(idx)));
             }
@@ -723,16 +1125,59 @@ impl KeyboardView {
                     }
                 }
             }
+            (Mode::Press, Target::ClipCard(Some(idx))) if !t.stopped_fling => {
+                if let Some(c) = self.clips.get(idx) {
+                    r.actions.push(UiAction::Paste(c.text.clone()));
+                }
+            }
+            (Mode::Press, Target::ClipGrid(Some(pos))) if !t.stopped_fling => {
+                if self.clip_menu.take().is_none() {
+                    if let Some(c) = self.clip_panel_order().get(pos).and_then(|&i| self.clips.get(i)) {
+                        r.actions.push(UiAction::Paste(c.text.clone()));
+                        self.set_panel(Panel::Keys);
+                    }
+                }
+            }
+            (Mode::Press, Target::ClipGrid(None)) => self.clip_menu = None,
+            (Mode::Press, Target::ClipBtn { id, delete }) => {
+                self.clip_menu = None;
+                if delete {
+                    r.actions.push(UiAction::DeleteClip(id));
+                } else if let Some(c) = self.clips.iter().find(|c| c.id == id) {
+                    r.actions.push(UiAction::PinClip { id, pinned: !c.pinned });
+                }
+            }
+            (Mode::Press, Target::PadAux) => self.trackpad_aux_tap(r),
             (Mode::Press, Target::CloseMenu) => self.set_panel(Panel::Keys),
             (Mode::Scroll, target) => {
-                let horizontal = matches!(target, Target::Strip(_));
                 let v = t.vel.velocity(e.time_ms);
-                let _ = horizontal;
                 if let Some(s) = self.scroller_mut(&target) {
                     s.fling(v, e.time_ms);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Drops a touch without acting on it (system cancel, stale id). Pass-through keys and
+    /// modifiers that were sent down are released.
+    fn cancel_touch(&mut self, id: u32, r: &mut Response) {
+        let Some(i) = self.touches.iter().position(|t| t.id == id) else { return };
+        let t = self.touches.remove(i);
+        r.repaint = true;
+        match &t.target {
+            Target::Key(Key { action: KeyAction::Raw(code), .. }) => self.pc_key_up(*code, r),
+            Target::Key(Key { action: KeyAction::Mod(_), .. }) => {
+                if self.pc {
+                    self.pc_sync(r);
+                }
+                self.rebuild();
+            }
+            _ => {
+                if let Mode::Trackpad { .. } = t.mode {
+                    self.trackpad_end(r);
+                }
+            }
         }
     }
 
@@ -760,6 +1205,8 @@ impl KeyboardView {
             Target::Column(_) => Some(&mut self.column_scroll),
             Target::Grid(_) => Some(&mut self.grid_scroll),
             Target::SymGrid(_) => Some(&mut self.sym_scroll),
+            Target::ClipCard(_) => Some(&mut self.clip_strip),
+            Target::ClipGrid(_) => Some(&mut self.clip_scroll),
             _ => None,
         }
     }
@@ -781,30 +1228,93 @@ impl KeyboardView {
     /// Fires a key's tap action.
     fn tap_key(&mut self, k: &Key, r: &mut Response) {
         let input = |r: &mut Response, a: Action| r.actions.push(UiAction::Input(a));
+        let mods = self.mods();
+        let chording = mods.chording();
         match &k.action {
             KeyAction::Letter(c) => {
-                let c = if self.shift != Shift::Off { c.to_ascii_uppercase() } else { *c };
-                input(r, Action::Char(c));
-                if self.shift == Shift::Once {
-                    self.shift = Shift::Off;
-                    self.rebuild();
-                }
-            }
-            KeyAction::Char(c) => input(r, Action::Char(*c)),
-            KeyAction::Text(s) => input(r, Action::Text(s.clone())),
-            KeyAction::Backspace => input(r, Action::Backspace),
-            KeyAction::Shift => {
-                let quick = self.last_shift_tap.is_some_and(|t| self.now.saturating_sub(t) <= DOUBLE_TAP_MS);
-                self.shift = match self.shift {
-                    Shift::Off => Shift::Once,
-                    Shift::Once if quick => Shift::Locked,
-                    Shift::Once | Shift::Locked => Shift::Off,
+                let a = if chording {
+                    Action::Key(self.chord(KeyCode::Char(*c)))
+                } else {
+                    self.typed();
+                    Action::Char(if mods.on(Modifier::Shift) { c.to_ascii_uppercase() } else { *c })
                 };
-                self.last_shift_tap = Some(self.now);
+                input(r, a);
+                self.after_key();
+            }
+            KeyAction::Char(c) => {
+                self.typed();
+                input(r, Action::Char(*c));
+            }
+            KeyAction::Text(s) => {
+                let a = match k.code {
+                    Some(code) if chording => Action::Key(self.chord(KeyCode::Char(code))),
+                    _ => {
+                        self.typed();
+                        Action::Text(s.clone())
+                    }
+                };
+                input(r, a);
+                self.after_key();
+            }
+            KeyAction::Backspace => input(r, Action::Backspace),
+            KeyAction::Edit(_) => {
+                let a = self.press_input(k);
+                input(r, a);
+                self.after_key();
+            }
+            KeyAction::Chord(c) => {
+                let m = self.chord(c.key.unwrap_or(KeyCode::Char(' ')));
+                let merged = KeyChord {
+                    ctrl: c.ctrl || m.ctrl,
+                    shift: c.shift || m.shift,
+                    alt: c.alt || m.alt,
+                    win: c.win || m.win,
+                    key: c.key,
+                };
+                input(r, Action::Key(merged));
+                if *c == KeyChord::COPY {
+                    // Nothing selected? The host checks the clipboard and opens selection mode.
+                    r.actions.push(UiAction::CheckCopied);
+                }
+                self.after_key();
+            }
+            KeyAction::ClearAll => {
+                input(r, Action::Key(KeyChord::SELECT_ALL));
+                input(r, Action::Key(KeyChord::key(KeyCode::Edit(EditKey::Delete))));
+                self.after_key();
+            }
+            KeyAction::Mod(_) => {}
+            KeyAction::CapsLock => {
+                let i = Modifier::Shift.index();
+                self.latch[i] = if self.latch[i] == Latch::Locked { Latch::Off } else { Latch::Locked };
                 self.rebuild();
             }
-            KeyAction::Space => input(r, Action::Space),
-            KeyAction::Enter => input(r, Action::Enter),
+            KeyAction::PcKeys => self.set_panel(if self.panel == Panel::PcKeys { Panel::Keys } else { Panel::PcKeys }),
+            KeyAction::PageUp | KeyAction::PageDown => {
+                let step = if k.action == KeyAction::PageUp { -self.grid_page() } else { self.grid_page() };
+                let g = &mut self.grid_scroll;
+                g.stop();
+                g.offset = (g.offset + step).clamp(0.0, g.max);
+                self.maybe_request_more(r);
+            }
+            KeyAction::Space if chording => {
+                input(r, Action::Key(self.chord(KeyCode::Char(' '))));
+                self.after_key();
+            }
+            KeyAction::Enter if chording || mods.on(Modifier::Shift) => {
+                input(r, Action::Key(self.chord(KeyCode::Edit(EditKey::Enter))));
+                self.after_key();
+            }
+            KeyAction::Space => {
+                self.typed();
+                input(r, Action::Space);
+                self.after_key();
+            }
+            KeyAction::Enter => {
+                self.typed();
+                input(r, Action::Enter);
+                self.after_key();
+            }
             KeyAction::ToggleChinese => input(r, Action::ToggleChinese),
             KeyAction::LayoutMenu => {
                 self.set_panel(if self.panel == Panel::Menu { Panel::Keys } else { Panel::Menu });
@@ -822,12 +1332,24 @@ impl KeyboardView {
                 self.set_panel(Panel::Candidates);
                 self.request_more(r);
             }
+            KeyAction::SetLayout(Layout::Pc) => {
+                if self.composing() {
+                    // Like any other key that leaves the composition: commit the first candidate.
+                    input(r, Action::Space);
+                }
+                if self.set_pc(true, r) {
+                    r.actions.push(UiAction::PcKeyboard(true));
+                }
+            }
             KeyAction::SetLayout(l) => {
+                if self.set_pc(false, r) {
+                    r.actions.push(UiAction::PcKeyboard(false));
+                }
                 let schema = match l {
                     Layout::Pinyin => Some(Schema::Pinyin),
                     Layout::Shuangpin => Some(Schema::Shuangpin),
                     Layout::T9 => Some(Schema::T9),
-                    Layout::English => None,
+                    Layout::English | Layout::Pc => None,
                 };
                 match schema {
                     Some(s) => {
@@ -848,7 +1370,45 @@ impl KeyboardView {
                 self.set_theme(next);
                 r.actions.push(UiAction::ThemeChanged(next));
             }
-            KeyAction::T9One => input(r, Action::Char(if self.composing() { '\'' } else { '1' })),
+            KeyAction::T9One => {
+                self.typed();
+                input(r, Action::Char(if self.composing() { '\'' } else { '1' }));
+            }
+            // Fired on press (`fires_on_press`).
+            KeyAction::Raw(_) | KeyAction::Press(_) => {}
+            KeyAction::PcBack => {
+                if self.set_pc(false, r) {
+                    r.actions.push(UiAction::PcKeyboard(false));
+                }
+            }
+            KeyAction::SelectMode => {
+                let on = !self.selecting;
+                self.set_selecting(on);
+            }
+            KeyAction::Sel(act) => {
+                match act {
+                    SelAct::Copy => {
+                        input(r, Action::Key(KeyChord::COPY));
+                    }
+                    SelAct::Cut => input(r, Action::Key(KeyChord::CUT)),
+                    SelAct::Paste => input(r, Action::Key(KeyChord::PASTE)),
+                    SelAct::Delete => input(r, Action::Edit(EditKey::Delete)),
+                    SelAct::Done => {}
+                }
+                self.set_selecting(false);
+            }
+            KeyAction::ClipPanel => {
+                self.clip_menu = None;
+                self.set_panel(if self.panel == Panel::Clipboard { Panel::Keys } else { Panel::Clipboard });
+            }
+            KeyAction::CloseClipBar => {
+                self.clip_bar = false;
+                self.rebuild();
+            }
+            KeyAction::ClearClips => {
+                self.clip_menu = None;
+                r.actions.push(UiAction::ClearClips);
+            }
         }
     }
 
@@ -861,6 +1421,7 @@ impl KeyboardView {
             }
             self.grid_scroll.reset();
             self.column_scroll.reset();
+            self.clip_scroll.reset();
             self.rebuild();
         }
     }
@@ -885,14 +1446,17 @@ impl KeyboardView {
     }
 
     /// Sets `timer_ms` to the earliest pending deadline.
-    fn finish(&self, mut r: Response) -> Response {
+    pub(crate) fn finish(&self, mut r: Response) -> Response {
         let mut next: Option<u64> = None;
         let mut consider = |d: u64| next = Some(next.map_or(d, |n: u64| n.min(d)));
         for t in &self.touches {
             t.long_at.into_iter().chain(t.repeat_at).for_each(&mut consider);
         }
-        if [&self.strip, &self.grid_scroll, &self.column_scroll, &self.sym_scroll].iter().any(|s| s.animating()) {
+        if self.scrollers().iter().any(|s| s.animating()) {
             consider(self.now + FRAME_MS);
+        }
+        if let Some((_, until)) = &self.toast {
+            consider(*until);
         }
         r.timer_ms = next.map(|d| d.saturating_sub(self.now).max(1));
         r
@@ -918,7 +1482,7 @@ pub(crate) fn repeat_interval(repeats: u32) -> u64 {
 
 impl View for KeyboardView {
     fn resize(&mut self, width: f32, height: f32) {
-        let m = Metrics::new(width, height);
+        let m = if self.pc { Metrics::pc(width, height) } else { Metrics::new(width, height) };
         if m != self.m {
             self.m = m;
             self.rebuild();
@@ -926,7 +1490,11 @@ impl View for KeyboardView {
     }
 
     fn preferred_height(&self, width: f32) -> f32 {
-        layout::preferred_height(width) * self.height_scale
+        if layout::is_wide(width) {
+            layout::preferred_height_wide(width, self.height_scale)
+        } else {
+            layout::preferred_height(width) * self.height_scale
+        }
     }
 
     fn paint(&mut self, canvas: &mut dyn Canvas) {
@@ -941,11 +1509,7 @@ impl View for KeyboardView {
             PointerPhase::Down => self.on_down(e, &mut r),
             PointerPhase::Move => self.on_move(e, &mut r),
             PointerPhase::Up => self.on_up(e, &mut r),
-            PointerPhase::Cancel => {
-                let before = self.touches.len();
-                self.touches.retain(|t| t.id != e.id);
-                r.repaint = before != self.touches.len();
-            }
+            PointerPhase::Cancel => self.cancel_touch(e.id, &mut r),
         }
         self.finish(r)
     }
@@ -956,12 +1520,41 @@ impl View for KeyboardView {
         let mut r = Response::none();
         for i in 0..self.touches.len() {
             let mut t = self.touches[i].clone();
+            // Some(true): a hold action was sent; Some(false): Win latched.
+            let mut fired: Option<bool> = None;
             if t.long_at.is_some_and(|d| d <= now) {
                 t.long_at = None;
-                if let (Mode::Press, Target::Key(k)) = (&t.mode, &t.target) {
+                if let (Mode::Press, Target::ClipGrid(Some(pos))) = (&t.mode, &t.target) {
+                    // Long-press a clipboard card: show its 固定 / 删除 buttons.
+                    self.clip_menu = self.clip_panel_order().get(*pos).and_then(|&i| self.clips.get(i)).map(|c| c.id);
+                    t.consumed = true;
+                    r.repaint = true;
+                } else if let (Mode::Press, Target::Key(k) | Target::Bar(k)) = (&t.mode, &t.target) {
                     if k.action == KeyAction::Space {
-                        t.mode = Mode::Voice;
+                        t.mode = Mode::Trackpad { acc_x: 0.0, acc_y: 0.0, lx: t.x, ly: t.y, lt: now };
+                        self.pad_select = false;
+                        self.pad_selected = false;
+                        self.selecting = false;
                         r.repaint = true;
+                    } else if self.pc && matches!(k.action, KeyAction::Mod(Modifier::Shift | Modifier::Ctrl | Modifier::Alt)) {
+                        // 电脑键盘: a long-pressed modifier is really held down until released.
+                        t.engaged = true;
+                        t.used = true;
+                        self.touches[i] = t.clone();
+                        self.pc_sync(&mut r);
+                        r.repaint = true;
+                    } else if k.action == KeyAction::Mod(Modifier::Win) {
+                        // Long-press latches Win instead of pressing it.
+                        let i = Modifier::Win.index();
+                        self.latch[i] = if self.latch[i] == Latch::Off { Latch::Once } else { Latch::Locked };
+                        t.used = true;
+                        r.repaint = true;
+                        fired = Some(false);
+                    } else if let Some(hold) = &k.hold {
+                        r.actions.push(UiAction::Input(hold.clone()));
+                        t.consumed = true;
+                        r.repaint = true;
+                        fired = Some(true);
                     } else if k.has_long_press() {
                         let (alts, sel) = k.popup();
                         let (popup, cell_w) = self.popup_geometry(k, alts.len(), sel);
@@ -970,11 +1563,21 @@ impl View for KeyboardView {
                     }
                 }
             }
+            if let Some(sent) = fired {
+                self.touches[i] = t;
+                if sent {
+                    self.after_key();
+                } else {
+                    self.rebuild();
+                }
+                continue;
+            }
             if t.repeat_at.is_some_and(|d| d <= now) {
-                if t.mode == Mode::Press {
-                    r.actions.push(UiAction::Input(Action::Backspace));
+                if let (Mode::Press, Some(a)) = (&t.mode, &t.repeat_action) {
+                    r.actions.push(UiAction::Input(a.clone()));
                     t.repeats += 1;
-                    t.repeat_at = Some(now + repeat_interval(t.repeats));
+                    let interval = if matches!(a, Action::KeyDown(_)) { PC_REPEAT_MS } else { repeat_interval(t.repeats) };
+                    t.repeat_at = Some(now + interval);
                 } else {
                     t.repeat_at = None;
                 }
@@ -982,8 +1585,19 @@ impl View for KeyboardView {
             self.touches[i] = t;
         }
         let mut scrolled = false;
-        for s in [&mut self.strip, &mut self.grid_scroll, &mut self.column_scroll, &mut self.sym_scroll] {
+        for s in [
+            &mut self.strip,
+            &mut self.grid_scroll,
+            &mut self.column_scroll,
+            &mut self.sym_scroll,
+            &mut self.clip_strip,
+            &mut self.clip_scroll,
+        ] {
             scrolled |= s.step(now);
+        }
+        if self.toast.as_ref().is_some_and(|(_, until)| *until <= now) {
+            self.toast = None;
+            r.repaint = true;
         }
         if scrolled {
             r.repaint = true;
@@ -1004,7 +1618,7 @@ impl View for KeyboardView {
         self.schema = state.schema;
         self.snapshot = Snapshot { commit: None, ..state.snapshot };
         if layout_changed {
-            self.shift = Shift::Off;
+            self.latch[Modifier::Shift.index()] = Latch::Off;
             if self.panel == Panel::Menu {
                 self.panel = Panel::Keys;
             }

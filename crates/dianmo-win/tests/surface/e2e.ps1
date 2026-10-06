@@ -16,7 +16,7 @@ $env:DIANMO_DEMO_LOG = $log
 $t0 = Get-Date
 $demo = Start-Process $exe -PassThru
 $deadline = (Get-Date).AddSeconds(8); $kh = [IntPtr]::Zero
-while ($kh -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 20; $kh = [T]::FindWindow('DianmoKeyboard', [NullString]::Value) }
+while ($kh -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 20; $kh = [T]::FindOf('DianmoKeyboard', $demo.Id) }
 while (-not [T]::IsWindowVisible($kh) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 20 }
 "keyboard window visible after $([int]((Get-Date) - $t0).TotalMilliseconds)ms (incl. process start)"
 Start-Sleep -Milliseconds 1000
@@ -40,7 +40,7 @@ try {
   [T]::Click($dou[0], $dou[1]); Start-Sleep -Milliseconds 250
   "mouse click ， fg=$([T]::GetForegroundWindow() -eq $nh) text=[$(Txt)]"
   # tray icon: tap toggles
-  $th = [T]::FindWindow('DianmoTray', [NullString]::Value); $tr = [T]::TrayRect($th); "tray icon rect: $(Fmt $tr)"
+  $th = [T]::FindOf('DianmoTray', $demo.Id); $tr = [T]::TrayRect($th); "tray icon rect: $(Fmt $tr)"
   if ($tr.right -gt 0) {
     [T]::Tap([int](($tr.left + $tr.right) / 2), [int](($tr.top + $tr.bottom) / 2)) | Out-Null; Start-Sleep -Milliseconds 600
     "after tray tap: keyboard visible=$([T]::IsWindowVisible($kh)) work=$(Fmt ([T]::Work()))"

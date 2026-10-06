@@ -23,7 +23,8 @@ pub mod tabtip;
 mod tray;
 
 pub use clock::now_ms;
+pub use handle::{BallEdge, BallEvent, BallPos, BallState};
 pub use focus::{FieldKind, FocusEvent, FocusWatcher, start_focus_watcher};
 pub use host::{App, HostControl, HostOptions, HostProxy, enable_per_monitor_dpi, run, run_with};
 pub use tray::TrayItem;
-pub use sink::{SendInputSink, send_edit_key, send_text, start_voice_typing};
+pub use sink::{SendInputSink, send_chord, send_edit_key, send_key_event, send_text, start_voice_typing};

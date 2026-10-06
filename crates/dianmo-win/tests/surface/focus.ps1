@@ -71,7 +71,7 @@ try {
   $env:DIANMO_DEMO_LOG = $log; $env:DIANMO_FOCUS_LOG = $flog
   $demo = Start-Process $exe -ArgumentList '--auto', '--hidden', '--tray-menu' -PassThru
   $deadline = (Get-Date).AddSeconds(8)
-  while ($kh -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50; $kh = [F]::FindWindow('DianmoKeyboard', [NullString]::Value) }
+  while ($kh -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50; $kh = [T]::FindOf('DianmoKeyboard', $demo.Id) }
   Start-Sleep -Milliseconds 1500
   "demo started, keyboard visible=$(Vis)"
   Cost 'idle, watcher running' 8
@@ -186,7 +186,7 @@ try {
 
   # --- Full-screen app (Edge --start-fullscreen, own profile) -----------------------------------
   if (On 'fullscreen') {
-    $hh = [F]::FindWindow('DianmoHandle', [NullString]::Value)
+    $hh = [T]::FindOf('DianmoBall', $demo.Id)
     [T]::PostMessage($kh, 0x8001, [IntPtr]1, [IntPtr]::Zero) | Out-Null; Start-Sleep -Milliseconds 500   # CMD_SHOW
     "before full-screen: visible=$(Vis) topmost=$([F]::Topmost($kh))"
     Mark 'fullscreen edge'
@@ -211,7 +211,7 @@ try {
   if (On 'tray') {
     # The icon may sit in the overflow area (no rect), so open the menu the way the shell does:
     # the icon's callback message (WM_APP+4) with WM_CONTEXTMENU, menu at the cursor.
-    $th = [T]::FindWindow('DianmoTray', [NullString]::Value)
+    $th = [T]::FindOf('DianmoTray', $demo.Id)
     [F]::SetCursorPos(2000, 1500) | Out-Null
     function Menus { $AEl::RootElement.FindAll($TS::Children, (Cond $AEl::ClassNameProperty '#32768')) | Where-Object { $_.Current.BoundingRectangle.Width -gt 0 } }
     function OpenMenu { [F]::SetCursorPos(2000, 1500) | Out-Null; [T]::PostMessage($th, 0x8004, [IntPtr]::Zero, [IntPtr]0x7B) | Out-Null; Start-Sleep -Milliseconds 700

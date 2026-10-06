@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont as _};
 use dianmo_core::{Action, Candidate, Schema, Snapshot};
 use dianmo_ui::{
-    Align, Canvas, Color, Font, InputState, KeyboardConfig, KeyboardView, PointerEvent, PointerPhase, Rect, TextStyle,
-    ThemeKind, UiAction, View,
+    Align, Canvas, ClipItem, Color, Font, InputState, KeyboardConfig, KeyboardView, PointerEvent, PointerPhase, Rect,
+    TextStyle, ThemeKind, UiAction, View,
 };
 use tiny_skia::{FillRule, LineCap, LineJoin, Mask, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
@@ -205,7 +205,71 @@ impl<'a> SkiaCanvas<'a> {
                 line(&mut pb, &[(-0.1, -0.3), (-0.4, 0.0), (-0.1, 0.3)]);
             }
             "\u{E70D}" => line(&mut pb, &[(-0.35, -0.15), (0.0, 0.2), (0.35, -0.15)]),
+            "\u{E76B}" => line(&mut pb, &[(0.15, -0.35), (-0.2, 0.0), (0.15, 0.35)]),
+            "\u{E76C}" => line(&mut pb, &[(-0.15, -0.35), (0.2, 0.0), (-0.15, 0.35)]),
+            "\u{E7A7}" | "\u{E7A6}" => {
+                // Undo / redo: a hooked arrow.
+                let m = if glyph == "\u{E7A7}" { 1.0 } else { -1.0 };
+                let (x0, y0) = p(-0.3 * m, -0.1);
+                pb.move_to(x0, y0);
+                let (c1, c2) = p(0.45 * m, -0.25);
+                let (x1, y1) = p(0.25 * m, 0.35);
+                pb.quad_to(c1, c2, x1, y1);
+                line(&mut pb, &[(-0.1 * m, -0.32), (-0.3 * m, -0.1), (-0.08 * m, 0.08)]);
+            }
+            "\u{E8B3}" => {
+                for (a, b) in [((-0.4, -0.35), (0.4, -0.35)), ((0.4, -0.35), (0.4, 0.35)), ((0.4, 0.35), (-0.4, 0.35)), ((-0.4, 0.35), (-0.4, -0.35))] {
+                    for i in 0..4 {
+                        let t0 = i as f32 / 4.0;
+                        let t1 = t0 + 0.14;
+                        line(&mut pb, &[(a.0 + (b.0 - a.0) * t0, a.1 + (b.1 - a.1) * t0), (a.0 + (b.0 - a.0) * t1, a.1 + (b.1 - a.1) * t1)]);
+                    }
+                }
+            }
+            "\u{E8C6}" => {
+                for cx0 in [-0.2, 0.2] {
+                    let (x, y) = p(cx0, 0.25);
+                    pb.push_circle(x, y, 0.13 * s * SCALE);
+                }
+                line(&mut pb, &[(-0.1, 0.15), (0.2, -0.45)]);
+                line(&mut pb, &[(0.1, 0.15), (-0.2, -0.45)]);
+            }
+            "\u{E8C8}" => {
+                line(&mut pb, &[(-0.35, 0.25), (-0.35, -0.4), (0.2, -0.4)]);
+                if let Some(path) = rounded(Rect::new(cx - 0.18 * s, cy - 0.25 * s, 0.52 * s, 0.65 * s), 0.05 * s) {
+                    self.stroke_path(&path, lw, style.color);
+                }
+            }
+            "\u{E77F}" => {
+                if let Some(path) = rounded(Rect::new(cx - 0.35 * s, cy - 0.32 * s, 0.7 * s, 0.75 * s), 0.06 * s) {
+                    self.stroke_path(&path, lw, style.color);
+                }
+                line(&mut pb, &[(-0.15, -0.42), (0.15, -0.42), (0.15, -0.28), (-0.15, -0.28), (-0.15, -0.42)]);
+            }
             "\u{E70E}" => line(&mut pb, &[(-0.35, 0.15), (0.0, -0.2), (0.35, 0.15)]),
+            "\u{E711}" => {
+                line(&mut pb, &[(-0.3, -0.3), (0.3, 0.3)]);
+                line(&mut pb, &[(0.3, -0.3), (-0.3, 0.3)]);
+            }
+            "\u{E762}" => {
+                // Multi-select: ticked boxes.
+                for y in [-0.25, 0.2] {
+                    if let Some(path) = rounded(Rect::new(cx - 0.4 * s, cy + (y - 0.12) * s, 0.24 * s, 0.24 * s), 0.03 * s) {
+                        self.stroke_path(&path, lw, style.color);
+                    }
+                    line(&mut pb, &[(-0.02, y), (0.42, y)]);
+                }
+            }
+            "\u{E81C}" => {
+                // History: a clock.
+                let (x, y) = p(0.0, 0.0);
+                pb.push_circle(x, y, 0.4 * s * SCALE);
+                line(&mut pb, &[(0.0, -0.22), (0.0, 0.0), (0.16, 0.12)]);
+            }
+            "\u{E718}" => {
+                line(&mut pb, &[(-0.2, -0.4), (0.2, -0.4), (0.12, -0.05), (0.3, 0.1), (-0.3, 0.1), (-0.12, -0.05), (-0.2, -0.4)]);
+                line(&mut pb, &[(0.0, 0.1), (0.0, 0.45)]);
+            }
             "\u{E76E}" => {
                 let (x, y) = p(0.0, 0.0);
                 pb.push_circle(x, y, 0.42 * s * SCALE);
@@ -468,7 +532,9 @@ fn main() {
     Scene::new(light, w, state(true, Schema::T9, "ni", &["你", "尼", "泥", "呢", "妮", "倪", "腻"]))
         .render(&fonts, &out, "09-t9-composing");
 
+    // Wide: the 123 panel is a tab of the symbol panel (digits have their own row).
     let mut s = Scene::new(light, w, state(true, Schema::Pinyin, "", &[]));
+    s.tap("符号");
     s.tap("123");
     s.render(&fonts, &out, "10-numbers");
 
@@ -503,7 +569,110 @@ fn main() {
     s.ptr(1, PointerPhase::Down, x, y);
     s.render(&fonts, &out, "23-dark-bubble");
 
+    // Wide-only scenes (DESIGN.md §2「Surface 宽屏布局」「电脑按键」).
+    let mut s = Scene::new(light, w, state(true, Schema::Pinyin, "", &[]));
+    s.view.set_edit_area(false);
+    s.render(&fonts, &out, "15-wide-no-edit-area");
+    let mut s = Scene::new(light, w, state(true, Schema::Pinyin, "", &[]));
+    s.tap("ctrl");
+    s.render(&fonts, &out, "16-wide-ctrl-hints");
+    let mut s = Scene::new(light, w, state(true, Schema::Pinyin, "", &[]));
+    s.tap("fn");
+    s.render(&fonts, &out, "17-wide-fn-layer");
+    let mut s = Scene::new(light, w, state(false, Schema::Pinyin, "", &[]));
+    s.tap("shift");
+    s.render(&fonts, &out, "18-wide-english-shift");
+    Scene::new(light, w, state(true, Schema::Pinyin, "n h", &[
+        "你好", "女孩", "男孩", "你会", "那会", "南湖", "能会", "宁海", "你", "那", "年", "女", "男", "内", "能",
+    ]))
+    .render(&fonts, &out, "19-wide-abbrev");
+
+    // Portrait (Surface held upright: 960 DIPs wide).
+    let mut s = Scene::new(light, 960.0, state(true, Schema::Pinyin, "", &[]));
+    s.render(&fonts, &out, "32-portrait-idle-toolbar");
+    s.tap("pc");
+    s.render(&fonts, &out, "33-portrait-pc-keys");
     // Portrait (Surface held upright: 960 DIPs wide).
     Scene::new(light, 960.0, state(true, Schema::Pinyin, "ni hao", NIHAO)).render(&fonts, &out, "30-portrait-composing");
     Scene::new(light, 960.0, state(true, Schema::T9, "", &[])).render(&fonts, &out, "31-portrait-t9");
+
+    // 电脑键盘 (TODO #31) and selection / clipboard (TODO #32).
+    let mut s = Scene::new(light, w, state(true, Schema::Pinyin, "", &[]));
+    s.tap("layout");
+    s.render(&fonts, &out, "40-layout-menu-pc");
+    s.tap("pcmode");
+    s.render(&fonts, &out, "41-pc-keyboard");
+    let (x, y) = s.at("shift");
+    s.ptr(2, PointerPhase::Down, x, y);
+    let (x, y) = s.at("A");
+    s.ptr(1, PointerPhase::Down, x, y);
+    s.render(&fonts, &out, "42-pc-keyboard-shift");
+    s.ptr(1, PointerPhase::Up, x, y);
+    let (x, y) = s.at("shift");
+    s.ptr(2, PointerPhase::Up, x, y);
+    s.tap("caps");
+    s.tap("fn");
+    s.render(&fonts, &out, "43-pc-keyboard-caps-fn");
+    let mut s = Scene::new(dark, w, state(true, Schema::Pinyin, "", &[]));
+    s.view.set_pc_keyboard(true);
+    s.render(&fonts, &out, "44-dark-pc-keyboard");
+    let mut s = Scene::new(light, 960.0, state(true, Schema::Pinyin, "", &[]));
+    s.view.set_pc_keyboard(true);
+    s.render(&fonts, &out, "45-portrait-pc-keyboard");
+
+    let mut s = Scene::new(light, w, state(true, Schema::Pinyin, "", &[]));
+    let (x, y) = s.at("space");
+    s.ptr(1, PointerPhase::Down, x, y);
+    s.wait(500);
+    for i in 1..=6 {
+        s.ptr(1, PointerPhase::Move, x + i as f32 * 12.0, y - i as f32 * 8.0);
+    }
+    s.render(&fonts, &out, "46-trackpad");
+    let (qx, qy) = s.at("q");
+    s.ptr(2, PointerPhase::Down, qx, qy);
+    s.ptr(2, PointerPhase::Up, qx, qy);
+    s.ptr(1, PointerPhase::Move, x + 120.0, y - 48.0);
+    s.render(&fonts, &out, "47-trackpad-selecting");
+    s.ptr(1, PointerPhase::Up, x + 120.0, y - 48.0);
+    s.render(&fonts, &out, "48-select-bar");
+
+    let sample = [
+        "会议改到周四下午三点，地点不变",
+        "https://dianmo.example/docs/clipboard",
+        "收到，谢谢！",
+        "点墨 Dianmo：让 Surface 上的中文输入像手机一样好用。复制、粘贴、选择都在键盘上完成。",
+        "13800138000",
+        "Cargo.toml",
+    ];
+    let items = |pin: bool| -> Vec<ClipItem> {
+        sample
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ClipItem { id: i as u64 + 1, text: t.to_string(), pinned: pin && i == 4 })
+            .collect()
+    };
+    let mut s = Scene::new(light, w, state(true, Schema::Pinyin, "", &[]));
+    s.view.set_clips(items(false));
+    s.view.set_paste_preview(Some(sample[0]));
+    s.t += 10;
+    s.view.notify_copied(s.t);
+    s.render(&fonts, &out, "49-clipboard-bar");
+    s.wait(1100);
+    s.render(&fonts, &out, "50-clipboard-bar-after-toast");
+    let mut s = Scene::new(light, w, state(true, Schema::Pinyin, "", &[]));
+    s.view.set_clips(items(true));
+    s.tap("clipboard");
+    let (x, y) = s.at("clip2");
+    s.ptr(1, PointerPhase::Down, x, y);
+    s.wait(400);
+    s.ptr(1, PointerPhase::Up, x, y);
+    s.render(&fonts, &out, "51-clipboard-panel");
+    let mut s = Scene::new(dark, 960.0, state(true, Schema::Pinyin, "", &[]));
+    s.view.set_clips(items(false));
+    s.t += 10;
+    s.view.notify_copied(s.t);
+    s.render(&fonts, &out, "52-portrait-dark-clipboard-bar");
+    s.tap("clipclose");
+    s.tap("select");
+    s.render(&fonts, &out, "53-portrait-select-bar");
 }

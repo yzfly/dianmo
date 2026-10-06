@@ -91,7 +91,7 @@ impl Engine for BasicEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dianmo_core::{Action, EditKey, InputController, TextSink};
+    use dianmo_core::{Action, EditKey, InputController, KeyChord, KeyCode, TextSink};
 
     #[derive(Default)]
     struct Rec(String);
@@ -101,6 +101,12 @@ mod tests {
         }
         fn send_key(&mut self, k: EditKey) {
             self.0.push_str(&format!("<{k:?}>"));
+        }
+        fn send_chord(&mut self, c: KeyChord) {
+            self.0.push_str(&format!("<{c:?}>"));
+        }
+        fn key_event(&mut self, k: KeyCode, down: bool) {
+            self.0.push_str(&format!("<{k:?} {down}>"));
         }
     }
 

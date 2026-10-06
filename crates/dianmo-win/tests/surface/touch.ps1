@@ -15,6 +15,10 @@ public static class T {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string n);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string n);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  // The top-level window of class `cls` that belongs to process `pid` (an installed 点墨 may be
+  // running too, with the same window classes: never touch its windows).
+  public static IntPtr FindOf(string cls, int pid) { IntPtr h = IntPtr.Zero; while ((h = FindWindowEx(IntPtr.Zero, h, cls, null)) != IntPtr.Zero) { uint p; GetWindowThreadProcessId(h, out p); if (p == (uint)pid) return h; } return IntPtr.Zero; }
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);

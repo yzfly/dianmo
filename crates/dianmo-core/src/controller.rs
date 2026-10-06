@@ -2,7 +2,7 @@
 //! place that decides what an action means for the engine and the focused app.
 
 use crate::engine::{Engine, Schema, Snapshot};
-use crate::sink::{EditKey, TextSink};
+use crate::sink::{EditKey, KeyChord, KeyCode, TextSink};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -19,6 +19,13 @@ pub enum Action {
     /// T9: lock the leading digits to a spelling from the left column.
     PickSpelling(String),
     Edit(EditKey),
+    /// A key combination (edit keys, Ctrl/Alt/Win/Fn), pressed and released at once.
+    /// The composition is committed first.
+    Key(KeyChord),
+    /// Raw key press / release (pass-through layouts; the app's IME sees real keys). A press
+    /// commits the composition first.
+    KeyDown(KeyCode),
+    KeyUp(KeyCode),
     /// Drop the composition (swipe left on backspace).
     ClearComposition,
     ToggleChinese,
@@ -117,6 +124,16 @@ impl<E: Engine, S: TextSink> InputController<E, S> {
                 self.commit_default();
                 self.sink.send_key(key);
             }
+            Action::Key(chord) => {
+                // Same as cursor keys: the app must see the composed text before e.g. Ctrl+A.
+                self.commit_default();
+                self.sink.send_chord(chord);
+            }
+            Action::KeyDown(key) => {
+                self.commit_default();
+                self.sink.key_event(key, true);
+            }
+            Action::KeyUp(key) => self.sink.key_event(key, false),
             Action::ClearComposition => {
                 let s = self.engine.clear();
                 self.apply(s);

@@ -6,4 +6,4 @@ pub mod sink;
 
 pub use controller::{Action, InputController};
 pub use engine::{Candidate, Engine, Schema, Snapshot};
-pub use sink::{EditKey, TextSink};
+pub use sink::{EditKey, KeyChord, KeyCode, TextSink};

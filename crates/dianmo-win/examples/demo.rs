@@ -2,12 +2,16 @@
 //! into the focused app through `SendInputSink`, without ever taking focus.
 //!
 //!   demo.exe [--no-appbar] [--hidden] [--no-tray] [--no-handle] [--focus] [--auto] [--tray-menu]
+//!            [--voice-ball] [--ball-right]
 //!
 //! - `--focus`: start the UI Automation focus watcher and log every `FocusEvent`.
 //! - `--auto`: with `--focus`, show the keyboard on `Editable { by_touch: true }` and hide it on
 //!   `NotEditable { by_touch: true }` (the auto show/hide rule of DESIGN.md §2).
 //! - `--tray-menu`: app items in the tray menu (a 布局 submenu with radio-like checks, a 深色主题
 //!   switch); choices are logged.
+//! - `--voice-ball`: the floating ball acts as the voice ball: a tap toggles the listening halo,
+//!   a long press shows the keyboard. Ball events are logged either way. `--ball-right` starts
+//!   the ball on the right edge.
 //!
 //! With `DIANMO_DEMO_LOG=<file>` every pointer event, focus event, tray command and visibility
 //! change is appended to that file (for tests).
@@ -32,7 +36,7 @@ mod demo {
         Align, Canvas, Color, Font, InputState, PointerEvent, PointerPhase, Rect, Response, TextStyle, UiAction, View,
     };
     use dianmo_win::{
-        App, FocusEvent, FocusWatcher, HostControl, HostOptions, SendInputSink, TrayItem, now_ms, start_focus_watcher,
+        App, BallEdge, BallEvent, BallPos, BallState, FocusEvent, FocusWatcher, HostControl, HostOptions, SendInputSink, TrayItem, now_ms, start_focus_watcher,
         start_voice_typing,
     };
 
@@ -298,6 +302,8 @@ mod demo {
         layout: usize,
         dark: bool,
         tray_menu: bool,
+        voice_ball: bool,
+        listening: bool,
     }
 
     impl DemoApp {
@@ -341,6 +347,25 @@ mod demo {
                         _ => {}
                     }
                 }
+            }
+            Response::none()
+        }
+
+        fn on_ball(&mut self, event: BallEvent, _view: &mut dyn View, host: &mut HostControl) -> Response {
+            log_line(&format!("ball {event:?}"));
+            match event {
+                BallEvent::Tap if self.voice_ball => {
+                    self.listening = !self.listening;
+                    host.set_ball_state(if self.listening { BallState::Listening } else { BallState::Idle });
+                }
+                BallEvent::Tap | BallEvent::LongPress => {
+                    if self.listening {
+                        self.listening = false;
+                        host.set_ball_state(BallState::Idle);
+                    }
+                    host.show();
+                }
+                BallEvent::Moved(_) => {}
             }
             Response::none()
         }
@@ -394,6 +419,8 @@ mod demo {
             layout: 0,
             dark: false,
             tray_menu: has("--tray-menu"),
+            voice_ball: has("--voice-ball"),
+            listening: false,
         };
         let opts = HostOptions {
             appbar: !has("--no-appbar"),
@@ -401,6 +428,7 @@ mod demo {
             tray: !has("--no-tray"),
             edge_handle: !has("--no-handle"),
             tray_menu: if app.tray_menu { app.tray_items() } else { Vec::new() },
+            ball_pos: has("--ball-right").then_some(BallPos { edge: BallEdge::Right, y_frac: 0.85 }),
             ..HostOptions::default()
         };
         dianmo_win::run_with(Box::new(DemoView::new()), Box::new(app), opts)

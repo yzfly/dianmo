@@ -1,5 +1,10 @@
 //! Notification-area icon: tap toggles the keyboard, the menu (press-and-hold / right click) has
 //! the app's own items ([`TrayItem`]) on top, then show/hide, the AppBar switch and 退出.
+//!
+//! The icon is the exe's icon resource 1 at the small-icon size for the current DPI (reloaded
+//! when the DPI changes); without such a resource (e.g. the demo) a 「墨」 is drawn with GDI.
+
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -8,17 +13,64 @@ use windows::Win32::Graphics::Gdi::{
     FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FW_BOLD, HGDIOBJ, SelectObject, SetBkMode,
     SetTextColor, TRANSPARENT,
 };
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NOTIFYICON_VERSION_4,
-    NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
+    NOTIFYICON_VERSION_4, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, HICON, HMENU, ICONINFO, MF_CHECKED,
     MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, SM_CXSMICON, SetForegroundWindow, TPM_BOTTOMALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL, CreateIconIndirect,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL, CreateIconIndirect, FindWindowW, GetWindowRect,
+    IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
 };
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::core::{HSTRING, PCWSTR, w};
+
+/// The window that owns our notification icon (uID 1), for [`icon_rect`]; 0 = none.
+static OWNER: AtomicIsize = AtomicIsize::new(0);
+
+/// Screen rectangle of our notification icon: on the taskbar, or in the hidden-icons flyout while
+/// that is open; `None` when the icon is hidden in the closed flyout (or there is no icon).
+/// Asks the shell (cross-process).
+pub(crate) fn icon_rect() -> Option<RECT> {
+    let owner = OWNER.load(Ordering::Relaxed);
+    if owner == 0 {
+        return None;
+    }
+    let id = NOTIFYICONIDENTIFIER {
+        cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
+        hWnd: HWND(owner as *mut _),
+        uID: 1,
+        ..Default::default()
+    };
+    let rc = unsafe { Shell_NotifyIconGetRect(&id) }.ok()?;
+    (rc.right > rc.left && rc.bottom > rc.top).then_some(rc)
+}
+
+/// Whether `rc` (from [`icon_rect`]) lies on the main taskbar rather than in the flyout.
+pub(crate) fn icon_on_taskbar(rc: RECT) -> bool {
+    let mut tb = RECT::default();
+    unsafe {
+        let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) else { return false };
+        if GetWindowRect(tray, &mut tb).is_err() {
+            return false;
+        }
+    }
+    rc.left >= tb.left && rc.right <= tb.right && rc.top >= tb.top && rc.bottom <= tb.bottom
+}
+
+/// The exe's icon resource 1 at `size` px, or the drawn 「墨」.
+fn load_icon(size: i32) -> HICON {
+    unsafe {
+        if let Ok(module) = GetModuleHandleW(None)
+            && let Ok(h) = LoadImageW(Some(module.into()), PCWSTR(std::ptr::without_provenance(1)), IMAGE_ICON, size, size, LR_DEFAULTCOLOR)
+        {
+            return HICON(h.0);
+        }
+    }
+    make_icon(size).unwrap_or_default()
+}
 
 pub(crate) const CMD_TOGGLE: u32 = 1001;
 pub(crate) const CMD_APPBAR: u32 = 1002;
@@ -28,16 +80,36 @@ pub(crate) struct Tray {
     hwnd: HWND,
     callback: u32,
     icon: HICON,
+    /// Icon size in px.
+    size: i32,
     tip: String,
 }
 
 impl Tray {
     pub(crate) fn new(hwnd: HWND, callback: u32, tip: &str, dpi: u32) -> Self {
         let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi) }.max(16);
-        let icon = make_icon(size).unwrap_or_default();
-        let tray = Self { hwnd, callback, icon, tip: tip.to_owned() };
+        let tray = Self { hwnd, callback, icon: load_icon(size), size, tip: tip.to_owned() };
         tray.add();
+        OWNER.store(hwnd.0 as isize, Ordering::Relaxed);
         tray
+    }
+
+    /// Reloads the icon at the small-icon size for `dpi` (after a DPI change).
+    pub(crate) fn set_dpi(&mut self, dpi: u32) {
+        let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi) }.max(16);
+        if size == self.size {
+            return;
+        }
+        let old = std::mem::replace(&mut self.icon, load_icon(size));
+        self.size = size;
+        let mut d = self.data();
+        d.uFlags = NIF_ICON;
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
+            if !old.is_invalid() {
+                let _ = DestroyIcon(old);
+            }
+        }
     }
 
     fn data(&self) -> NOTIFYICONDATAW {
@@ -157,6 +229,7 @@ pub(crate) fn menu(hwnd: HWND, visible: bool, appbar: bool, items: &[TrayItem]) 
 
 impl Drop for Tray {
     fn drop(&mut self) {
+        OWNER.store(0, Ordering::Relaxed);
         let d = self.data();
         unsafe {
             let _ = Shell_NotifyIconW(NIM_DELETE, &d);

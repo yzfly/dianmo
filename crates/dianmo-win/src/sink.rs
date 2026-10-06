@@ -2,12 +2,14 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use dianmo_core::{EditKey, TextSink};
+use dianmo_core::{EditKey, KeyChord, KeyCode, TextSink};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN,
-    VK_END, VK_ESCAPE, VK_H, VK_HOME, VK_LEFT, VK_LWIN, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
+    VK_END, VK_ESCAPE, VK_F1, VK_H, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_NEXT,
+    VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
+    VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SNAPSHOT, VK_SPACE, VK_APPS, VK_CAPITAL, VK_TAB, VK_UP,
 };
 
 /// Commits text and editing keys to whatever window has keyboard focus. The keyboard window never
@@ -31,6 +33,14 @@ impl TextSink for SendInputSink {
 
     fn send_key(&mut self, key: EditKey) {
         send_edit_key(key);
+    }
+
+    fn send_chord(&mut self, chord: KeyChord) {
+        send_chord(chord);
+    }
+
+    fn key_event(&mut self, key: KeyCode, down: bool) {
+        send_key_event(key, down);
     }
 }
 
@@ -111,6 +121,8 @@ fn edit_vk(key: EditKey) -> (VIRTUAL_KEY, bool) {
         EditKey::Down => (VK_DOWN, true),
         EditKey::Home => (VK_HOME, true),
         EditKey::End => (VK_END, true),
+        EditKey::PageUp => (VK_PRIOR, true),
+        EditKey::PageDown => (VK_NEXT, true),
     }
 }
 
@@ -120,6 +132,97 @@ pub fn send_edit_key(key: EditKey) -> bool {
     let mut events = Vec::with_capacity(2);
     tap(&mut events, vk, extended);
     send(&events)
+}
+
+/// The virtual key for a chord key, and whether it needs `KEYEVENTF_EXTENDEDKEY`.
+///
+/// Letters and digits use their virtual-key codes ('A'..'Z' = 0x41.., '0'..'9' = 0x30..) and
+/// punctuation the US-layout OEM codes, which is what Windows' Chinese layouts use too. Virtual
+/// keys reach the app's keyboard handling directly, so an IME in the target app (微软拼音、搜狗)
+/// does not compose them; it only reacts to its own hotkeys (Ctrl+Space, Ctrl+Shift, Ctrl+.).
+fn chord_vk(key: KeyCode) -> Option<(VIRTUAL_KEY, bool)> {
+    Some(match key {
+        KeyCode::Char(c) => {
+            let vk: u16 = match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' => c.to_ascii_uppercase() as u16,
+                ' ' => VK_SPACE.0,
+                '-' => VK_OEM_MINUS.0,
+                '=' => VK_OEM_PLUS.0,
+                '[' => VK_OEM_4.0,
+                ']' => VK_OEM_6.0,
+                '\\' => VK_OEM_5.0,
+                ';' => VK_OEM_1.0,
+                '\'' => VK_OEM_7.0,
+                ',' => VK_OEM_COMMA.0,
+                '.' => VK_OEM_PERIOD.0,
+                '/' => VK_OEM_2.0,
+                '`' => VK_OEM_3.0,
+                _ => return None,
+            };
+            (VIRTUAL_KEY(vk), false)
+        }
+        KeyCode::Edit(k) => edit_vk(k),
+        KeyCode::F(n @ 1..=24) => (VIRTUAL_KEY(VK_F1.0 + n as u16 - 1), false),
+        KeyCode::F(_) => return None,
+        KeyCode::Insert => (VK_INSERT, true),
+        KeyCode::PrintScreen => (VK_SNAPSHOT, true),
+        KeyCode::Ctrl => (VK_LCONTROL, false),
+        KeyCode::Shift => (VK_LSHIFT, false),
+        KeyCode::Alt => (VK_LMENU, false),
+        KeyCode::Win => (VK_LWIN, true),
+        KeyCode::CapsLock => (VK_CAPITAL, false),
+        KeyCode::Menu => (VK_APPS, true),
+    })
+}
+
+/// Modifiers down (Ctrl, Shift, Alt, Win), the key down/up, modifiers up in reverse order.
+/// Empty if the key cannot be sent; a chord without a key taps the modifiers alone.
+fn chord_events(chord: KeyChord) -> Vec<INPUT> {
+    let key = match chord.key {
+        Some(k) => match chord_vk(k) {
+            Some(vk) => Some(vk),
+            None => return Vec::new(),
+        },
+        None => None,
+    };
+    let mods: Vec<(VIRTUAL_KEY, bool)> = [
+        (chord.ctrl, (VK_LCONTROL, false)),
+        (chord.shift, (VK_LSHIFT, false)),
+        (chord.alt, (VK_LMENU, false)),
+        (chord.win, (VK_LWIN, true)),
+    ]
+    .into_iter()
+    .filter_map(|(on, m)| on.then_some(m))
+    .collect();
+    if key.is_none() && mods.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(2 * mods.len() + 2);
+    for &(vk, ext) in &mods {
+        vk_events(&mut out, vk, ext, false);
+    }
+    if let Some((vk, ext)) = key {
+        tap(&mut out, vk, ext);
+    }
+    for &(vk, ext) in mods.iter().rev() {
+        vk_events(&mut out, vk, ext, true);
+    }
+    out
+}
+
+/// Sends a key combination (Ctrl+C, Ctrl+Shift+T, Win+V, Alt+F4, a lone Win, ...) in one
+/// `SendInput`, so no other input can interleave with the held modifiers.
+pub fn send_chord(chord: KeyChord) -> bool {
+    send(&chord_events(chord))
+}
+
+/// Presses or releases one key (virtual key + scan code from `MapVirtualKeyW`, extended keys
+/// flagged), like a physical keyboard. False if the key can't be sent or the system blocked it.
+pub fn send_key_event(key: KeyCode, down: bool) -> bool {
+    let Some((vk, ext)) = chord_vk(key) else { return false };
+    let mut out = Vec::with_capacity(1);
+    vk_events(&mut out, vk, ext, !down);
+    send(&out)
 }
 
 /// Starts Windows voice typing: Win↓ H↓ H↑ Win↑ in one `SendInput`. The keyboard never takes
@@ -143,6 +246,28 @@ mod tests {
         assert_eq!(ev.len(), 2 + 4);
         let scans: Vec<u16> = ev.iter().map(|e| unsafe { e.Anonymous.ki.wScan }).collect();
         assert_eq!(scans, [0x4F60, 0x4F60, 0xD83D, 0xD83D, 0xDE00, 0xDE00]);
+    }
+
+    #[test]
+    fn chords_hold_modifiers_around_the_key() {
+        let vks = |c| chord_events(c).iter().map(|e| unsafe { (e.Anonymous.ki.wVk, e.Anonymous.ki.dwFlags) }).collect::<Vec<_>>();
+        let up = KEYEVENTF_KEYUP;
+        let none = KEYBD_EVENT_FLAGS(0);
+        let c = VIRTUAL_KEY(b'C' as u16);
+        assert_eq!(vks(KeyChord::COPY), [(VK_LCONTROL, none), (c, none), (c, up), (VK_LCONTROL, up)]);
+        let t = vks(KeyChord { shift: true, ..KeyChord::ctrl('t') });
+        assert_eq!(t.len(), 6);
+        assert_eq!(t[1], (VK_LSHIFT, none));
+        assert_eq!(t[4], (VK_LSHIFT, up), "released in reverse order");
+        assert_eq!(vks(KeyChord::ctrl('1'))[1].0, VIRTUAL_KEY(b'1' as u16));
+        assert_eq!(vks(KeyChord::ctrl('-'))[1].0, VK_OEM_MINUS);
+        assert_eq!(vks(KeyChord::ctrl_key(EditKey::Left))[1], (VK_LEFT, KEYEVENTF_EXTENDEDKEY));
+        assert_eq!(vks(KeyChord::win_alone()), [(VK_LWIN, KEYEVENTF_EXTENDEDKEY), (VK_LWIN, KEYEVENTF_EXTENDEDKEY | up)]);
+        assert_eq!(vks(KeyChord { alt: true, ..KeyChord::key(KeyCode::F(4)) })[1].0, VIRTUAL_KEY(VK_F1.0 + 3));
+        assert!(chord_events(KeyChord::ctrl('，')).is_empty());
+        assert!(chord_events(KeyChord::default()).is_empty());
+        assert_eq!(chord_vk(KeyCode::Win), Some((VK_LWIN, true)));
+        assert_eq!(chord_vk(KeyCode::Shift), Some((VK_LSHIFT, false)));
     }
 
     #[test]

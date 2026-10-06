@@ -2,17 +2,24 @@
 //! Direct2D); overlays (bubbles, popups) go last so they may cover the candidate bar.
 
 use crate::canvas::{Align, Canvas, Color, Font, Rect, TextStyle};
-use crate::keyboard::{KeyboardView, Mode, Panel, Target, Touch};
-use crate::layout::{self, ColumnKind, Key, KeyAction, Shift, Tone};
+use crate::clip::clip_preview;
+use crate::keyboard::{KeyboardView, Mode, Panel, Target, Touch, estimate_width};
+use crate::layout::{self, ColumnKind, Key, KeyAction, Latch, Modifier, Tone};
 
 impl KeyboardView {
     pub(crate) fn draw(&self, c: &mut dyn Canvas) {
         c.clear(self.theme.background);
         self.draw_bar(c);
+        if self.trackpad_active() {
+            self.draw_trackpad(c);
+            self.draw_toast(c);
+            return;
+        }
         match self.panel {
             Panel::Candidates => self.draw_candidate_grid(c),
             Panel::Symbols(_) => self.draw_symbol_grid(c),
             Panel::Menu => self.draw_menu_title(c),
+            Panel::Clipboard => self.draw_clip_panel(c),
             _ => {}
         }
         if self.column.is_some() {
@@ -25,6 +32,7 @@ impl KeyboardView {
         for t in &self.touches {
             self.draw_overlay(c, t);
         }
+        self.draw_toast(c);
     }
 
     fn style(&self, size: f32, color: Color) -> TextStyle {
@@ -65,31 +73,62 @@ impl KeyboardView {
             c.text(&self.snapshot.preedit, Rect::new(lead, 0.0, m.w * 0.7, m.bar_h), st);
         } else if self.composing() {
             self.draw_strip(c);
+        } else if self.clip_bar_shown() {
+            self.draw_clip_bar(c);
+        } else if self.pc {
+            let st = self.style(13.0 * self.bar_s(), th.text_faint);
+            c.text("电脑键盘 · 按键直通，由当前应用的输入法处理", Rect::new(0.0, 0.0, m.w, m.bar_h), st);
         }
+        let bs = self.bar_s();
         for k in &self.bar_keys {
             let pressed = self.press_of(k, true).is_some();
             if pressed {
                 let d = m.bar_h * 0.8;
-                let r = Rect::new(k.cell.x + (k.cell.w - d) / 2.0, k.cell.y + (k.cell.h - d) / 2.0, d, d);
+                let r = if k.sub.is_some() {
+                    Rect::new(k.cell.x + 3.0 * bs, k.cell.y + (k.cell.h - d) / 2.0, k.cell.w - 6.0 * bs, d)
+                } else {
+                    Rect::new(k.cell.x + (k.cell.w - d) / 2.0, k.cell.y + (k.cell.h - d) / 2.0, d, d)
+                };
                 c.fill_rect(r, d / 2.0, th.flat_pressed);
             }
             let color = if matches!(k.action, KeyAction::ExpandCandidates | KeyAction::CollapseCandidates) {
                 th.text
+            } else if k.action == KeyAction::SelectMode && self.selecting {
+                th.accent
             } else {
                 th.text_secondary
             };
-            c.text(&k.label, k.cell, self.icon_style(19.0 * s, color));
+            match &k.sub {
+                // Toolbar tool: icon and caption side by side.
+                Some(cap) => {
+                    let ist = self.icon_style(17.0 * bs, color);
+                    let cst = TextStyle { align: Align::Start, ..self.style(14.5 * bs, color) };
+                    let iw = 20.0 * bs;
+                    let gap = 5.0 * bs;
+                    let tw = c.measure_text(cap, cst);
+                    let x = k.cell.x + (k.cell.w - iw - gap - tw) / 2.0;
+                    c.text(&k.label, Rect::new(x, k.cell.y, iw, k.cell.h), ist);
+                    c.text(cap, Rect::new(x + iw + gap, k.cell.y, tw + 1.0, k.cell.h), cst);
+                }
+                None if k.icon => c.text(&k.label, k.cell, self.icon_style(19.0 * s * k.scale / 0.78, color)),
+                // Text button (selection bar).
+                None => {
+                    let accent = k.tone == Tone::Accent;
+                    let st = TextStyle { bold: accent, ..self.style(16.0 * bs, if accent { th.accent } else { th.text }) };
+                    c.text(&k.label, k.cell, st);
+                }
+            }
         }
     }
 
     fn draw_strip(&self, c: &mut dyn Canvas) {
         let th = &self.theme;
         let m = &self.m;
-        let s = m.s;
+        let s = self.bar_s();
         let sr = self.strip_rect();
         let lead = self.strip_lead();
-        let pre_h = 17.0 * s;
-        let pre = TextStyle { align: Align::Start, ..self.style(14.5 * s, th.text_secondary) };
+        let pre_h = if m.wide { 19.0 * s } else { 17.0 * s };
+        let pre = TextStyle { align: Align::Start, ..self.style(if m.wide { 15.5 * s } else { 14.5 * s }, th.text_secondary) };
         c.text(&self.snapshot.preedit, Rect::new(lead + 2.0 * s, 2.0 * s, sr.w - lead, pre_h), pre);
 
         let y0 = pre_h + 1.0 * s;
@@ -105,6 +144,10 @@ impl KeyboardView {
             }
             let Some(cand) = self.cands.get(i) else { break };
             let cell = Rect::new(rx, y0, w, h);
+            if i == 0 && m.wide {
+                // Wide bars make the default choice stand out with a soft pill.
+                c.fill_rect(Rect::new(rx + 3.0 * s, y0 + 1.0 * s, w - 6.0 * s, h - 2.0 * s), 9.0 * s, th.accent_soft);
+            }
             if pressed == Some(i) {
                 c.fill_rect(cell.inset(1.0), 8.0 * s, th.flat_pressed);
             }
@@ -273,22 +316,40 @@ impl KeyboardView {
             _ => {}
         }
         let size = m.letter_size() * k.scale;
+        let mods = self.mods();
+        let locked = match k.action {
+            KeyAction::Mod(md) => mods.latch(md) == Latch::Locked,
+            KeyAction::CapsLock => mods.latch(Modifier::Shift) == Latch::Locked,
+            _ => false,
+        };
+        if locked {
+            let w = 14.0 * s;
+            c.fill_rect(Rect::new(face.x + (face.w - w) / 2.0, face.y + face.h * 0.78, w, 2.0 * s), 1.0 * s, th.accent);
+        }
+        if k.action == KeyAction::Raw(dianmo_core::KeyCode::CapsLock) {
+            // Caps Lock light.
+            let d = 6.0 * s;
+            let color = if self.pc_caps { th.accent } else { th.divider };
+            c.fill_rect(Rect::new(face.x + face.w - d - 7.0 * s, face.y + 7.0 * s, d, d), d / 2.0, color);
+        }
+        if let Some(tl) = &k.top_left {
+            let r = Rect::new(face.x + 6.0 * s, face.y + 2.0 * s, face.w * 0.5, 17.0 * s);
+            c.text(tl, r, TextStyle { align: Align::Start, ..self.style(13.0 * s, th.text_secondary) });
+        }
         if k.icon {
             let color = match k.action {
-                KeyAction::Shift if self.shift == Shift::Once => th.accent,
+                KeyAction::Mod(Modifier::Shift) if mods.on(Modifier::Shift) => th.accent,
                 _ => fg,
             };
             c.text(&k.label, face, self.icon_style(size, color));
-            if k.action == KeyAction::Shift && self.shift == Shift::Locked {
-                let w = 14.0 * s;
-                c.fill_rect(Rect::new(face.x + (face.w - w) / 2.0, face.y + face.h * 0.76, w, 2.0 * s), 1.0 * s, th.accent);
-            }
         } else if let Some(sub) = &k.sub {
             // 小鹤: letter above, finals below.
             let main = Rect::new(face.x, face.y + face.h * 0.04, face.w, face.h * 0.62);
             c.text(&k.label, main, self.style(size * 0.92, fg));
             let sub_r = Rect::new(face.x + 2.0, face.y + face.h * 0.60, face.w - 4.0, face.h * 0.32);
-            c.text(sub, sub_r, self.style(12.5 * s, th.text_secondary));
+            // Shortcut hints (Ctrl+C 复制) are in the accent colour; 小鹤 finals are grey.
+            let color = if mods.chording() { th.accent } else { th.text_secondary };
+            c.text(sub, sub_r, self.style(12.5 * s, color));
         } else if let Some(top) = &k.top {
             // T9: digit above, letters below.
             let top_r = Rect::new(face.x, face.y + face.h * 0.10, face.w, face.h * 0.30);
@@ -331,15 +392,6 @@ impl KeyboardView {
             Some(Mode::Cursor { .. }) => {
                 c.text("‹   移动光标   ›", face, self.style(14.0 * s, th.accent));
             }
-            Some(Mode::Voice) => {
-                let iw = 22.0 * s;
-                let label = "松开开始语音";
-                let st = self.style(14.0 * s, th.accent);
-                let tw = c.measure_text(label, st);
-                let x = face.x + (face.w - iw - 6.0 * s - tw) / 2.0;
-                c.text(layout::icon::MIC, Rect::new(x, face.y, iw, face.h), self.icon_style(18.0 * s, th.accent));
-                c.text(label, Rect::new(x + iw + 6.0 * s, face.y, tw + 1.0, face.h), TextStyle { align: Align::Start, ..st });
-            }
             _ => {
                 if !k.label.is_empty() {
                     c.text(&k.label, face, self.style(13.0 * s, th.text_faint));
@@ -380,7 +432,7 @@ impl KeyboardView {
         match &t.mode {
             Mode::Press if k.bubble => {
                 let label = match &k.action {
-                    KeyAction::Letter(ch) if self.shift != Shift::Off => ch.to_ascii_uppercase().to_string(),
+                    KeyAction::Letter(ch) if self.mods().on(Modifier::Shift) => ch.to_ascii_uppercase().to_string(),
                     KeyAction::Letter(ch) => ch.to_string(),
                     _ => k.label.clone(),
                 };
@@ -439,6 +491,156 @@ impl KeyboardView {
             let size = if n <= 1.0 { 28.0 * s } else { (28.0 * s * 1.5 / n).clamp(14.0 * s, 22.0 * s) };
             c.text(a, punct_centered(a, cell, size), self.style(size, if selected { th.on_accent } else { th.text }));
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Selection, trackpad, clipboard (TODO #32)
+    // -----------------------------------------------------------------------------------------
+
+    /// The key area as a trackpad: key faces hidden, a hint, and the finger.
+    fn draw_trackpad(&self, c: &mut dyn Canvas) {
+        let th = &self.theme;
+        let m = &self.m;
+        let s = m.s;
+        let area = m.keys_area();
+        let face = area.inset(4.0 * s);
+        c.fill_rect(face, m.radius * 2.0, th.func);
+        if self.pad_select {
+            c.stroke_rect(face.inset(1.0 * s), m.radius * 2.0, 2.0 * s, th.accent);
+        }
+        let (title, hint) = if self.pad_select {
+            ("选择中", "拖动扩大选区 · 再用另一根手指点一下，按词扩选 · 松手结束")
+        } else {
+            ("触控板", "拖动移动光标，拖得快走得远 · 另一根手指点一下开始选择")
+        };
+        let mid = face.y + face.h * 0.42;
+        c.text(title, Rect::new(face.x, mid - 34.0 * s, face.w, 30.0 * s), TextStyle { bold: true, ..self.style(22.0 * s, if self.pad_select { th.accent } else { th.text_secondary }) });
+        c.text(hint, Rect::new(face.x, mid + 2.0 * s, face.w, 24.0 * s), self.style(14.5 * s, th.text_faint));
+        for t in &self.touches {
+            if let Mode::Trackpad { .. } = t.mode {
+                let d = 34.0 * s;
+                c.fill_rect(Rect::new(t.x - d / 2.0, t.y - d / 2.0, d, d), d / 2.0, th.accent.with_alpha(0.25));
+                c.fill_rect(Rect::new(t.x - d / 4.0, t.y - d / 4.0, d / 2.0, d / 2.0), d / 4.0, th.accent.with_alpha(0.6));
+            }
+        }
+    }
+
+    /// Clipboard cards in the idle bar (most recent first).
+    fn draw_clip_bar(&self, c: &mut dyn Canvas) {
+        let th = &self.theme;
+        let s = self.bar_s();
+        let rect = self.clip_bar_rect();
+        let pressed = self.pressed_index(|t| if let Target::ClipCard(i) = t { *i } else { None });
+        let st = self.clip_text_style();
+        let h = self.m.bar_h * 0.7;
+        let y = (self.m.bar_h - h) / 2.0;
+        c.push_clip(rect);
+        for (i, (x, w, text)) in self.clip_cards().into_iter().enumerate() {
+            let rx = rect.x + x - self.clip_strip.offset;
+            if rx + w < rect.x || rx > rect.x + rect.w {
+                continue;
+            }
+            let card = Rect::new(rx, y, w, h);
+            c.fill_rect(Rect::new(card.x, card.y + 1.0 * s, card.w, card.h), 9.0 * s, th.shadow);
+            c.fill_rect(card, 9.0 * s, if pressed == Some(i) { th.key_pressed } else { th.key });
+            if i == 0 {
+                c.stroke_rect(card.inset(0.5 * s), 9.0 * s, 1.5 * s, th.accent.with_alpha(0.6));
+            }
+            c.text(&text, card.inset(6.0 * s), st);
+        }
+        c.pop_clip();
+    }
+
+    /// Splits `text` (one line, see [`clip_preview`]) into at most `lines` lines of width `w`.
+    fn wrap_lines(text: &str, size: f32, w: f32, lines: usize) -> Vec<String> {
+        let mut out: Vec<String> = vec![String::new()];
+        let mut width = 0.0;
+        for ch in text.chars() {
+            let cw = estimate_width(ch.encode_utf8(&mut [0; 4]), size);
+            if width + cw > w && !out.last().is_some_and(|l| l.is_empty()) {
+                if out.len() == lines {
+                    let last = out.last_mut().unwrap();
+                    last.pop();
+                    last.push('…');
+                    return out;
+                }
+                out.push(String::new());
+                width = 0.0;
+            }
+            out.last_mut().unwrap().push(ch);
+            width += cw;
+        }
+        out
+    }
+
+    /// Clipboard panel: title, and the cards (pinned first). Long-pressed card: 固定 / 删除.
+    fn draw_clip_panel(&self, c: &mut dyn Canvas) {
+        let th = &self.theme;
+        let m = &self.m;
+        let s = m.s;
+        let area = m.keys_area();
+        let head_h = m.row_h * 0.85;
+        let title = if self.clips.is_empty() { "剪贴板" } else { "剪贴板 · 点一下粘贴，长按固定或删除" };
+        c.text(title, Rect::new(area.x, area.y, area.w, head_h), self.style(15.0 * s, th.text_secondary));
+        let Some(grid) = self.grid else { return };
+        if self.clips.is_empty() {
+            c.text("复制的文字会出现在这里", grid, self.style(16.0 * s, th.text_faint));
+            return;
+        }
+        let pressed = self.pressed_index(|t| if let Target::ClipGrid(i) = t { *i } else { None });
+        let size = 16.0 * s;
+        c.push_clip(grid);
+        for (pos, &i) in self.clip_panel_order().iter().enumerate() {
+            let cell = self.clip_grid_cell(grid, pos);
+            if cell.y + cell.h < grid.y || cell.y > grid.y + grid.h {
+                continue;
+            }
+            let item = &self.clips[i];
+            let face = Rect::new(cell.x + 4.0 * s, cell.y + 4.0 * s, cell.w - 8.0 * s, cell.h - 8.0 * s);
+            c.fill_rect(Rect::new(face.x, face.y + 1.3 * s, face.w, face.h), m.radius * 1.4, th.shadow);
+            c.fill_rect(face, m.radius * 1.4, if pressed == Some(pos) { th.key_pressed } else { th.key });
+            if self.clip_menu == Some(item.id) {
+                // 固定 / 删除 halves.
+                let half = face.w / 2.0;
+                let l = Rect::new(face.x, face.y, half, face.h);
+                let r = Rect::new(face.x + half, face.y, half, face.h);
+                c.fill_rect(l.inset(4.0 * s), m.radius, th.accent_soft);
+                c.fill_rect(r.inset(4.0 * s), m.radius, th.func);
+                c.text(if item.pinned { "取消固定" } else { "固定" }, l, TextStyle { bold: true, ..self.style(16.0 * s, th.accent) });
+                c.text("删除", r, TextStyle { bold: true, ..self.style(16.0 * s, th.text) });
+                continue;
+            }
+            let pad = 12.0 * s;
+            let text = clip_preview(&item.text, 120);
+            let lines = Self::wrap_lines(&text, size, face.w - 2.0 * pad - if item.pinned { 18.0 * s } else { 0.0 }, 2);
+            let lh = size * 1.45;
+            let y0 = face.y + (face.h - lh * lines.len() as f32) / 2.0;
+            for (j, line) in lines.iter().enumerate() {
+                let r = Rect::new(face.x + pad, y0 + j as f32 * lh, face.w - 2.0 * pad, lh);
+                c.text(line, r, TextStyle { align: Align::Start, ..self.style(size, th.text) });
+            }
+            if item.pinned {
+                let r = Rect::new(face.x + face.w - 22.0 * s, face.y + 4.0 * s, 18.0 * s, 18.0 * s);
+                c.text(layout::icon::PIN, r, self.icon_style(13.0 * s, th.accent));
+            }
+        }
+        c.pop_clip();
+    }
+
+    /// 「已复制」: a dark pill over the keys.
+    fn draw_toast(&self, c: &mut dyn Canvas) {
+        let Some((text, _)) = &self.toast else { return };
+        let th = &self.theme;
+        let s = self.bar_s();
+        let st = TextStyle { bold: true, ..self.style(16.0 * s, th.background) };
+        let w = c.measure_text(text, st) + 40.0 * s;
+        // Over the keys like a phone toast, so the new clipboard card in the bar stays visible.
+        let h = (self.m.bar_h * 0.8).max(32.0);
+        let area = self.m.keys_area();
+        let r = Rect::new((self.m.w - w) / 2.0, area.y + area.h * 0.38 - h / 2.0, w, h);
+        c.fill_rect(Rect::new(r.x, r.y + 2.0 * s, r.w, r.h), h / 2.0, th.bubble_shadow);
+        c.fill_rect(r, h / 2.0, th.text.with_alpha(0.9));
+        c.text(text, r, st);
     }
 }
 

@@ -1,4 +1,4 @@
-use dianmo_core::{Action, Candidate, EditKey, Engine, InputController, Schema, Snapshot, TextSink};
+use dianmo_core::{Action, Candidate, EditKey, Engine, InputController, KeyChord, KeyCode, Schema, Snapshot, TextSink};
 
 /// Tiny pinyin engine: whole-input words first, then words for a prefix of the input.
 struct FakeEngine {
@@ -81,6 +81,23 @@ impl TextSink for Sink {
     }
     fn send_key(&mut self, key: EditKey) {
         self.log.push(format!("<{key:?}>"));
+    }
+    fn send_chord(&mut self, chord: KeyChord) {
+        let mut name = String::new();
+        for (on, m) in [(chord.ctrl, "C-"), (chord.shift, "S-"), (chord.alt, "A-"), (chord.win, "W-")] {
+            if on {
+                name.push_str(m);
+            }
+        }
+        match chord.key {
+            Some(KeyCode::Char(c)) => name.push(c),
+            Some(k) => name.push_str(&format!("{k:?}")),
+            None => {}
+        }
+        self.log.push(format!("<{name}>"));
+    }
+    fn key_event(&mut self, key: KeyCode, down: bool) {
+        self.log.push(format!("<{key:?}{}>", if down { "↓" } else { "↑" }));
     }
 }
 
@@ -206,4 +223,28 @@ fn clear_drops_composition_silently() {
     c.handle(Action::ClearComposition);
     assert!(!c.is_composing());
     assert!(log(&mut c).is_empty());
+}
+
+#[test]
+fn chords_commit_composition_first() {
+    let mut c = controller();
+    type_str(&mut c, "nihao");
+    c.handle(Action::Key(KeyChord::SELECT_ALL));
+    assert!(!c.is_composing());
+    c.handle(Action::Key(KeyChord::COPY));
+    c.handle(Action::Key(KeyChord { shift: true, ..KeyChord::ctrl('t') }));
+    c.handle(Action::Key(KeyChord::DELETE_WORD));
+    c.handle(Action::Key(KeyChord::win_alone()));
+    c.handle(Action::Key(KeyChord::key(KeyCode::F(5))));
+    assert_eq!(log(&mut c), ["你好", "<C-a>", "<C-c>", "<C-S-t>", "<C-Edit(Backspace)>", "<W->", "<F(5)>"]);
+    assert!(KeyChord::UNDO.has_modifier());
+    // Raw key events: a press commits the composition first.
+    let mut c = controller();
+    type_str(&mut c, "ni");
+    c.handle(Action::KeyDown(KeyCode::Shift));
+    c.handle(Action::KeyDown(KeyCode::Char('a')));
+    c.handle(Action::KeyUp(KeyCode::Char('a')));
+    c.handle(Action::KeyUp(KeyCode::Shift));
+    assert_eq!(log(&mut c), ["你", "<Shift↓>", "<Char('a')↓>", "<Char('a')↑>", "<Shift↑>"]);
+    assert!(!KeyChord::key(KeyCode::F(1)).has_modifier());
 }

@@ -41,7 +41,7 @@ use windows::core::{Result, w};
 use crate::appbar::{ABN_FULLSCREENAPP, ABN_POSCHANGED, ABN_STATECHANGE, AppBar};
 use crate::canvas::Renderer;
 use crate::clock::now_ms;
-use crate::handle::EdgeHandle;
+use crate::handle::{BallEvent, BallPos, BallState, EdgeHandle};
 use crate::tray::{self, Choice, Tray, TrayItem};
 
 pub(crate) const WM_APP_CMD: u32 = WM_APP + 1;
@@ -50,6 +50,8 @@ const WM_APP_APPBAR: u32 = WM_APP + 3;
 const WM_APP_TRAY: u32 = WM_APP + 4;
 const WM_APP_TRAY_CMD: u32 = WM_APP + 5;
 const WM_APP_FULLSCREEN: u32 = WM_APP + 6;
+/// From the floating ball: wParam = event code, lParam = packed position (`handle::decode`).
+pub(crate) const WM_APP_BALL: u32 = WM_APP + 7;
 
 pub(crate) const CMD_SHOW: usize = 1;
 const CMD_HIDE: usize = 2;
@@ -78,8 +80,12 @@ pub struct HostOptions {
     pub appbar: bool,
     /// Notification-area icon (tap = show/hide, menu = AppBar switch and 退出).
     pub tray: bool,
-    /// Small tab on the left screen edge while hidden; tapping it shows the keyboard.
+    /// Floating ball on a screen edge while the keyboard is hidden ([`App::on_ball`]; by default
+    /// tapping it shows the keyboard). The field keeps its old name (it was an edge tab).
     pub edge_handle: bool,
+    /// Where the floating ball starts (saved from [`BallEvent::Moved`]); `None` = left edge,
+    /// a bit below the middle.
+    pub ball_pos: Option<BallPos>,
     pub tray_tip: String,
     /// Upper bound of the keyboard height as a fraction of the monitor height.
     pub max_height_fraction: f32,
@@ -102,6 +108,7 @@ impl Default for HostOptions {
             max_height_fraction: 0.5,
             hardware_gpu: false,
             tray_menu: Vec::new(),
+            ball_pos: None,
         }
     }
 }
@@ -132,6 +139,16 @@ pub trait App {
         Response::none()
     }
 
+    /// The floating ball was tapped, long-pressed or moved. Default: tap and long press show the
+    /// keyboard; save the position of `Moved` to pass it back in [`HostOptions::ball_pos`].
+    fn on_ball(&mut self, event: BallEvent, view: &mut dyn View, host: &mut HostControl) -> Response {
+        let _ = view;
+        if matches!(event, BallEvent::Tap | BallEvent::LongPress) {
+            host.show();
+        }
+        Response::none()
+    }
+
     /// An app item of the tray menu ([`TrayItem::Command`]) was chosen.
     fn on_tray_command(&mut self, id: u32, view: &mut dyn View, host: &mut HostControl) -> Response {
         let _ = (id, view, host);
@@ -144,13 +161,14 @@ struct Requests {
     visible: Option<bool>,
     appbar: Option<bool>,
     quit: bool,
+    ball_state: Option<BallState>,
     /// Applied by `Host::process` itself (no window operations involved).
     tray_menu: Option<Vec<TrayItem>>,
 }
 
 impl Requests {
     fn is_empty(&self) -> bool {
-        self.visible.is_none() && self.appbar.is_none() && !self.quit
+        self.visible.is_none() && self.appbar.is_none() && !self.quit && self.ball_state.is_none()
     }
 }
 
@@ -214,6 +232,12 @@ impl HostControl {
     /// the edge handle hides; showing the keyboard still puts it on top.
     pub fn fullscreen_app(&self) -> bool {
         self.fullscreen
+    }
+
+    /// How the floating ball looks: [`BallState::Listening`] draws a breathing halo (voice
+    /// input running; the only animation, and only in that state).
+    pub fn set_ball_state(&mut self, state: BallState) {
+        self.req.ball_state = Some(state);
     }
 }
 
@@ -408,7 +432,7 @@ pub fn run_with(view: Box<dyn View>, app: Box<dyn App>, opts: HostOptions) -> Re
         let dpi = monitor_dpi(hwnd);
         let renderer = Renderer::new(hwnd, opts.hardware_gpu)?;
         let tray = opts.tray.then(|| Tray::new(tray_hwnd, WM_APP_TRAY, &opts.tray_tip, dpi));
-        let handle = if opts.edge_handle { EdgeHandle::new(hwnd).ok() } else { None };
+        let handle = if opts.edge_handle { EdgeHandle::new(hwnd, opts.ball_pos.unwrap_or_default()).ok() } else { None };
         let start_visible = opts.start_visible;
         let appbar_on = opts.appbar;
         let tray_menu = opts.tray_menu.clone();
@@ -611,6 +635,9 @@ fn merge_requests(into: &mut Requests, r: Requests) {
         into.appbar = r.appbar;
     }
     into.quit |= r.quit;
+    if r.ball_state.is_some() {
+        into.ball_state = r.ball_state;
+    }
 }
 
 /// Applies host requests outside the state borrow. Visibility callbacks may produce more.
@@ -627,6 +654,13 @@ fn apply(mut req: Requests) {
                 }
             }
             return;
+        }
+        if let Some(state) = next_req.ball_state {
+            with(|h| {
+                if let Some(ball) = &h.handle {
+                    ball.set_state(state);
+                }
+            });
         }
         if let Some(on) = next_req.appbar {
             set_appbar(on);
@@ -732,6 +766,9 @@ fn layout() {
         let max_h = ((mi.rcMonitor.bottom - mi.rcMonitor.top) as f32 * max_frac.clamp(0.1, 1.0)) as i32;
         let Some(pref) = with(|h| {
             h.dpi = dpi;
+            if let Some(t) = &mut h.tray {
+                t.set_dpi(dpi);
+            }
             h.view.preferred_height(width as f32 / scale)
         }) else {
             return;
@@ -949,6 +986,18 @@ extern "system" fn keyboard_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             }
             WM_APP_FULLSCREEN => {
                 set_fullscreen(wp.0 != 0);
+                LRESULT(0)
+            }
+            WM_APP_BALL => {
+                if let Some(event) = crate::handle::decode(wp, lp)
+                    && let Some(req) = with(|h| {
+                        let mut ctl = h.control();
+                        let r = h.app.on_ball(event, &mut *h.view, &mut ctl);
+                        h.process(ctl, r)
+                    })
+                {
+                    apply(req);
+                }
                 LRESULT(0)
             }
             WM_APP_EVENT => {

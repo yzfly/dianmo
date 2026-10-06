@@ -46,6 +46,27 @@ pub enum UiAction {
     /// The user switched the colour theme from the layout menu (already applied to the view).
     /// The host only needs to remember it (settings).
     ThemeChanged(ThemeKind),
+    /// The 电脑键盘 layout was turned on or off (already applied). The host remembers it.
+    PcKeyboard(bool),
+    /// Paste this clipboard entry (card tapped). Short text is typed (`Action::Text`); long text
+    /// goes through the system clipboard and Ctrl+V.
+    Paste(String),
+    /// Pin or unpin a clipboard entry (pinned entries are kept on disk).
+    PinClip { id: u64, pinned: bool },
+    DeleteClip(u64),
+    /// Remove every unpinned clipboard entry.
+    ClearClips,
+    /// A 复制 button was pressed (Ctrl+C sent). If the clipboard does not change shortly, nothing
+    /// was selected: the host calls `KeyboardView::enter_select_mode`.
+    CheckCopied,
+}
+
+/// One clipboard history entry, as the host passes it to the view (most recent first).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipItem {
+    pub id: u64,
+    pub text: String,
+    pub pinned: bool,
 }
 
 /// What the host should do after an event.

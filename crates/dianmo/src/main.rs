@@ -20,6 +20,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 mod basic;
+mod clipboard;
 #[cfg(windows)]
 mod elevate;
 mod engine;
@@ -30,6 +31,8 @@ mod settings;
 mod app;
 #[cfg(windows)]
 mod platform;
+#[cfg(windows)]
+mod voice;
 
 #[cfg(not(windows))]
 fn main() {

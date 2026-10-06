@@ -27,6 +27,10 @@ pub struct Settings {
     pub height: f32,
     /// Pop up on touch in an edit field / hide when touching elsewhere.
     pub auto_show: bool,
+    /// Wide (landscape) layout: two-column edit area on the right (撤销、复制、粘贴 …).
+    pub edit_area: bool,
+    /// The 电脑键盘 (pass-through PC keyboard) layout was showing last time.
+    pub pc_keyboard: bool,
     /// System touch keyboard settings to restore on exit: `(EnableDesktopModeAutoInvoke,
     /// TouchKeyboardTapInvoke)`. `Some` while Dianmo runs (or after it crashed).
     pub saved_tabtip: Option<(SavedDword, SavedDword)>,
@@ -42,6 +46,8 @@ impl Default for Settings {
             autostart: false,
             height: 1.0,
             auto_show: true,
+            edit_area: true,
+            pc_keyboard: false,
             saved_tabtip: None,
         }
     }
@@ -104,6 +110,8 @@ impl Settings {
                 "appbar" => s.appbar = parse_bool(v).unwrap_or(s.appbar),
                 "autostart" => s.autostart = parse_bool(v).unwrap_or(s.autostart),
                 "auto_show" => s.auto_show = parse_bool(v).unwrap_or(s.auto_show),
+                "edit_area" => s.edit_area = parse_bool(v).unwrap_or(s.edit_area),
+                "pc_keyboard" => s.pc_keyboard = parse_bool(v).unwrap_or(s.pc_keyboard),
                 "height" => {
                     if let Ok(h) = v.parse::<f32>()
                         && h.is_finite()
@@ -131,6 +139,8 @@ impl Settings {
         let _ = writeln!(out, "appbar={}", self.appbar);
         let _ = writeln!(out, "autostart={}", self.autostart);
         let _ = writeln!(out, "auto_show={}", self.auto_show);
+        let _ = writeln!(out, "edit_area={}", self.edit_area);
+        let _ = writeln!(out, "pc_keyboard={}", self.pc_keyboard);
         let _ = writeln!(out, "height={}", self.height);
         if let Some((a, b)) = self.saved_tabtip {
             out.push_str("# 点墨运行期间替换掉的系统触摸键盘设置，退出时恢复\n");
@@ -170,6 +180,8 @@ mod tests {
             autostart: true,
             height: 1.25,
             auto_show: false,
+            edit_area: false,
+            pc_keyboard: true,
             saved_tabtip: Some((None, Some(1))),
         };
         assert_eq!(Settings::parse(&s.serialize()), s);
@@ -184,6 +196,10 @@ mod tests {
         assert_eq!(s.theme, ThemeKind::Light);
         assert_eq!(s.height, 1.5);
         assert!(!s.chinese);
+        assert!(s.edit_area, "default on");
+        assert!(!Settings::parse("edit_area=off").edit_area);
+        assert!(!s.pc_keyboard, "default off");
+        assert!(Settings::parse("pc_keyboard=1").pc_keyboard);
         assert_eq!(s.saved_tabtip, None);
         // Half a saved pair is ignored.
         assert_eq!(Settings::parse("saved_desktop_mode_auto_invoke=0\n").saved_tabtip, None);

@@ -6,22 +6,35 @@
 //! posted to the UI thread with [`HostProxy::post`] (`App::on_event` gets a `Box<dyn Any>` that
 //! downcasts to `FocusEvent`).
 //!
-//! "Was it a touch?" comes from a low-level mouse hook on the same thread: mouse events Windows
-//! synthesizes from touch/pen carry the `MI_WP_SIGNATURE` (0xFF515700) in `dwExtraInfo`. The
-//! hook only stores a timestamp; it never calls UI Automation (a blocked hook stalls the whole
-//! system's mouse). The hook also covers tapping a field that already has focus (no focus event):
-//! a touch released inside the last focused editable element re-sends `Editable { by_touch }`.
+//! "Was it a touch?" comes from two sources on the same thread:
+//! - a low-level mouse hook: mouse events Windows synthesizes from touch/pen carry the
+//!   `MI_WP_SIGNATURE` (0xFF515700) in `dwExtraInfo` (Win32 apps, Explorer, XAML);
+//! - Raw Input from HID touch screens ([`rawtouch`], `RIDEV_INPUTSINK`): contact down/up with
+//!   screen positions, also for apps that take `WM_POINTER` themselves and never get synthesized
+//!   mouse events (Chromium/Edge/Electron). Messages arrive only while a finger is down.
+//!
+//! Neither ever calls UI Automation or another process (a blocked hook stalls the whole system's
+//! mouse). Both cover tapping a field that already has focus (no focus event): a touch released
+//! inside the focused editable element re-sends `Editable { by_touch }`; one released on the
+//! taskbar while the taskbar already has focus re-sends `NotEditable { by_touch }`.
+//!
+//! Interacting with our own tray icon moves focus to the taskbar; that focus change is not
+//! reported (it is the 点墨 UI, like our own windows), so opening the tray menu doesn't hide the
+//! keyboard.
 //!
 //! Nothing polls: the thread sleeps in `GetMessage`, UIA calls the handler on its own threads.
 //! With `DIANMO_FOCUS_LOG=<file>` every focus event and its raw properties are logged.
 
+mod rawtouch;
+
 use std::fs::File;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, VARIANT_FALSE, WPARAM};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
     CoUninitialize, SAFEARRAY,
@@ -44,12 +57,13 @@ use windows::Win32::UI::Accessibility::{
     UIA_ValueIsReadOnlyPropertyId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CURSORINFO, CallNextHookEx, DispatchMessageW, GetCursorInfo, GetCursorPos, GWL_STYLE, GetClassNameW, GetMessageW, GetParent,
+    CURSORINFO, CallNextHookEx, DispatchMessageW, FindWindowW, GetClientRect, GetForegroundWindow, GetWindowRect, GetCursorInfo, GetCursorPos, GWL_STYLE, GetClassNameW, GetMessageW, GetParent,
     GetWindowLongW, GetWindowThreadProcessId, HHOOK, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW,
     PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_QUIT,
+    WM_RBUTTONDOWN,
     WindowFromPoint,
 };
-use windows::core::{BSTR, Interface, Ref, Result, implement};
+use windows::core::{BSTR, Interface, Ref, Result, implement, w};
 
 use crate::clock::now_ms;
 use crate::host::HostProxy;
@@ -105,7 +119,9 @@ impl std::fmt::Debug for FocusWatcher {
 }
 
 /// Starts watching focus on a background MTA thread; events go to `App::on_event` through
-/// `proxy`. Also posts one event for the element focused right now (`by_touch: false`).
+/// `proxy`. The first event is always the element focused right now, with `by_touch: false`
+/// (focus changes UIA reports while the handler is being registered are dropped, and touches
+/// from before the start never count).
 /// Returns once the UIA handler and the touch hook are installed (typically tens of ms).
 pub fn start_focus_watcher(proxy: HostProxy) -> Result<FocusWatcher> {
     let (tx, rx) = mpsc::channel::<Result<u32>>();
@@ -128,35 +144,139 @@ pub fn start_focus_watcher(proxy: HostProxy) -> Result<FocusWatcher> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Touch tracking (low-level mouse hook)
+// Touch tracking (low-level mouse hook + raw input, both on the watcher thread)
 
 const MI_WP_SIGNATURE: usize = 0xFF51_5700;
 const SIGNATURE_MASK: usize = 0xFFFF_FF00;
 
-/// `now_ms()` of the last touch/pen contact (down or up); 0 = never.
+/// `now_ms()` of the last touch/pen contact (down or up) outside our own windows; 0 = never.
 static LAST_TOUCH_MS: AtomicU64 = AtomicU64::new(0);
+/// `now_ms()` of the last mouse button press that did *not* come from touch/pen; 0 = never.
+static LAST_MOUSE_MS: AtomicU64 = AtomicU64::new(0);
+/// Screen position (packed, see [`pack`]) and `now_ms()` of the last press of any kind (mouse
+/// button, touch or pen contact), to tell what a focus change on the taskbar was about.
+static LAST_DOWN_PT: AtomicU64 = AtomicU64::new(0);
+static LAST_DOWN_MS: AtomicU64 = AtomicU64::new(0);
+/// `now_ms()` of the last re-sent event (a touch reaches us through the hook *and* raw input).
+static LAST_RETAP_MS: AtomicU64 = AtomicU64::new(0);
+/// `GetTickCount()` when the watcher started: input from before that never counts as a touch.
+static START_TICK: AtomicU32 = AtomicU32::new(0);
 /// Incremented on every touch down (one per tap), so a repeated focus event after a new tap is
 /// not swallowed by the de-duplication.
 static TOUCH_SEQ: AtomicU32 = AtomicU32::new(0);
 /// Context for the hook (the hook procedure has no user data).
 static HOOK_CTX: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
 
-/// Whether a touch/pen contact happened within [`TOUCH_WINDOW_MS`]. Two sources:
-/// - the hook's timestamp: mouse events synthesized from touch (Win32 apps, Explorer, XAML);
-/// - for apps that take `WM_POINTER` themselves (Chromium/Edge/Electron), where no mouse event is
-///   synthesized: the system cursor is *suppressed* (`CURSOR_SUPPRESSED`, Windows 8+) after
+fn pack(pt: POINT) -> u64 {
+    ((pt.x as u32 as u64) << 32) | pt.y as u32 as u64
+}
+
+fn unpack(v: u64) -> POINT {
+    POINT { x: (v >> 32) as u32 as i32, y: v as u32 as i32 }
+}
+
+fn record_down(pt: POINT) {
+    LAST_DOWN_PT.store(pack(pt), Ordering::Relaxed);
+    LAST_DOWN_MS.store(now_ms().max(1), Ordering::Relaxed);
+}
+
+/// Where the user last pressed (within `max_age_ms`), else the cursor position.
+fn last_press_point(max_age_ms: u64) -> POINT {
+    let t = LAST_DOWN_MS.load(Ordering::Relaxed);
+    if t != 0 && now_ms().saturating_sub(t) <= max_age_ms {
+        return unpack(LAST_DOWN_PT.load(Ordering::Relaxed));
+    }
+    let mut pt = POINT::default();
+    let _ = unsafe { GetCursorPos(&mut pt) };
+    pt
+}
+
+/// Whether a top-level window at `pt` belongs to this process (keyboard, edge handle, menus).
+fn own_window_at(pt: POINT, own_pid: u32) -> bool {
+    let mut pid = 0;
+    unsafe {
+        let hwnd = WindowFromPoint(pt);
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    pid == own_pid
+}
+
+/// Position and time of the last contact raw input saw go down.
+static LAST_RAW_DOWN_PT: AtomicU64 = AtomicU64::new(0);
+static LAST_RAW_DOWN_MS: AtomicU64 = AtomicU64::new(0);
+
+/// A touch/pen contact went down at `pt`, seen by raw input (`raw`) or the hook.
+fn touch_down(pt: POINT, raw: bool) {
+    if own_window_at(pt, unsafe { GetCurrentProcessId() }) {
+        // Typing on the keyboard isn't a touch on the app (our SendInput is excluded likewise).
+        return;
+    }
+    let now = now_ms().max(1);
+    LAST_TOUCH_MS.store(now, Ordering::Relaxed);
+    if raw {
+        LAST_RAW_DOWN_PT.store(pack(pt), Ordering::Relaxed);
+        LAST_RAW_DOWN_MS.store(now, Ordering::Relaxed);
+    } else {
+        // The mouse press Windows synthesizes for a touch comes up to a few hundred ms after
+        // raw input reported the contact: same tap, not a new one.
+        let r = unpack(LAST_RAW_DOWN_PT.load(Ordering::Relaxed));
+        let t = LAST_RAW_DOWN_MS.load(Ordering::Relaxed);
+        if t != 0 && now - t.min(now) <= 600 && (r.x - pt.x).abs() <= 24 && (r.y - pt.y).abs() <= 24 {
+            return;
+        }
+    }
+    TOUCH_SEQ.fetch_add(1, Ordering::Relaxed);
+    record_down(pt);
+}
+
+/// A touch/pen contact was released at `pt` (hook or raw input).
+fn touch_up(pt: POINT, source: &str) {
+    if let Ok(guard) = HOOK_CTX.try_lock()
+        && let Some(shared) = guard.as_ref()
+    {
+        if own_window_at(pt, shared.own_pid) {
+            return;
+        }
+        LAST_TOUCH_MS.store(now_ms().max(1), Ordering::Relaxed);
+        shared.touch_up(pt, source);
+    }
+}
+
+/// Writes to the focus log from the watcher thread (never blocks).
+fn log_line(line: std::fmt::Arguments) {
+    if let Ok(guard) = HOOK_CTX.try_lock()
+        && let Some(shared) = guard.as_ref()
+    {
+        shared.log(line);
+    }
+}
+
+/// Whether a touch/pen contact happened within [`TOUCH_WINDOW_MS`] (and after the watcher
+/// started). Sources:
+/// - touch down/up seen by the hook (synthesized mouse) or raw input;
+/// - for apps that take `WM_POINTER` themselves (Chromium/Edge/Electron) when raw input isn't
+///   available: the system cursor is *suppressed* (`CURSOR_SUPPRESSED`, Windows 8+) after
 ///   touch/pen input until the mouse moves again, and the last input event is recent (and was
-///   not our own `SendInput`). A physical key press right after a touch also counts as touch.
+///   not our own `SendInput`, nor a mouse click). A physical key press right after a touch also
+///   counts as touch.
 fn touched_recently() -> bool {
+    let now = now_ms();
     let t = LAST_TOUCH_MS.load(Ordering::Relaxed);
-    if t != 0 && now_ms().saturating_sub(t) <= TOUCH_WINDOW_MS {
+    if t != 0 && now.saturating_sub(t) <= TOUCH_WINDOW_MS {
         return true;
+    }
+    // A mouse click is the newest press: the cursor may still be suppressed from an earlier
+    // touch (clicking doesn't move the mouse), but this wasn't a touch.
+    let m = LAST_MOUSE_MS.load(Ordering::Relaxed);
+    if m != 0 && m >= t && now.saturating_sub(m) <= TOUCH_WINDOW_MS {
+        return false;
     }
     let (suppressed, age) = touch_signals();
     suppressed && age <= TOUCH_WINDOW_MS as u32
 }
 
-/// (`CURSOR_SUPPRESSED`, ms since the last input event of any kind).
+/// (`CURSOR_SUPPRESSED`, ms since the last input event of any kind). The age is `u32::MAX` when
+/// the last input was our own `SendInput` or happened before the watcher started.
 fn touch_signals() -> (bool, u32) {
     const CURSOR_SUPPRESSED: u32 = 0x2;
     unsafe {
@@ -171,6 +291,10 @@ fn touch_signals() -> (bool, u32) {
         if sent != 0 && (li.dwTime.wrapping_sub(sent) as i32).abs() <= 32 {
             return (false, u32::MAX);
         }
+        // E.g. the tap that launched us: not a reason to report the first focus as touched.
+        if (li.dwTime.wrapping_sub(START_TICK.load(Ordering::Relaxed)) as i32) < 0 {
+            return (suppressed, u32::MAX);
+        }
         (suppressed, GetTickCount().wrapping_sub(li.dwTime))
     }
 }
@@ -178,21 +302,84 @@ fn touch_signals() -> (bool, u32) {
 unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 {
         let msg = wp.0 as u32;
-        if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP {
+        if matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN) {
             let info = unsafe { &*(lp.0 as *const MSLLHOOKSTRUCT) };
-            if info.dwExtraInfo & SIGNATURE_MASK == MI_WP_SIGNATURE {
-                LAST_TOUCH_MS.store(now_ms().max(1), Ordering::Relaxed);
-                if msg == WM_LBUTTONDOWN {
-                    TOUCH_SEQ.fetch_add(1, Ordering::Relaxed);
-                } else if let Ok(guard) = HOOK_CTX.try_lock()
-                    && let Some(shared) = guard.as_ref()
-                {
-                    shared.touch_up(info.pt);
+            let touch = info.dwExtraInfo & SIGNATURE_MASK == MI_WP_SIGNATURE;
+            match (msg, touch) {
+                (WM_LBUTTONDOWN, true) => {
+                    rawtouch::calibrate(info.pt);
+                    touch_down(info.pt, false);
                 }
+                (WM_LBUTTONUP, true) => touch_up(info.pt, "hook"),
+                (WM_RBUTTONDOWN, true) => record_down(info.pt), // press-and-hold
+                (WM_LBUTTONDOWN | WM_RBUTTONDOWN, false) => {
+                    LAST_MOUSE_MS.store(now_ms().max(1), Ordering::Relaxed);
+                    record_down(info.pt);
+                }
+                _ => {}
             }
         }
     }
     unsafe { CallNextHookEx(None, code, wp, lp) }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Taskbar and our tray icon
+
+/// Process id of the shell (Explorer, owner of the taskbar); 0 if there is no taskbar.
+fn shell_pid() -> u32 {
+    let mut pid = 0;
+    unsafe {
+        if let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) {
+            GetWindowThreadProcessId(tray, Some(&mut pid));
+        }
+    }
+    pid
+}
+
+/// Window classes of Explorer's taskbars.
+fn is_taskbar_class(class: &str) -> bool {
+    matches!(class, "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
+}
+
+/// The notification-area window at `pt` (tray icons, chevron, clock; the hidden-icons flyout):
+/// `Some(is_chevron)`, or `None` elsewhere. Only window-manager calls (no messages sent).
+fn notification_area_at(pt: POINT) -> Option<bool> {
+    let hwnd = unsafe { WindowFromPoint(pt) };
+    if hwnd.is_invalid() {
+        return None;
+    }
+    let chevron = win_class(hwnd) == "Button";
+    let mut h = hwnd;
+    for _ in 0..5 {
+        match win_class(h).as_str() {
+            "TrayNotifyWnd" => return Some(chevron),
+            "NotifyIconOverflowWindow" => return Some(false),
+            "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" => return None,
+            _ => {}
+        }
+        match unsafe { GetParent(h) } {
+            Ok(p) if !p.is_invalid() => h = p,
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Whether a press at `pt` was on our own tray icon, or on the "show hidden icons" chevron while
+/// our icon sits in the hidden-icons flyout (the way to reach it). Asks the shell for the icon's
+/// position (a cross-process call: UIA threads only, never the hook thread).
+fn on_own_tray_icon(pt: POINT) -> bool {
+    let Some(chevron) = notification_area_at(pt) else { return false };
+    match crate::tray::icon_rect() {
+        Some(rc) => {
+            let inside = pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
+            // The icon's rect is in the flyout while that is open; on the taskbar otherwise.
+            inside || (chevron && !crate::tray::icon_on_taskbar(rc))
+        }
+        // No rect: the icon is in the closed hidden-icons flyout.
+        None => chevron,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -205,11 +392,16 @@ struct State {
     last_seq: u32,
     /// Bounding rectangle (screen px) and kind of the focused editable element.
     field: Option<(RECT, FieldKind)>,
+    /// Bounding rectangle of the taskbar when it has focus (tapping it again re-sends
+    /// `NotEditable`: the focus doesn't change, but the user tapped outside any text field).
+    taskbar: Option<RECT>,
 }
 
 struct Shared {
     proxy: HostProxy,
     own_pid: u32,
+    /// Set once the initial focus event was posted; earlier handler calls are dropped.
+    ready: AtomicBool,
     state: Mutex<State>,
     log: Option<Mutex<File>>,
 }
@@ -223,28 +415,34 @@ impl Shared {
         }
     }
 
-    /// From the hook thread: a touch was released at `pt`. Re-sends `Editable` when it landed in
-    /// the field that already has focus (tapping a focused field doesn't move focus).
-    fn touch_up(&self, pt: POINT) {
+    /// From the watcher thread (hook or raw input): a touch was released at `pt`, not on our own
+    /// windows. Tapping the focused field (or the focused taskbar) again doesn't move focus, so
+    /// re-send its event. Must not block: no UIA, no cross-process calls.
+    fn touch_up(&self, pt: POINT, source: &str) {
+        let inside = |rc: &RECT| pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
         let Ok(mut st) = self.state.try_lock() else { return };
-        let Some((rc, kind)) = st.field else { return };
-        if pt.x < rc.left || pt.x >= rc.right || pt.y < rc.top || pt.y >= rc.bottom {
+        let ev = match (st.field, st.taskbar) {
+            (Some((rc, kind)), _) if inside(&rc) => FocusEvent::Editable { kind, by_touch: true },
+            // Not the notification area: our tray icon (and the menu it opens) must not hide us.
+            (None, Some(rc)) if inside(&rc) && notification_area_at(pt).is_none() => {
+                FocusEvent::NotEditable { by_touch: true }
+            }
+            _ => return,
+        };
+        // The focus event for this very tap already said so (a tap that moved focus).
+        let seq = TOUCH_SEQ.load(Ordering::Relaxed);
+        if st.last == Some(ev) && st.last_seq == seq {
             return;
         }
-        // Not when the touch was on our own windows (e.g. the keyboard over a tall text area).
-        let mut pid = 0;
-        unsafe {
-            let hwnd = WindowFromPoint(pt);
-            GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        }
-        if pid == self.own_pid {
+        // The same release often arrives twice (synthesized mouse and raw input).
+        let now = now_ms();
+        if now.saturating_sub(LAST_RETAP_MS.swap(now, Ordering::Relaxed)) < 250 {
             return;
         }
-        let ev = FocusEvent::Editable { kind, by_touch: true };
         st.last = Some(ev);
-        st.last_seq = TOUCH_SEQ.load(Ordering::Relaxed);
+        st.last_seq = seq;
         drop(st);
-        self.log(format_args!("retap {ev:?} at ({},{})", pt.x, pt.y));
+        self.log(format_args!("retap({source}) {ev:?} at ({},{})", pt.x, pt.y));
         self.proxy.post(ev);
     }
 
@@ -254,7 +452,38 @@ impl Shared {
             return;
         }
         let by_touch = !initial && touched_recently();
-        let kind = classify(el, &p);
+        // Consoles (conhost, Windows Terminal) report their text area and their window in turn,
+        // in any order, and taps inside don't move focus: the whole window counts as one field.
+        let console = console_window(&p);
+        let kind = if console.is_some() { Some(FieldKind::Text) } else { classify(el, &p) };
+        if kind.is_none() && !initial && p.pid == shell_pid() {
+            // Our tray icon (tap = show/hide, press-and-hold = menu) focuses the taskbar: that's
+            // our own UI, not leaving the text field.
+            let pt = last_press_point(1500);
+            if on_own_tray_icon(pt) {
+                self.log(format_args!("tray icon at ({},{}), ignored: {}", pt.x, pt.y, p.describe()));
+                return;
+            }
+            if self.log.is_some() {
+                let mut chain = Vec::new();
+                let mut h = unsafe { WindowFromPoint(pt) };
+                for _ in 0..6 {
+                    if h.is_invalid() {
+                        break;
+                    }
+                    chain.push(win_class(h));
+                    h = unsafe { GetParent(h) }.unwrap_or_default();
+                }
+                self.log(format_args!(
+                    "shell focus, press at ({},{}) on {:?}, notification area {:?}, icon {:?}",
+                    pt.x,
+                    pt.y,
+                    chain,
+                    notification_area_at(pt),
+                    crate::tray::icon_rect().map(|r| (r.left, r.top, r.right, r.bottom))
+                ));
+            }
+        }
         let ev = match kind {
             Some(kind) => FocusEvent::Editable { kind, by_touch },
             None => FocusEvent::NotEditable { by_touch },
@@ -273,20 +502,27 @@ impl Shared {
             st.last_id = id;
             st.last = Some(ev);
             st.last_seq = seq;
-            st.field = kind.map(|k| (p.rect, k));
+            st.field = kind.map(|k| (console.unwrap_or(p.rect), k));
+            st.taskbar = (kind.is_none() && is_taskbar_class(&p.class)).then_some(p.rect);
         }
         if self.log.is_some() {
             let (suppressed, age) = touch_signals();
             let mut cur = POINT::default();
             let _ = unsafe { GetCursorPos(&mut cur) };
+            let age_of = |t: u64| if t == 0 { -1 } else { now_ms().saturating_sub(t) as i64 };
+            let down = unpack(LAST_DOWN_PT.load(Ordering::Relaxed));
             self.log(format_args!(
-                "{ev:?} {} | hook_touch_age={} suppressed={} input_age={} cursor=({},{})",
+                "{ev:?} {} | touch_age={} mouse_age={} suppressed={} input_age={} cursor=({},{}) down=({},{}) down_age={}",
                 p.describe(),
-                now_ms().saturating_sub(LAST_TOUCH_MS.load(Ordering::Relaxed)),
+                age_of(LAST_TOUCH_MS.load(Ordering::Relaxed)),
+                age_of(LAST_MOUSE_MS.load(Ordering::Relaxed)),
                 suppressed as u8,
-                age,
+                age as i64,
                 cur.x,
-                cur.y
+                cur.y,
+                down.x,
+                down.y,
+                age_of(LAST_DOWN_MS.load(Ordering::Relaxed)),
             ));
         }
         self.proxy.post(ev);
@@ -480,6 +716,42 @@ fn kind_of(p: &Props) -> FieldKind {
     FieldKind::Text
 }
 
+/// Top-level window classes of consoles: conhost (PowerShell, cmd) and Windows Terminal.
+fn is_console_class(class: &str) -> bool {
+    matches!(class, "ConsoleWindowClass" | "CASCADIA_HOSTING_WINDOW_CLASS")
+}
+
+/// If the focused element is a console window or lies inside the foreground console window: that
+/// window's client area (screen px).
+fn console_window(p: &Props) -> Option<RECT> {
+    unsafe {
+        let own = HWND(p.hwnd as *mut _);
+        let hwnd = if p.hwnd != 0 && is_console_class(&win_class(own)) {
+            own
+        } else {
+            let fg = GetForegroundWindow();
+            if fg.is_invalid() || !is_console_class(&win_class(fg)) {
+                return None;
+            }
+            let mut wr = RECT::default();
+            GetWindowRect(fg, &mut wr).ok()?;
+            let r = p.rect;
+            let inside = r.left >= wr.left && r.top >= wr.top && r.right <= wr.right && r.bottom <= wr.bottom;
+            if !inside || r.right <= r.left {
+                return None;
+            }
+            fg
+        };
+        let mut rc = RECT::default();
+        GetClientRect(hwnd, &mut rc).ok()?;
+        let mut tl = POINT { x: rc.left, y: rc.top };
+        let mut br = POINT { x: rc.right, y: rc.bottom };
+        let _ = ClientToScreen(hwnd, &mut tl);
+        let _ = ClientToScreen(hwnd, &mut br);
+        Some(RECT { left: tl.x, top: tl.y, right: br.x, bottom: br.y })
+    }
+}
+
 fn win_class(hwnd: HWND) -> String {
     let mut buf = [0u16; 64];
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
@@ -530,6 +802,12 @@ struct FocusHandler {
 impl IUIAutomationFocusChangedEventHandler_Impl for FocusHandler_Impl {
     fn HandleFocusChangedEvent(&self, sender: Ref<IUIAutomationElement>) -> Result<()> {
         if let Ok(el) = sender.ok() {
+            if !self.shared.ready.load(Ordering::Acquire) {
+                // Raised while registering (often for a stale element); the initial event that
+                // follows reports what has focus now.
+                self.shared.log(format_args!("early focus event dropped"));
+                return Ok(());
+            }
             self.shared.on_focus(el, false);
         }
         Ok(())
@@ -551,6 +829,7 @@ fn watcher_thread(proxy: HostProxy, ready: mpsc::Sender<Result<u32>>) {
         // Create the message queue before reporting the thread id (PostThreadMessage needs it).
         let mut msg = MSG::default();
         let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+        START_TICK.store(GetTickCount(), Ordering::Relaxed);
         let com = CoInitializeEx(None, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
         if com.is_err() {
             let _ = ready.send(Err(com.into()));
@@ -569,7 +848,13 @@ fn watcher_thread(proxy: HostProxy, ready: mpsc::Sender<Result<u32>>) {
             let log = std::env::var_os("DIANMO_FOCUS_LOG")
                 .and_then(|p| File::options().create(true).append(true).open(p).ok())
                 .map(Mutex::new);
-            let shared = Arc::new(Shared { proxy, own_pid: GetCurrentProcessId(), state: Mutex::default(), log });
+            let shared = Arc::new(Shared {
+                proxy,
+                own_pid: GetCurrentProcessId(),
+                ready: AtomicBool::new(false),
+                state: Mutex::default(),
+                log,
+            });
             let handler: IUIAutomationFocusChangedEventHandler = FocusHandler { shared: shared.clone() }.into();
             uia.AddFocusChangedEventHandler(&cache, &handler)?;
             Ok((uia, cache, handler, shared))
@@ -590,17 +875,21 @@ fn watcher_thread(proxy: HostProxy, ready: mpsc::Sender<Result<u32>>) {
         if let Ok(el) = uia.GetFocusedElementBuildCache(&cache) {
             shared.on_focus(&el, true);
         }
+        shared.ready.store(true, Ordering::Release);
         *HOOK_CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(shared.clone());
         let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), GetModuleHandleW(None).ok().map(Into::into), 0)
             .unwrap_or_else(|e| {
                 shared.log(format_args!("mouse hook failed: {e}"));
                 HHOOK::default()
             });
+        let raw = rawtouch::RawTouch::start();
+        shared.log(format_args!("raw touch input: {}", if raw.is_some() { "registered" } else { "unavailable" }));
 
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             DispatchMessageW(&msg);
         }
 
+        drop(raw);
         if !hook.is_invalid() {
             let _ = UnhookWindowsHookEx(hook);
         }

@@ -9,12 +9,13 @@ use dianmo_core::{Action, Engine, InputController, Schema};
 use dianmo_ui::{InputState, KeyboardView, Response, ThemeKind, UiAction, View};
 use dianmo_win::tabtip::SystemKeyboardSettings;
 use dianmo_win::{
-    App, FieldKind, FocusEvent, FocusWatcher, HostControl, SendInputSink, TrayItem, start_focus_watcher,
+    App, FieldKind, FocusEvent, FocusWatcher, HostControl, SendInputSink, TrayItem, now_ms, start_focus_watcher,
     start_voice_typing,
 };
 
 #[cfg(feature = "rime")]
 use crate::basic::BasicEngine;
+use crate::clipboard::{self, ClipEvent, ClipStore, ClipboardWatcher};
 use crate::engine::AnyEngine;
 use crate::log;
 use crate::platform;
@@ -40,7 +41,21 @@ pub struct DianmoApp {
     showing_for_focus: bool,
     manual_show_at: Option<Instant>,
     tray_shown: Vec<TrayItem>,
+    /// Clipboard history (TODO #32); pinned entries live in `clips_path`.
+    clips: ClipStore,
+    clips_path: PathBuf,
+    clip_watch: Option<ClipboardWatcher>,
+    /// Clipboard changes seen so far (to tell whether a 复制 copied anything).
+    clip_updates: u64,
+    /// A password field has focus: clipboard changes are not recorded.
+    password_focus: bool,
 }
+
+/// Posted to ourselves [`COPY_CHECK_MS`] after a 复制 button: the clipboard update count then.
+struct CopyCheck(u64);
+
+/// After 复制, wait this long for the clipboard to change before deciding nothing was selected.
+const COPY_CHECK_MS: u64 = 350;
 
 /// librime starts this long after the window (see `start_rime`).
 #[cfg(feature = "rime")]
@@ -72,6 +87,8 @@ impl DianmoApp {
     /// `rime`: librime options to start in the background (the window comes up with the stand-in
     /// engine first; librime takes 150–700 ms to start), or why it can't be used.
     pub fn new(engine: AnyEngine, rime: RimeSetup, settings: Settings, settings_path: PathBuf) -> Self {
+        // The data directory (`--instance` aware): clips.txt lives next to settings.ini.
+        let clips_path = settings_path.with_file_name("clips.txt");
         let mut ctl = InputController::new(engine, SendInputSink::new());
         ctl.handle(Action::SetSchema(settings.schema));
         if !settings.chinese {
@@ -99,6 +116,76 @@ impl DianmoApp {
             showing_for_focus: false,
             manual_show_at: None,
             tray_shown: Vec::new(),
+            clips: ClipStore::load(&clips_path),
+            clips_path,
+            clip_watch: None,
+            clip_updates: 0,
+            password_focus: false,
+        }
+    }
+
+    fn save_clips(&self) {
+        if let Err(e) = self.clips.save_pinned(&self.clips_path) {
+            log!("saving pinned clips failed: {e}");
+        }
+    }
+
+    fn push_clips(&self, view: &mut dyn View) -> Response {
+        let changed = view
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<KeyboardView>())
+            .is_some_and(|kv| kv.set_clips(self.clips.items().to_vec()));
+        if changed { Response::repaint() } else { Response::none() }
+    }
+
+    fn on_clip_event(&mut self, ev: ClipEvent, view: &mut dyn View, host: &mut HostControl) -> Response {
+        let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) else { return Response::none() };
+        match ev {
+            ClipEvent::Text(text) => {
+                self.clip_updates += 1;
+                if self.password_focus {
+                    // Copied from / while in a password field: don't keep or show it.
+                    kv.set_paste_preview(None);
+                    return Response::repaint();
+                }
+                kv.set_paste_preview(Some(&text));
+                if self.clips.add(text) {
+                    kv.set_clips(self.clips.items().to_vec());
+                }
+                if host.is_visible() {
+                    return kv.notify_copied(now_ms());
+                }
+                Response::repaint()
+            }
+            ClipEvent::NoText | ClipEvent::Private => {
+                self.clip_updates += 1;
+                if kv.set_paste_preview(None) { Response::repaint() } else { Response::none() }
+            }
+            ClipEvent::PasteFailed(text) => {
+                log!("pasting through the clipboard failed; typing {} chars", text.chars().count());
+                self.input(Action::Text(text), view)
+            }
+        }
+    }
+
+    /// Pastes a clipboard entry: typed with Unicode `SendInput` (the clipboard is untouched);
+    /// long or multi-line text goes through the clipboard and Ctrl+V (typing a newline would press
+    /// Enter, which sends the message in chat apps).
+    fn paste(&mut self, text: String, view: &mut dyn View) -> Response {
+        let long = text.chars().count() > clipboard::TYPE_MAX_CHARS || text.contains('\n');
+        match &self.clip_watch {
+            Some(w) if long => {
+                w.paste(text);
+                Response::none()
+            }
+            _ => self.input(Action::Text(text), view),
+        }
+    }
+
+    fn start_clipboard(&mut self, host: &mut HostControl) {
+        match clipboard::start(host.proxy()) {
+            Ok(w) => self.clip_watch = Some(w),
+            Err(e) => log!("clipboard watcher failed to start (no clipboard history): {e}"),
         }
     }
 
@@ -143,7 +230,22 @@ impl DianmoApp {
         Response::repaint()
     }
 
+    fn set_pc_keyboard(&mut self, on: bool, view: &mut dyn View) -> Response {
+        if on && self.ctl.is_composing() {
+            self.input(Action::Space, view);
+        }
+        if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
+            kv.set_pc_keyboard(on);
+        }
+        if self.settings.pc_keyboard != on {
+            self.settings.pc_keyboard = on;
+            self.save();
+        }
+        Response::repaint()
+    }
+
     fn set_schema(&mut self, schema: Schema, view: &mut dyn View) -> Response {
+        self.set_pc_keyboard(false, view);
         if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
             kv.show_letters();
         }
@@ -247,24 +349,36 @@ impl DianmoApp {
 }
 
 impl App for DianmoApp {
-    fn on_start(&mut self, _view: &mut dyn View, host: &mut HostControl) -> Response {
+    fn on_start(&mut self, view: &mut dyn View, host: &mut HostControl) -> Response {
         platform::set_proxy(host.proxy());
+        if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
+            kv.set_edit_area(self.settings.edit_area);
+            kv.set_pc_keyboard(self.settings.pc_keyboard);
+            kv.set_clips(self.clips.items().to_vec());
+        }
+        self.start_clipboard(host);
         #[cfg(feature = "rime")]
         self.start_rime(host);
         self.set_focus_watch(self.settings.auto_show, host);
         self.refresh_tray(host);
-        Response::none()
+        Response::repaint()
     }
 
     fn on_action(&mut self, action: UiAction, view: &mut dyn View, host: &mut HostControl) -> Response {
         let r = self.action(action, view, host);
         self.refresh_tray(host);
+        if keymap_wanted() && host.is_visible() {
+            dump_keymap(view);
+        }
         r
     }
 
     fn on_event(&mut self, event: Box<dyn Any + Send>, view: &mut dyn View, host: &mut HostControl) -> Response {
         let r = self.event(event, view, host);
         self.refresh_tray(host);
+        if keymap_wanted() && host.is_visible() {
+            dump_keymap(view);
+        }
         r
     }
 
@@ -273,8 +387,12 @@ impl App for DianmoApp {
             dump_keymap(view);
             self.manual_show_at = if std::mem::take(&mut self.showing_for_focus) { None } else { Some(Instant::now()) };
         } else {
-            // A manual hide cancels a pending auto-hide; nothing else to do.
+            // A manual hide cancels a pending auto-hide.
             self.focus_seq += 1;
+            // Selection mode, the clipboard bar and toasts belong to the last text field.
+            if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
+                kv.reset_transient();
+            }
         }
         self.refresh_tray(host);
         if !visible && self.ctl.is_composing() {
@@ -293,6 +411,21 @@ impl DianmoApp {
     fn event(&mut self, event: Box<dyn Any + Send>, view: &mut dyn View, host: &mut HostControl) -> Response {
         if let Some(ev) = event.downcast_ref::<FocusEvent>() {
             return self.on_focus(*ev, view, host);
+        }
+        let event = match event.downcast::<ClipEvent>() {
+            Ok(ev) => return self.on_clip_event(*ev, view, host),
+            Err(e) => e,
+        };
+        if let Some(CopyCheck(n)) = event.downcast_ref::<CopyCheck>() {
+            // 复制 did not change the clipboard: nothing was selected, so offer selection mode.
+            if *n == self.clip_updates && self.clip_watch.is_some() && host.is_visible() {
+                if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
+                    if kv.enter_select_mode() {
+                        return Response::repaint();
+                    }
+                }
+            }
+            return Response::none();
         }
         #[cfg(feature = "rime")]
         let event = match event.downcast::<RimeReady>() {
@@ -337,17 +470,64 @@ impl DianmoApp {
                 }
                 Response::none()
             }
+            UiAction::PcKeyboard(on) => {
+                if self.settings.pc_keyboard != on {
+                    self.settings.pc_keyboard = on;
+                    self.save();
+                }
+                Response::none()
+            }
+            UiAction::Paste(text) => self.paste(text, view),
+            UiAction::PinClip { id, pinned } => {
+                if self.clips.pin(id, pinned) {
+                    self.save_clips();
+                }
+                self.push_clips(view)
+            }
+            UiAction::DeleteClip(id) => {
+                if self.clips.delete(id) {
+                    self.save_clips();
+                }
+                self.push_clips(view)
+            }
+            UiAction::ClearClips => {
+                self.clips.clear_unpinned();
+                self.push_clips(view)
+            }
+            UiAction::CheckCopied => {
+                let n = self.clip_updates;
+                let proxy = host.proxy();
+                let _ = std::thread::Builder::new().name("dianmo-copycheck".into()).stack_size(64 * 1024).spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(COPY_CHECK_MS));
+                    proxy.post(CopyCheck(n));
+                });
+                Response::none()
+            }
         }
     }
 }
 
+fn keymap_wanted() -> bool {
+    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WANTED.get_or_init(|| std::env::var_os("DIANMO_KEYMAP").is_some())
+}
+
 /// Test hook: with `DIANMO_KEYMAP=<file>`, writes `name x y` (DIPs, window coordinates) for the
-/// visible keys each time the keyboard is shown, so GUI tests on the Surface can tap real keys.
+/// visible keys each time the keyboard is shown or changes, so GUI tests on the Surface can tap
+/// real keys.
 fn dump_keymap(view: &mut dyn View) {
     let Some(path) = std::env::var_os("DIANMO_KEYMAP") else { return };
     let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) else { return };
     let mut out = String::new();
-    let names = ["shift", "backspace", "enter", "space", "layout", "toggle", "expand", "voice", "hide", "123", "符号", "，", ",", "。"];
+    let names = [
+        "shift", "backspace", "enter", "space", "layout", "toggle", "expand", "voice", "hide", "123", "符号", "，", ",", "。",
+        "ctrl", "alt", "win", "fn", "caps", "esc", "tab", "del", "left", "right", "up", "down", "home", "end", "undo",
+        "redo", "selectall", "copy", "paste", "cut", "delword", "clear", "pc", "symbols", "numbers", "pcmode", "pcback",
+        "prtsc", "select", "clipboard", "clipclose", "clearclips", "back", "sel_left", "sel_right", "sel_wordleft",
+        "sel_wordright", "sel_up", "sel_down", "sel_home", "sel_end", "sel_copy", "sel_cut", "sel_paste", "sel_delete",
+        "sel_done", "clip0", "clip1", "clip2", "clip3", "F1", "F4", "F5", "`", "-", "=", "[", "]", "\\", ";", "'", "/",
+        ".",
+    ];
     let letters: Vec<String> = ('a'..='z').chain('0'..='9').map(String::from).collect();
     for name in names.iter().copied().chain(letters.iter().map(String::as_str)) {
         if let Some((x, y)) = kv.key_center(name) {
@@ -360,6 +540,7 @@ fn dump_keymap(view: &mut dyn View) {
 impl Drop for DianmoApp {
     fn drop(&mut self) {
         self.focus = None;
+        self.clip_watch = None;
         #[cfg(feature = "rime")]
         {
             // Close the librime session, then let librime flush the user dictionary.
@@ -390,9 +571,11 @@ mod tray_id {
     pub const PINYIN: u32 = 1;
     pub const SHUANGPIN: u32 = 2;
     pub const T9: u32 = 3;
+    pub const PC: u32 = 4;
     pub const DARK: u32 = 10;
     pub const AUTO_SHOW: u32 = 11;
     pub const AUTOSTART: u32 = 12;
+    pub const EDIT_AREA: u32 = 13;
     pub const HEIGHT_BASE: u32 = 20; // + index into HEIGHTS
     pub const ABOUT: u32 = 30;
 }
@@ -412,12 +595,14 @@ impl DianmoApp {
             .map(|(i, (h, label))| cmd(tray_id::HEIGHT_BASE + i as u32, label, (self.settings.height - h).abs() < 0.01))
             .collect();
         vec![
-            cmd(tray_id::PINYIN, "全拼", schema == Schema::Pinyin),
-            cmd(tray_id::SHUANGPIN, "小鹤双拼", schema == Schema::Shuangpin),
-            cmd(tray_id::T9, "九宫格", schema == Schema::T9),
+            cmd(tray_id::PINYIN, "全拼", schema == Schema::Pinyin && !self.settings.pc_keyboard),
+            cmd(tray_id::SHUANGPIN, "小鹤双拼", schema == Schema::Shuangpin && !self.settings.pc_keyboard),
+            cmd(tray_id::T9, "九宫格", schema == Schema::T9 && !self.settings.pc_keyboard),
+            cmd(tray_id::PC, "电脑键盘（按键直通）", self.settings.pc_keyboard),
             TrayItem::Separator,
             cmd(tray_id::DARK, "深色主题", self.settings.theme == ThemeKind::Dark),
             TrayItem::Submenu { label: "键盘高度".to_owned(), items: heights },
+            cmd(tray_id::EDIT_AREA, "横屏显示编辑区（复制、粘贴…）", self.settings.edit_area),
             cmd(tray_id::AUTO_SHOW, "点输入框时自动弹出", self.settings.auto_show),
             cmd(tray_id::AUTOSTART, "开机自动启动", self.settings.autostart),
             TrayItem::Separator,
@@ -466,6 +651,9 @@ impl DianmoApp {
     }
 
     fn on_focus(&mut self, ev: FocusEvent, view: &mut dyn View, host: &mut HostControl) -> Response {
+        // No clipboard history while a password field has focus (needs the focus watcher, i.e.
+        // auto show on).
+        self.password_focus = matches!(ev, FocusEvent::Editable { kind: FieldKind::Password, .. });
         if !self.settings.auto_show {
             return Response::none();
         }
@@ -507,6 +695,10 @@ impl DianmoApp {
             tray_id::PINYIN => self.set_schema(Schema::Pinyin, view),
             tray_id::SHUANGPIN => self.set_schema(Schema::Shuangpin, view),
             tray_id::T9 => self.set_schema(Schema::T9, view),
+            tray_id::PC => {
+                let on = !self.settings.pc_keyboard;
+                self.set_pc_keyboard(on, view)
+            }
             tray_id::DARK => {
                 let next = if self.settings.theme == ThemeKind::Dark { ThemeKind::Light } else { ThemeKind::Dark };
                 self.set_theme(next, view)
@@ -520,6 +712,15 @@ impl DianmoApp {
             tray_id::AUTOSTART => {
                 self.set_autostart(!self.settings.autostart);
                 Response::none()
+            }
+            tray_id::EDIT_AREA => {
+                self.settings.edit_area = !self.settings.edit_area;
+                self.save();
+                let changed = view
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<KeyboardView>())
+                    .is_some_and(|kv| kv.set_edit_area(self.settings.edit_area));
+                if changed { Response::repaint() } else { Response::none() }
             }
             id if (tray_id::HEIGHT_BASE..tray_id::HEIGHT_BASE + HEIGHTS.len() as u32).contains(&id) => {
                 let h = HEIGHTS[(id - tray_id::HEIGHT_BASE) as usize].0;
