@@ -7,7 +7,7 @@
     <Root>\librime\rime.dll, rime_deployer.exe, rime_api.h   (librime 1.17.0, MSVC x64)
     <Root>\rime\                                             shared data dir = the app's data\rime
         *.schema.yaml, *.dict.yaml, cn_dicts\, en_dicts\, lua\, opencc\, default.yaml (+ our default.custom.yaml)
-        build\   <- filled by the prebuild step (probe.exe --prebuild), not by this script
+        build\   <- filled by stage.ps1 -Probe (probe.exe deploy), not by this script
 
   Idempotent: downloads are cached in <Root>\downloads (archives checked by SHA-256);
   rime-ice files are re-fetched only when the pinned commit changes.

@@ -125,6 +125,42 @@ pub fn raw_commit(display: &str) -> String {
     display.chars().filter(|&c| !is_delimiter(c)).collect()
 }
 
+/// Letter syllables locked by [`pick_input`] between `start` and the digit run at `run_start`
+/// (`"ni'426"` -> 1): candidate comments cover them too, so their first syllables are skipped.
+pub fn locked_syllables(input: &str, start: usize, run_start: usize) -> usize {
+    input.get(start..run_start).map_or(0, |s| s.split(is_delimiter).filter(|s| !s.is_empty()).count())
+}
+
+/// `comment` without its first `n` syllables (`"ni hao"`, 1 -> `"hao"`).
+pub fn skip_syllables(comment: &str, n: usize) -> &str {
+    let mut rest = comment.trim_start_matches(is_delimiter);
+    for _ in 0..n {
+        rest = rest.find(is_delimiter).map_or("", |i| &rest[i..]).trim_start_matches(is_delimiter);
+    }
+    rest
+}
+
+/// The input after locking the leading digits of the unconfirmed part (which starts at byte
+/// `start`) to `spelling`: `("64426", 0, "ni")` -> `"ni'426"`. `None` if `spelling`'s digits
+/// don't start the next digit run.
+pub fn pick_input(input: &str, start: usize, spelling: &str) -> Option<String> {
+    let digits = digits_of(spelling).filter(|d| !d.is_empty())?;
+    let run = digit_run(input, start);
+    if !input[run.clone()].starts_with(&digits) {
+        return None;
+    }
+    let cut = run.start + digits.len();
+    let rest = &input[cut..];
+    let mut out = String::with_capacity(input.len() + spelling.len() + 1);
+    out.push_str(&input[..run.start]);
+    out.push_str(spelling);
+    if !rest.is_empty() && !rest.starts_with(is_delimiter) {
+        out.push('\'');
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +206,20 @@ mod tests {
         assert_eq!(display_preedit("\u{4e00}426", 3, 6, Some("hao")), "\u{4e00}hao");
         assert_eq!(display_preedit("64426", 0, 5, None), "64426");
         assert_eq!(raw_commit("\u{4e00}ni hao"), "\u{4e00}nihao");
+    }
+
+    #[test]
+    fn picking() {
+        assert_eq!(pick_input("64426", 0, "ni").as_deref(), Some("ni'426"));
+        assert_eq!(pick_input("ni'426", 0, "hao").as_deref(), Some("ni'hao"));
+        assert_eq!(pick_input("64426", 2, "hao").as_deref(), Some("64hao"));
+        assert_eq!(pick_input("64426", 0, "m").as_deref(), Some("m'4426"));
+        assert_eq!(pick_input("64426", 0, "ha"), None);
+        assert_eq!(pick_input("ni", 0, "ni"), None);
+        assert_eq!(locked_syllables("ni'426", 0, 3), 1);
+        assert_eq!(locked_syllables("64426", 0, 0), 0);
+        assert_eq!(skip_syllables("ni hao", 1), "hao");
+        assert_eq!(skip_syllables("ni hao", 0), "ni hao");
+        assert_eq!(skip_syllables("ni", 2), "");
     }
 }

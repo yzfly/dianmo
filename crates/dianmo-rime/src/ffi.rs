@@ -212,7 +212,7 @@ pub struct RimeApi {
     pub get_prebuilt_data_dir_s: Unused,
     pub get_staging_dir_s: Unused,
     pub get_sync_dir_s: Unused,
-    pub highlight_candidate: Unused,
+    pub highlight_candidate: Option<unsafe extern "C" fn(RimeSessionId, usize) -> Bool>,
     pub highlight_candidate_on_current_page: Unused,
     pub change_page: Unused,
 }
@@ -232,6 +232,7 @@ pub unsafe fn rime_struct<T>() -> T {
 /// X11 keysyms librime understands (`rime/key_table.h`).
 pub mod keysym {
     pub const BACKSPACE: i32 = 0xff08;
+    pub const RETURN: i32 = 0xff0d;
     pub const ESCAPE: i32 = 0xff1b;
     pub const DELETE: i32 = 0xffff;
     pub const APOSTROPHE: i32 = 0x27;
