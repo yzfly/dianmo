@@ -1,0 +1,8 @@
+[package]
+name = "dianmo-core"
+description = "Input rules for Dianmo: engine/sink traits and the phone-style input state machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
