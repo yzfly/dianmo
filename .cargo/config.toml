@@ -1,0 +1,4 @@
+# Windows builds use the gnullvm toolchain + llvm-mingw (see docs/DESIGN.md §5).
+# Static CRT so the exe only depends on system DLLs (no libunwind.dll).
+[target.x86_64-pc-windows-gnullvm]
+rustflags = ["-C", "target-feature=+crt-static"]

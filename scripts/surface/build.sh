@@ -8,7 +8,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 exec 9>/tmp/dianmo-surface-build.lock; flock 9
 "$here/sync.sh" "$name"
 "$here/ps.sh" <<PS
-\$env:Path = "\$HOME\.cargo\bin;\$env:Path"
+\$env:Path = "\$HOME\.cargo\bin;C:\dev\tools\llvm-mingw\bin;\$env:Path"
 \$env:CARGO_TERM_COLOR = 'never'
 Set-Location 'C:\dev\dianmo-$name'
 cmd /c start '""' /belownormal /b /wait cargo $args -j 2 2>&1

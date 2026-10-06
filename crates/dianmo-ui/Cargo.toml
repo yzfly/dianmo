@@ -1,0 +1,9 @@
+[package]
+name = "dianmo-ui"
+description = "Dianmo keyboard UI: layouts, candidate bar, gestures; draws through the Canvas trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dianmo-core = { path = "../dianmo-core" }

@@ -50,52 +50,95 @@ Surface 拆掉键盘后只剩触屏，而 Windows 的输入体验是为实体键
 - 屏幕边缘有一个小把手，托盘也有图标，可以手动呼出。
 - 关掉 Windows 系统触摸键盘的自动弹出，避免两个键盘同时出来。
 
-## 3. 架构
+## 3. 技术选型（2026-10-06 调研后定稿）
 
-.NET 10 + WPF，x64。键盘是一个独立的置顶窗口，不是 TSF 输入法：组字在点墨自己的候选条里完成，上屏时用 `SendInput`（Unicode）把文字发给目标应用。这样不用注册 TSF，不用折腾系统输入法栈，部署简单。代价是：无法向管理员权限的窗口输入（UIPI 限制），以后可以用 uiAccess 签名解决。
+调研了两个方向（界面框架、输入架构），结论和理由如下；冒烟测试已在 Surface 上通过。
+
+**语言：Rust**。没有运行时，内存小，启动快，符合「Surface 性能有限」（TODO #10、#14）。
+
+**界面：原生 Win32 + Direct2D / DirectWrite（`windows` crate 0.62.2），动画以后用 DirectComposition**
+- 窗口过程完全自己写，不抢焦点的做法可控：`WS_EX_NOACTIVATE|WS_EX_TOPMOST|WS_EX_TOOLWINDOW`，`WM_MOUSEACTIVATE` 返回 `MA_NOACTIVATE`，`WM_POINTERACTIVATE` 返回 `PA_NOACTIVATE`，显示时用 `SW_SHOWNOACTIVATE`。
+- `WM_POINTER` 原生多点触控，两只拇指同时按也不会丢键。
+- DirectWrite 渲染中文清晰；`GetMessage` 阻塞，空闲时 CPU 为 0。
+- 冒烟测试结果：exe 264KB，私有内存约 45MB，空闲 CPU 0，前台窗口不变。
+- 不选的方案和原因：
+  - Slint、egui：底层 winit 不处理 `WM_MOUSEACTIVATE`，而且把第一根手指当鼠标，第二根手指按下时会让第一根「抬起」，双拇指打字会出错。
+  - Tauri / WebView2：一点就抢焦点，还要额外 100–200MB 内存。
+  - Freya、GPUI：需要 MSVC 或 Skia。
+
+**输入架构：近期用「键盘进程 + `SendInput` 上屏」，长期加一个轻量的 TSF 客户端**
+- **M1–M3**：组字只在点墨的候选条里进行，上屏用 `SendInput(KEYEVENTF_UNICODE)`；退格、回车、方向键发真实的虚拟键（方向键要加 `KEYEVENTF_EXTENDEDKEY`）。Win32、UWP、Chromium、Electron、Office、终端都能用。
+  - 限制：管理员权限的窗口收不到（UIPI 限制）；只读扫描码的程序（游戏、远程桌面）不行；没有内嵌在应用里的预编辑。
+- **长期**：写一个很薄的 Rust TSF 输入法 DLL（参考 windows-chewing-tsf），只当客户端，librime 仍然跑在点墨进程里。好处：
+  - 应用里能显示内嵌预编辑；
+  - 能拿到可靠的「输入框获得焦点」信号，以及输入框类型（数字、密码、网址）；
+  - 管理员窗口也能用。
+
+  所以现在的代码要按「点墨进程是服务端」来写。
+- 不选「复用小狼毫 Weasel」：它的候选词拿不到点墨的键盘上，除非 fork 它的 C++ 代码。
+
+**引擎：librime 1.17.0 官方 MSVC x64 版（`rime-33e7814-Windows-msvc-x64.7z` 里的 `rime.dll`）**
+- 这个 `rime.dll` 已经静态链接了 lua、octagram、predict 插件，只依赖系统 DLL。
+- 运行时用 `LoadLibrary` 加载，再调 `rime_get_api()` 拿函数指针表；绑定代码自己写，不用现成的 crate（都不活跃）。注意设置 `data_size`，返回的对象只能用 librime 自己的 `free_*` 释放。
+- 方案来自雾凇拼音 rime-ice：`rime_ice`（全拼）、`double_pinyin_flypy`（小鹤）、`t9`（九宫格）。
+  - rime-ice 的 t9 方案从 PR #1451 起依赖 iOS 专有的 `t9_processor`，要用之前的版本（2025-01-14），或者去掉这个处理器。
+  - 九宫格的键盘显示要用候选注释里的拼音，不显示数字。
+- 词库在打包时预编译，首次启动不用等；OpenCC 数据一起发。
+
+**语音：Windows 自带的语音输入**
+- 一次 `SendInput` 发出 Win↓ H↓ H↑ Win↑。点墨不抢焦点，所以文字会进入目标输入框。
+- 依赖：要联网，要打开「在线语音识别」，当前输入语言要是中文。Win10 LTSC 上的中文语音组件可能需要另外装，待真机确认。
+
+**自动弹出（M2）**
+- 用 UI Automation 的焦点变化事件（放在 MTA 线程上，用 CacheRequest 一次取齐控件类型、只读、密码等属性），并且只在约 500ms 内刚有过触摸时才弹出，和系统键盘的规则一致。
+- 关掉系统触摸键盘的自动弹出：Win10 设 `HKCU\Software\Microsoft\TabletTip\1.7\EnableDesktopModeAutoInvoke=0`，Win11 设 `TouchKeyboardTapInvoke=0`。不要停用 TabletInputService，Win+H 依赖它。
+- AppBar 只在键盘显示时注册，退出时一定要发 `ABM_REMOVE`；Explorer 重启（`TaskbarCreated` 消息）和屏幕旋转后要重新注册。
+
+**输入法冲突**：目标应用里如果开着微软拼音、搜狗，`SendInput` 发 Unicode 字符不会触发它们组字，基本不受影响。以后可以在中文语言下加一个美式键盘布局，键盘显示时切过去作兜底，这个待验证。
+
+## 4. 代码结构
 
 ```
-src/
-  Dianmo.Core/      net10.0          接口、数据模型、InputController（输入状态机）、键盘布局数据
-  Dianmo.Rime/      net10.0          librime P/Invoke 封装，实现 IImeEngine；方案（全拼/小鹤/九宫格）
-  Dianmo.Platform/  net10.0-windows  Win32：SendInput 上屏、不抢焦点窗口、UIA 焦点监听、AppBar、Win+H
-  Dianmo.App/       net10.0-windows  WPF 程序：键盘界面、候选条、手势、托盘、设置、组装
-tests/
-  Dianmo.Core.Tests/                 InputController 等纯逻辑测试（用假的引擎和 sink）
-data/rime/                           Rime 方案与词库（来自雾凇拼音 rime-ice，构建时拉取）
-scripts/surface/                     Surface 上的同步、构建、运行、截屏工具
+crates/
+  dianmo-core/   纯逻辑   Engine / TextSink 接口、InputController（手机输入规则，唯一实现处）
+  dianmo-ui/     纯逻辑   键盘界面：布局、候选条、手势、气泡；通过 Canvas 画，通过 View 被驱动
+  dianmo-rime/   Windows  librime 动态加载 + Engine 实现；方案和词库的准备、预编译
+  dianmo-win/    Windows  窗口宿主（不抢焦点、WM_POINTER、DPI）、Canvas 的 D2D 实现、SendInput、Win+H、AppBar、系统键盘设置
+  dianmo/        Windows  主程序：把上面几块组装起来，托盘
+data/rime/       方案、词库（脚本拉取，不进 git）
 ```
 
-**依赖方向**：App → Core、Rime、Platform；Rime 和 Platform 只依赖 Core；Core 不依赖任何一方。
+**模块之间的接口**（以代码为准）
+- `dianmo_core::Engine` / `TextSink` / `InputController` / `Action`。
+- `dianmo_ui::Canvas`：圆角矩形、文字、裁剪；坐标都是 DIP。`dianmo_ui::View`：resize / paint / pointer / timer / set_input_state …，返回 `Response { repaint, actions, timer_ms }`。
 
-**核心接口**（`src/Dianmo.Core`，签名以代码为准）
-- `IImeEngine`：输入一个字符 / 删除 / 选候选 / 原样上屏 / 切方案，每次都返回 `ImeSnapshot`（预编辑、候选、要上屏的文字）。
-- `ITextSink`：`CommitText(string)`、`SendKey(EditKey)`，向前台应用发文字和编辑键。
-- `IVoiceInput`：`Start()`，默认实现是发 Win+H。
-- `IFocusMonitor`：输入框焦点变化事件（是否可编辑、位置）。
-- `InputController`：把界面的按键动作翻译成对引擎和 sink 的调用，这是手机输入法交互规则的唯一实现处。界面只管显示和手势，不写输入逻辑。
+**宿主的事件循环**：触摸事件 → `View::pointer` → `UiAction::Input(a)` → `InputController::handle(a)` → `View::set_input_state(...)` → 需要时重绘。
 
-**引擎**：librime 官方 Windows x64 版（自带 lua 插件）+ 雾凇拼音的 `rime_ice`（全拼）、`double_pinyin_flypy`（小鹤）、`t9`（九宫格）方案。首次部署要编译词库，在 Surface 上打包时预先编译好，随程序一起发，这样首次启动不用等。用户词频存在 `%APPDATA%\Dianmo\rime`。
+依赖方向：`dianmo` → 其余四个；`dianmo-win`、`dianmo-rime`、`dianmo-ui` → `dianmo-core`；`dianmo-win` → `dianmo-ui`（只用 Canvas / View 接口）。
 
-## 4. 性能（硬约束）
+## 5. 性能（硬约束）
 
-- 空闲时 CPU≈0：没有轮询、没有常驻动画；焦点监听用事件。
-- 内存：工作集目标 < 120MB（含 librime 和词库）。
-- 按键到界面更新 < 16ms；候选查询不在 UI 线程以外排队。
-- 构建在 Surface 上进行：低优先级（`start /belownormal`）、`-m:2`、关闭 node reuse 和共享编译服务（不留常驻 MSBuild / VBCSCompiler），打包后清理 `bin/obj`。
+- 空闲时 CPU≈0：没有轮询，没有常驻动画，焦点监听用事件。
+- 内存：私有内存目标 < 80MB（含 librime 和词库）。
+- 按键到界面更新 < 16ms。
+- 构建在 Surface 上进行：低优先级、`-j 2`，打包后清理 `target`。
 
-## 5. 开发流程
+## 6. 构建与开发流程
 
-- 代码仓库在服务器 `~/yzfly/dianmo`（唯一真源）；Surface 只作为构建和测试机，工作目录是 `C:\dev\dianmo-<名字>`。
+- **工具链**：
+  - Surface：Rust stable `x86_64-pc-windows-gnullvm` + llvm-mingw（`C:\dev\tools\llvm-mingw`，提供 clang、lld、dlltool），不装 Visual Studio。`.cargo/config.toml` 开启 `+crt-static`，exe 只依赖系统 DLL。
+  - 服务器：只做快速检查。纯逻辑 crate 用 `cargo test`；Windows crate 用 `cargo check --target x86_64-pc-windows-gnullvm`，不链接。
+- 代码在服务器 `~/yzfly/dianmo`（唯一真源），Surface 只作构建和测试机，工作目录是 `C:\dev\dianmo-<名字>`。
 - `scripts/surface/`：
-  - `ps.sh`：在 Surface 上执行 PowerShell（stdin 传脚本）。
-  - `sync.sh <名字>`：把仓库同步到 `C:\dev\dianmo-<名字>`。
-  - `build.sh <名字> [dotnet 参数]`：同步后低优先级构建，用服务器上的锁排队。
-  - `gui.sh`：在用户桌面会话里执行 PowerShell（启动程序、模拟点按），用 GUI 锁排队。
-  - `shot.sh <本地.png>`：截取 Surface 屏幕。
-- 用户正在用这台 Surface：GUI 测试要短，测完关掉自己启动的窗口，不动用户的其他窗口。
+  - `ps.sh`：在 Surface 上执行 PowerShell。
+  - `sync.sh <名字>`：同步代码。
+  - `build.sh <名字> [cargo 参数]`：同步后低优先级构建，排队执行。
+  - `gui.sh [超时]`：在用户的桌面会话里执行，排队执行。
+  - `shot.sh <out.png>`：截屏。
+  - `clean.sh <名字> [--target]`：清理工作目录或 target。
+- 用户正在用这台 Surface：GUI 测试要短，测完关掉自己开的窗口，不能留下错误弹窗。
 
-## 6. 里程碑
+## 7. 里程碑
 
 - **M1 能用**：底部停靠的键盘窗口 + 26 键全拼 / 小鹤双拼 + 候选条 + 上屏 + 删除、空格、回车规则 + 语音键（Win+H）+ 托盘手动呼出。
 - **M2 好用**：九宫格、数字和符号面板、长按和滑动手势、按键气泡、自动弹出和收起、AppBar 让位、关掉系统键盘的自动弹出。

@@ -22,7 +22,7 @@
 | 12 | 2026-10-06 | 服务器空间有限，主构建环境放在 Surface 上 | ✅ 构建在 Surface 上（现为 Rust 工具链，见 #14）；服务器只放代码 |
 | 13 | 2026-10-06 | 用户说的每件事都统一记到本文件；综合理解需求，做好设计 | ✅ 本文件 + DESIGN.md |
 | 14 | 2026-10-06 | 不一定用 .NET，Rust 能不能写？ | ✅ 改用 Rust（内存小、无运行时、启动快，更符合 #10）；Surface 已删 .NET、装 Rust（GNU 工具链，不装 VS） |
-| 15 | 2026-10-06 | 技术栈要好好调研，用好的技术栈 | 🔄 两路调研中：界面框架、输入架构（模拟按键 vs TSF） |
+| 15 | 2026-10-06 | 技术栈要好好调研，用好的技术栈 | ✅ 定稿见 DESIGN.md §3：Win32+Direct2D/DirectWrite（windows 0.62）；近期 SendInput 上屏、长期加 TSF 客户端；librime 1.17 动态加载 + rime-ice；Win+H 语音；Surface 用 gnullvm+llvm-mingw 工具链（冒烟测试通过） |
 
 ## 待清理 / 收尾
 
