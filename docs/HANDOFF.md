@@ -45,4 +45,4 @@ cd ~/yzfly/dianmo && claude # 新会话：先读 CLAUDE.md → TODO.md → docs/
 - **内容过滤**：rime 子 agent 两次被 API 内容过滤打断，很可能是把词库原文或长串候选读进了上下文。不要 cat 词库文件，测试输出每个输入最多打印前 3 个候选。
 - **Surface 是用户正在用的机器**：GUI 测试要短，测完关掉窗口，启动新 exe 之前先用 `llvm-objdump -p` 查依赖，别再弹出缺 DLL 的报错框。
 - **待清理**：见 `TODO.md` 末尾（计划任务 `DianmoGui`、`C:\Users\wecode\claude`、R2 上的一次性安装脚本）。
-- **提交**：git 身份用 yzfly，提交信息不加 Co-Authored-By，也不加生成标记。仓库目前只在本地，还没有远程仓库。
+- **提交**：git 身份用 yzfly，提交信息不加 Co-Authored-By，也不加生成标记。仓库已公开在 GitHub `yzfly/dianmo`（origin）；`scripts/surface/surface-setup.ps1`、`build-setup.py` 含个人服务器信息，只留在本地（已 .gitignore），不要提交。
