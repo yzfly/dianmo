@@ -729,21 +729,23 @@ fn sticky_ctrl_sends_chords() {
     assert_eq!(h.tap("s"), vec![key(KeyChord::ctrl('s'))]);
     assert_eq!(h.v.latch[Modifier::Ctrl.index()], Latch::Off);
     assert_eq!(h.tap("s"), chars("s"));
-    // Double tap locks.
+    // Double tap locks: Ctrl is really held from the first key until unlocked, the keys go
+    // without it (DESIGN「锁定 = 真按住」).
     h.tap("ctrl");
     h.t += 100;
-    h.tap("ctrl");
+    assert!(h.tap("ctrl").is_empty(), "nothing is sent before a key");
     assert_eq!(h.v.latch[Modifier::Ctrl.index()], Latch::Locked);
     let mut acts = h.tap("c");
     acts.extend(h.tap("v"));
     acts.extend(h.tap("1"));
     acts.extend(h.tap("left"));
+    let plain = |c: char| key(KeyChord::key(KeyCode::Char(c)));
     assert_eq!(
         acts,
-        vec![key(KeyChord::COPY), key(KeyChord::PASTE), key(KeyChord::ctrl('1')), key(KeyChord::ctrl_key(EditKey::Left))]
+        vec![kd(KeyCode::Ctrl), plain('c'), plain('v'), plain('1'), key(KeyChord::key(KeyCode::Edit(EditKey::Left)))]
     );
     h.t += 1000;
-    h.tap("ctrl");
+    assert_eq!(h.tap("ctrl"), vec![ku(KeyCode::Ctrl)]);
     assert_eq!(h.v.latch[Modifier::Ctrl.index()], Latch::Off);
     // Ctrl + Shift stack; full-width punctuation sends its physical key.
     h.tap("ctrl");
@@ -770,6 +772,146 @@ fn held_modifier_chords_with_another_finger() {
     assert_eq!(h.tap_at_id(2, h.at("A")), chars("A"));
     h.up(1, sh);
     assert_eq!(h.tap("a"), chars("a"));
+}
+
+/// Double-taps `name` (a modifier) so that it is locked.
+fn lock(h: &mut H, name: &str) -> Vec<UiAction> {
+    h.t += 1000;
+    let mut acts = h.tap(name);
+    h.t += 100;
+    acts.extend(h.tap(name));
+    acts
+}
+
+#[test]
+fn locked_alt_stays_down_for_alt_tab() {
+    let mut h = H::wide(idle());
+    let tab = key(KeyChord::key(KeyCode::Edit(EditKey::Tab)));
+    assert!(lock(&mut h, "alt").is_empty(), "a lock alone sends nothing");
+    assert_eq!(h.v.latch[Modifier::Alt.index()], Latch::Locked);
+    // Alt goes down before the first Tab and stays down: the task switcher stays open.
+    assert_eq!(h.tap("tab"), vec![kd(KeyCode::Alt), tab.clone()]);
+    assert_eq!(h.tap("tab"), vec![tab.clone()]);
+    assert_eq!(h.v.latch[Modifier::Alt.index()], Latch::Locked);
+    // Unlocking releases Alt (the switch completes).
+    h.t += 1000;
+    assert_eq!(h.tap("alt"), vec![ku(KeyCode::Alt)]);
+    assert_eq!(h.v.latch[Modifier::Alt.index()], Latch::Off);
+    assert_eq!(h.tap("tab"), vec![input(Action::Edit(EditKey::Tab))]);
+    // Lock and unlock without a key: nothing at all (no lone Alt = menu bar).
+    assert!(lock(&mut h, "alt").is_empty());
+    h.t += 1000;
+    assert!(h.tap("alt").is_empty());
+    // One-shot Alt is still a one-off chord.
+    h.t += 1000;
+    h.tap("alt");
+    assert_eq!(h.tap("tab"), vec![key(KeyChord { alt: true, ..KeyChord::key(KeyCode::Edit(EditKey::Tab)) })]);
+    // So is a held Alt with another finger.
+    let alt = h.at("alt");
+    h.down(2, alt);
+    let mut acts = h.tap_at_id(1, h.at("tab"));
+    acts.extend(h.tap_at_id(1, h.at("tab")));
+    acts.extend(h.up(2, alt));
+    let chord = key(KeyChord { alt: true, ..KeyChord::key(KeyCode::Edit(EditKey::Tab)) });
+    assert_eq!(acts, vec![chord.clone(), chord]);
+}
+
+#[test]
+fn locked_alt_end_to_end_keeps_alt_down_in_the_sink() {
+    let mut h = H::wide(idle());
+    let mut ctl = InputController::new(Fake { schema: Schema::Pinyin, raw: String::new() }, Sink::default());
+    let mut run = |acts: Vec<UiAction>| {
+        for a in acts {
+            if let UiAction::Input(a) = a {
+                ctl.handle(a);
+            }
+        }
+        std::mem::take(&mut ctl.sink_mut().0)
+    };
+    run(lock(&mut h, "alt"));
+    let tab = format!("<{:?}>", KeyChord::key(KeyCode::Edit(EditKey::Tab)));
+    assert_eq!(run(h.tap("tab")), format!("<Alt true>{tab}"));
+    assert_eq!(run(h.tap("tab")), tab, "no Alt up between the Tabs");
+    h.t += 1000;
+    assert_eq!(run(h.tap("alt")), "<Alt false>");
+}
+
+#[test]
+fn locked_ctrl_alt_win_and_shift_combine() {
+    let mut h = H::wide(idle());
+    // Locked Ctrl + one-shot Shift: Ctrl stays down, Shift goes with the chord.
+    lock(&mut h, "ctrl");
+    h.tap("shift");
+    assert_eq!(h.tap("T"), vec![kd(KeyCode::Ctrl), key(KeyChord { shift: true, ..KeyChord::key(KeyCode::Char('t')) })]);
+    // A toolbar chord that has Ctrl anyway does not press it again (nor release it).
+    let undo = h.tap("undo");
+    assert_eq!(undo, vec![key(KeyChord::key(KeyCode::Char('z')))]);
+    h.t += 1000;
+    assert_eq!(h.tap("ctrl"), vec![ku(KeyCode::Ctrl)]);
+    // Locked Win (long-press twice) is held the same way.
+    let win = h.at("win");
+    for _ in 0..2 {
+        h.down(1, win);
+        h.wait(LONG_PRESS_MS);
+        h.up(1, win);
+    }
+    assert_eq!(h.v.latch[Modifier::Win.index()], Latch::Locked);
+    let right = key(KeyChord::key(KeyCode::Edit(EditKey::Right)));
+    let r = h.at("right");
+    assert_eq!(h.down(1, r), vec![kd(KeyCode::Win), right.clone()]);
+    h.up(1, r);
+    assert_eq!(h.down(1, r), vec![right]);
+    h.up(1, r);
+    h.t += 1000;
+    assert_eq!(h.tap("win"), vec![ku(KeyCode::Win)]);
+    // Locked Shift stays caps lock: nothing is held, letters are typed in capitals.
+    assert!(lock(&mut h, "shift").is_empty());
+    assert_eq!(h.tap("A"), chars("A"));
+    assert!(h.v.mods_down.iter().all(|d| !d));
+}
+
+#[test]
+fn locked_modifier_goes_up_when_leaving() {
+    let tab = || key(KeyChord::key(KeyCode::Edit(EditKey::Tab)));
+    let mut h = H::wide(idle());
+    lock(&mut h, "alt");
+    assert_eq!(h.tap("tab"), vec![kd(KeyCode::Alt), tab()]);
+    // Hiding the keyboard: Alt goes up before the hide; the lock stays lit and presses again.
+    assert_eq!(h.tap("hide"), vec![ku(KeyCode::Alt), UiAction::Hide]);
+    assert_eq!(h.v.latch[Modifier::Alt.index()], Latch::Locked);
+    assert_eq!(h.tap("tab"), vec![kd(KeyCode::Alt), tab()]);
+    // Another panel (symbols, layout menu).
+    assert_eq!(h.tap("symbols"), vec![ku(KeyCode::Alt)]);
+    h.tap("back");
+    assert_eq!(h.tap("tab"), vec![kd(KeyCode::Alt), tab()]);
+    assert_eq!(h.tap("layout"), vec![ku(KeyCode::Alt)]);
+    h.tap("layout");
+    // Another layout (中 / 英).
+    h.tap("tab");
+    let r = h.state(st(false, Schema::Pinyin, "", &[]));
+    assert_eq!(r.actions, vec![ku(KeyCode::Alt)]);
+    // Typed text: Alt goes up first.
+    h.tap("tab");
+    let (x, y) = h.at("w");
+    h.down(1, (x, y));
+    h.mov(1, (x, y - 40.0));
+    let acts = h.up(1, (x, y - 40.0));
+    assert!(matches!(&acts[..], [a, UiAction::Input(Action::Text(_))] if *a == ku(KeyCode::Alt)), "{acts:?}");
+    // The host: keyboard hidden / focus moved by touch / input mode changed from the tray.
+    h.tap("tab");
+    assert_eq!(h.v.release_locked_mods().actions, vec![ku(KeyCode::Alt)]);
+    assert!(h.v.release_locked_mods().actions.is_empty());
+    // Voice releases the lock itself.
+    h.tap("tab");
+    assert_eq!(h.tap("voice"), vec![ku(KeyCode::Alt), UiAction::Voice]);
+    assert_eq!(h.v.latch[Modifier::Alt.index()], Latch::Off);
+    // Into the 电脑键盘 with Alt down (host switch after the release, or the view's own switch).
+    lock(&mut h, "alt");
+    h.tap("tab");
+    let mut r = Response::none();
+    assert!(h.v.set_pc(true, &mut r));
+    assert_eq!(r.actions, vec![ku(KeyCode::Alt)]);
+    assert!(h.v.mods_down.iter().all(|d| !d));
 }
 
 #[test]
@@ -1206,19 +1348,27 @@ fn pc_modifiers_are_real_keys() {
     assert_eq!(h.wait(LONG_PRESS_MS), vec![kd(KeyCode::Shift)]);
     assert_eq!(h.up(2, shift), vec![ku(KeyCode::Shift)]);
     assert!(h.v.latch.iter().all(|l| *l == Latch::Off));
-    // Locked Ctrl: down and up around every key, stays locked.
+    // Locked Ctrl: down before the first key, held until unlocked.
     h.tap("ctrl");
     h.t += 100;
-    h.tap("ctrl");
+    assert!(h.tap("ctrl").is_empty());
     assert_eq!(h.v.latch[Modifier::Ctrl.index()], Latch::Locked);
     let a = h.at("a");
-    for _ in 0..2 {
-        assert_eq!(h.down(1, a), vec![kd(KeyCode::Ctrl), kd(KeyCode::Char('a'))]);
-        assert_eq!(h.up(1, a), vec![ku(KeyCode::Char('a')), ku(KeyCode::Ctrl)]);
-    }
+    assert_eq!(h.down(1, a), vec![kd(KeyCode::Ctrl), kd(KeyCode::Char('a'))]);
+    assert_eq!(h.up(1, a), vec![ku(KeyCode::Char('a'))]);
+    assert_eq!(h.down(1, a), vec![kd(KeyCode::Char('a'))]);
+    assert_eq!(h.up(1, a), vec![ku(KeyCode::Char('a'))]);
     h.t += 500;
-    h.tap("ctrl");
+    assert_eq!(h.tap("ctrl"), vec![ku(KeyCode::Ctrl)]);
     assert_eq!(h.v.latch[Modifier::Ctrl.index()], Latch::Off);
+    // Locked Shift stays per key (it is caps lock).
+    h.tap("shift");
+    h.t += 100;
+    h.tap("shift");
+    assert_eq!(h.down(1, a), vec![kd(KeyCode::Shift), kd(KeyCode::Char('a'))]);
+    assert_eq!(h.up(1, a), vec![ku(KeyCode::Char('a')), ku(KeyCode::Shift)]);
+    h.t += 500;
+    assert!(h.tap("shift").is_empty());
     // Win alone opens Start; Win held + D = Win+D.
     assert_eq!(h.tap("win"), vec![key(KeyChord::win_alone())]);
     let (win, d) = (h.at("win"), h.at("d"));

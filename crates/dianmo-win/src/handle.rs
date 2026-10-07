@@ -6,8 +6,9 @@
 //!   with `UpdateLayeredWindow` (per-pixel alpha: anti-aliased edge, transparent corners that
 //!   don't take input).
 //! - Dragging moves it; on release it snaps to the nearest left/right edge of the work area and
-//!   reports the position ([`BallEvent::Moved`]). After 3 s without interaction it tucks half into
-//!   the edge and turns translucent; a touch brings it back.
+//!   reports the position ([`BallEvent::Moved`]). After 3 s without interaction it shrinks to a
+//!   translucent 32 DIP ball; a touch brings it back. It never touches the screen edge, out or
+//!   tucked, so grabbing it doesn't start a system edge swipe (geometry: `ball_geom.rs`).
 //! - [`BallState::Listening`] draws a breathing halo; that animation (a ~30 fps timer) is the only
 //!   thing that runs, and only in that state.
 //! - Never activates (like the keyboard window).
@@ -31,14 +32,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{Result, w};
 
+pub use crate::ball_geom::BallEdge;
+use crate::ball_geom::{self, Layout};
 use crate::clock::now_ms;
-
-/// Screen edge the ball sits on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BallEdge {
-    Left,
-    Right,
-}
 
 /// Where the ball sits: an edge and the vertical position of its centre as a fraction of the
 /// work area's height (0 = top, 1 = bottom). Save it from [`BallEvent::Moved`] and pass it back in
@@ -93,11 +89,6 @@ pub(crate) fn decode(wp: WPARAM, lp: LPARAM) -> Option<BallEvent> {
     }
 }
 
-const DIAMETER_DIP: f32 = 48.0;
-/// Room around the ball for the shadow and the listening halo.
-const MARGIN_DIP: f32 = 14.0;
-/// Gap between the ball and the screen edge.
-const EDGE_GAP_DIP: f32 = 6.0;
 const DRAG_SLOP_DIP: f32 = 8.0;
 const LONG_PRESS_MS: u32 = 550;
 const IDLE_MS: u32 = 3000;
@@ -118,6 +109,8 @@ struct Drag {
     last: POINT,
     /// Window origin when the press began.
     origin: POINT,
+    /// Ball centre relative to that origin (the tucked ball is smaller).
+    center_off: f32,
     moved: bool,
     long_fired: bool,
 }
@@ -133,9 +126,12 @@ struct Ball {
     shown: bool,
     tucked: bool,
     drag: Option<Drag>,
-    /// Window size (px) and the rendered ball for it (premultiplied RGBA, f32).
+    /// Side (px) of the DIB: the out ball's window, the largest. The tucked ball uses its top-left
+    /// corner.
     size: i32,
+    /// The rendered out and tucked balls for their window sizes (premultiplied RGBA, f32).
     base: Vec<[f32; 4]>,
+    tucked_base: Vec<[f32; 4]>,
     dc: HDC,
     bitmap: HBITMAP,
     bits: *mut u32,
@@ -185,6 +181,7 @@ impl EdgeHandle {
                     drag: None,
                     size: 0,
                     base: Vec::new(),
+                    tucked_base: Vec::new(),
                     dc: HDC::default(),
                     bitmap: HBITMAP::default(),
                     bits: std::ptr::null_mut(),
@@ -309,29 +306,14 @@ impl Ball {
         dip * self.scale
     }
 
-    fn radius(&self) -> f32 {
-        self.px(DIAMETER_DIP) / 2.0
-    }
-
-    fn margin(&self) -> i32 {
-        self.px(MARGIN_DIP).round() as i32
-    }
-
-    /// Window origin for the current position (tucked: half the ball past the edge).
-    fn origin(&self) -> POINT {
-        let r = self.radius();
-        let m = self.margin();
-        let gap = self.px(EDGE_GAP_DIP);
+    fn work(&self) -> ball_geom::Rect {
         let w = &self.work;
-        let h = (w.bottom - w.top) as f32;
-        let cy = (w.top as f32 + self.pos.y_frac * h).clamp(w.top as f32 + r + gap, w.bottom as f32 - r - gap);
-        let cx = match (self.pos.edge, self.tucked) {
-            (BallEdge::Left, false) => w.left as f32 + gap + r,
-            (BallEdge::Left, true) => w.left as f32,
-            (BallEdge::Right, false) => w.right as f32 - gap - r,
-            (BallEdge::Right, true) => w.right as f32,
-        };
-        POINT { x: (cx - r).round() as i32 - m, y: (cy - r).round() as i32 - m }
+        ball_geom::Rect { left: w.left, top: w.top, right: w.right, bottom: w.bottom }
+    }
+
+    /// The window for the current position and state (out or tucked).
+    fn layout(&self) -> Layout {
+        ball_geom::layout(self.work(), self.scale, self.pos.edge, self.pos.y_frac, self.tucked)
     }
 
     fn restart_idle(&self) {
@@ -361,11 +343,9 @@ impl Ball {
         }
     }
 
-    /// Renders the static ball (shadow, gradient disc, dot) for the current scale.
+    /// Renders the static balls (shadow, gradient disc, dot), out and tucked, for the current scale.
     fn render_base(&mut self) {
-        let r = self.radius();
-        let m = self.margin();
-        let size = (2.0 * r).ceil() as i32 + 2 * m;
+        let (size, r, _) = ball_geom::ball_size(false, self.scale);
         if size != self.size {
             self.free_surface();
             self.size = size;
@@ -390,26 +370,32 @@ impl Ball {
             }
         }
         self.base = render_ball(size, r, self.scale);
+        let (tucked_size, tucked_r, _) = ball_geom::ball_size(true, self.scale);
+        self.tucked_base = render_ball(tucked_size, tucked_r, self.scale);
     }
 
     /// Composes the current frame into the DIB and updates the layered window.
     fn present(&mut self) {
-        if self.bits.is_null() || self.size <= 0 {
+        let l = self.layout();
+        let base = if self.tucked { &self.tucked_base } else { &self.base };
+        let (stride, w) = (self.size.max(0) as usize, l.size.max(0) as usize);
+        if self.bits.is_null() || w == 0 || w > stride || base.len() != w * w {
             return;
         }
-        let n = (self.size * self.size) as usize;
-        let px = unsafe { std::slice::from_raw_parts_mut(self.bits, n) };
+        let px = unsafe { std::slice::from_raw_parts_mut(self.bits, stride * stride) };
         let halo = (self.state == BallState::Listening).then(|| {
             let t = now_ms().saturating_sub(self.anim_start) as f32 / 1000.0;
             // Breathing: 1.6 s period.
             0.5 - 0.5 * (t * std::f32::consts::TAU / 1.6).cos()
         });
-        let c = self.size as f32 / 2.0;
-        let r = self.radius();
-        for (i, p) in px.iter_mut().enumerate() {
-            let mut out = self.base[i];
+        let c = l.size as f32 / 2.0;
+        let r = l.radius;
+        // The window shows the top-left `w`×`w` of the DIB.
+        for (i, &b) in base.iter().enumerate() {
+            let p = &mut px[(i / w) * stride + i % w];
+            let mut out = b;
             if let Some(k) = halo {
-                let (x, y) = ((i % self.size as usize) as f32 + 0.5, (i / self.size as usize) as f32 + 0.5);
+                let (x, y) = ((i % w) as f32 + 0.5, (i / w) as f32 + 0.5);
                 let d = ((x - c).powi(2) + (y - c).powi(2)).sqrt();
                 let ring = r + self.px(2.0 + 5.0 * k);
                 let width = self.px(3.0 + 2.0 * k);
@@ -424,14 +410,14 @@ impl Ball {
             let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
             *p = (to8(out[3]) << 24) | (to8(out[0]) << 16) | (to8(out[1]) << 8) | to8(out[2]);
         }
-        let origin = self.origin();
+        let origin = POINT { x: l.x, y: l.y };
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
             SourceConstantAlpha: if self.tucked && self.state == BallState::Idle { TUCKED_ALPHA } else { 255 },
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        let size = SIZE { cx: self.size, cy: self.size };
+        let size = SIZE { cx: l.size, cy: l.size };
         unsafe {
             let _ = UpdateLayeredWindow(
                 self.hwnd,
@@ -488,7 +474,16 @@ impl Ball {
                     let _ = KillTimer(Some(self.hwnd), TIMER_IDLE);
                     SetTimer(Some(self.hwnd), TIMER_LONG, LONG_PRESS_MS, None);
                 }
-                self.drag = Some(Drag { id, start: pt, last: pt, origin: self.origin(), moved: false, long_fired: false });
+                let l = self.layout();
+                self.drag = Some(Drag {
+                    id,
+                    start: pt,
+                    last: pt,
+                    origin: POINT { x: l.x, y: l.y },
+                    center_off: l.center_off,
+                    moved: false,
+                    long_fired: false,
+                });
             }
             WM_POINTERUPDATE => {
                 let slop = self.px(DRAG_SLOP_DIP) as i32;
@@ -520,15 +515,9 @@ impl Ball {
                 self.tucked = false;
                 if d.moved {
                     // Snap to the nearer edge at the drop height (also when the capture was lost).
-                    let r = self.radius();
-                    let m = self.margin() as f32;
-                    let cx = (d.origin.x + d.last.x - d.start.x) as f32 + m + r;
-                    let cy = (d.origin.y + d.last.y - d.start.y) as f32 + m + r;
-                    let w = self.work;
-                    let mid = (w.left + w.right) as f32 / 2.0;
-                    let edge = if cx < mid { BallEdge::Left } else { BallEdge::Right };
-                    let h = (w.bottom - w.top).max(1) as f32;
-                    let y_frac = ((cy - w.top as f32) / h).clamp(0.0, 1.0);
+                    let cx = (d.origin.x + d.last.x - d.start.x) as f32 + d.center_off;
+                    let cy = (d.origin.y + d.last.y - d.start.y) as f32 + d.center_off;
+                    let (edge, y_frac) = ball_geom::snap(self.work(), cx, cy);
                     self.pos = BallPos { edge, y_frac };
                     self.present();
                     let lp = (edge == BallEdge::Right) as isize | (((y_frac * 65535.0).round() as isize) << 1);

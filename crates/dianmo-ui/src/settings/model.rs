@@ -347,7 +347,7 @@ impl VoiceEngineChoice {
     pub fn blurb(self) -> &'static str {
         match self {
             VoiceEngineChoice::WeType => "识别准、带标点，需要先安装微信输入法",
-            VoiceEngineChoice::DoubaoIme => "字节跳动的豆包输入法，需要在它的设置里打开全局语音快捷键",
+            VoiceEngineChoice::DoubaoIme => "字节跳动的豆包输入法；它目前不响应模拟按键，点墨还调不起它的语音",
             VoiceEngineChoice::Doubao => "第三方的豆包语音小工具，需要先配置好它",
             VoiceEngineChoice::System => "Windows 自带的语音输入（Win+H），无需安装",
         }
@@ -608,6 +608,10 @@ pub enum SettingsAction {
     FinishOnboarding,
     /// Close the window (Esc).
     Close,
+    /// The user switched to this page (navigation, top tabs or Tab). Not sent for
+    /// [`super::SettingsView::set_page`]: the host knows the pages it asks for. The host uses it
+    /// for 关于: the tray icon's 「新版本」 red dot goes once the about page has been seen.
+    PageShown(Page),
 }
 
 impl SettingsModel {

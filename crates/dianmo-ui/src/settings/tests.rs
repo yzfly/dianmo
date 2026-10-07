@@ -114,12 +114,53 @@ fn nav_switches_pages() {
     assert!(x < 232.0, "left navigation in a wide window");
     t.tap_at(x, y);
     assert_eq!(t.v.page(), Page::Keyboard);
-    assert!(t.take_actions().is_empty());
+    assert_eq!(t.take_actions(), vec![SettingsAction::PageShown(Page::Keyboard)]);
     t.tap("long_press/长");
     assert_eq!(t.take_actions(), vec![SettingsAction::SetLongPress(LongPress::Long)]);
     let (x, y) = t.v.element_center("关于").unwrap();
     t.tap_at(x, y);
     assert_eq!(t.v.page(), Page::About);
+}
+
+#[test]
+fn switching_to_about_tells_the_host() {
+    // Left navigation.
+    let mut t = T::new(960.0, 680.0);
+    let (x, y) = t.v.element_center("关于").unwrap();
+    let r = t.tap_at(x, y);
+    assert_eq!(r.actions, vec![UiAction::Settings(SettingsAction::PageShown(Page::About))]);
+    t.take_actions();
+    // Tapping the page already shown sends nothing.
+    t.tap_at(x, y);
+    assert!(t.take_actions().is_empty());
+
+    // Top tabs in a narrow window.
+    let mut t = T::new(600.0, 800.0);
+    let (x, y) = t.v.element_center("关于").unwrap();
+    t.tap_at(x, y);
+    assert_eq!(t.take_actions(), vec![SettingsAction::PageShown(Page::About)]);
+
+    // Tab pages through to 关于 (the last page), then wraps to 常规.
+    let mut t = T::new(960.0, 680.0);
+    for _ in 1..Page::ALL.len() {
+        t.key(0x09);
+    }
+    assert_eq!(t.v.page(), Page::About);
+    let shown = t.take_actions();
+    assert_eq!(shown.len(), Page::ALL.len() - 1);
+    assert_eq!(shown.last(), Some(&SettingsAction::PageShown(Page::About)));
+    t.key(0x09);
+    assert_eq!(t.take_actions(), vec![SettingsAction::PageShown(Page::General)]);
+
+    // The host choosing the page (e.g. tray 「关于点墨」) is not echoed back.
+    let mut v = SettingsView::new(SettingsModel::default(), ThemeKind::Light);
+    assert!(v.set_page(Page::About));
+    let r = v.key(0x28, true);
+    assert!(settings_actions(&r).is_empty());
+
+    // Showing it doesn't touch the model.
+    let mut m = SettingsModel::default();
+    assert!(!m.apply(&SettingsAction::PageShown(Page::About)));
 }
 
 #[test]
@@ -131,6 +172,7 @@ fn narrow_window_uses_top_tabs() {
     let (x, y) = t.v.element_center("语音").unwrap();
     t.tap_at(x, y);
     assert_eq!(t.v.page(), Page::Voice);
+    assert_eq!(t.take_actions(), vec![SettingsAction::PageShown(Page::Voice)]);
     // Rows still work (controls stacked under their text when needed).
     t.tap("engine_system");
     assert_eq!(t.take_actions(), vec![SettingsAction::SetVoiceEngine(VoiceEngineChoice::System)]);

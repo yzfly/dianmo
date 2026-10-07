@@ -59,7 +59,7 @@
 - **控制台（已修）**：conhost（`ConsoleWindowClass`，PowerShell/cmd）和 Windows Terminal（`CASCADIA_HOSTING_WINDOW_CLASS`）的焦点元素（窗口本身，或前台控制台窗口里的 Text Area）一律算 `Editable{Text}`，输入框范围是整个窗口的客户区，所以新开的控制台第一次点里面（焦点没变）也会弹出。实测：新开 cmd 窗口点里面 → `retap(raw) Editable{Text,true}` → 弹出；收起后再点 → 再弹出。
 - **悬浮球**（DESIGN.md 悬浮球，TODO #30；`handle.rs`，取代左边缘长条把手）：
   - 直径 48 DIP，蓝 #3B82F6 → 紫 → 品红 #EC4899 的对角渐变圆 + 左上青色辉光 + 上半部白色光泽 + 图标里的白色书法点（同一条贝塞尔路径）+ 柔和投影。CPU 渲染进预乘 BGRA 的 DIB，`UpdateLayeredWindow(ULW_ALPHA)` 显示：圆边按像素覆盖率抗锯齿，书法点 4×4 超采样，透明的角不接收点击。只在 DPI 变化时重画（约十几毫秒）。
-  - 拖动跟手，松手吸附到较近的左/右边缘，`BallEvent::Moved(BallPos{edge, y_frac})` 交给 App 保存，`HostOptions::ball_pos` 启动时传回（默认左边缘、62% 高度）。闲置 3 秒半隐入边缘并变半透明（alpha 150）；按下时先恢复不透明，松手后出来（按下时不能挪窗口，否则会丢触摸捕获）。长按 0.55 秒发 `LongPress`。不抢焦点（NOACTIVATE + MA/PA_NOACTIVATE）。
+  - 拖动跟手，松手吸附到较近的左/右边缘，`BallEvent::Moved(BallPos{edge, y_frac})` 交给 App 保存，`HostOptions::ball_pos` 启动时传回（默认左边缘、62% 高度）。闲置 3 秒缩成 32 DIP 的半透明小球（alpha 150；v0.2.1 起不再半隐到屏幕外，外沿离边缘 10 DIP，几何在 `ball_geom.rs`）；按下时先恢复不透明，松手后出来（按下时不能挪窗口，否则会丢触摸捕获）。长按 0.55 秒发 `LongPress`。不抢焦点（NOACTIVATE + MA/PA_NOACTIVATE）。
   - `BallState::Listening` 画呼吸光圈（1.6 秒一呼吸，约 30fps 的计时器只在这个状态、球可见时运行）；`Idle` 时没有任何计时器（3 秒的收边计时器是一次性的）。
   - 窗口类名改为 `DianmoBall`（测试脚本已改）。
   - 实测：Tap / LongPress / Moved(Left, 0.217) 都收到；光圈期间 3 秒 CPU 31ms；闲置 5 秒 CPU 0ms；截图放大看边缘平滑、无锯齿。
@@ -132,7 +132,7 @@
 - 进程被强杀（TerminateProcess）时 AppBar 占的工作区不会释放，要等下一次有 AppBar 变化（比如再开一次点墨）才恢复。测试时请用 WM_CLOSE 关闭（e2e 脚本就是这样做的）。
 - 每帧都整窗重绘（约 6–7ms CPU）。以后可以只重绘变化区域（见下面的接口需求）。
 - Raw Input 用真实手指还没验证过（见第三轮）；旋转屏幕时的坐标映射靠显示方向 + 自动校准，也没实测。
-- 悬浮球贴边半隐时，从屏幕最边上开始拖可能触发系统的边缘手势（右边缘 = 操作中心）；点它没问题。
+- ~~悬浮球贴边半隐时，从屏幕最边上开始拖可能触发系统的边缘手势~~：v0.2.1 已改（球离边缘 10 DIP，收起时缩小而不是半隐）。
 - `CURSOR_SUPPRESSED` 判定会把「触摸之后 500ms 内的实体键盘按键」也算作触摸（比如触摸后马上按 Esc 关掉搜索，焦点回到别处时 `by_touch=true`）。纯触屏用户没有实体键盘，影响很小；点墨自己 SendInput 发出的键已排除。
 - 监听焦点会让 Chromium 打开无障碍树（和屏幕阅读器一样），Edge 自身内存会多一些，没量。
 - 托盘图标现在被系统放进了「隐藏的图标」里（Shell_NotifyIconGetRect 拿不到位置），所以 e2e 里「点托盘图标」那一步被跳过；`run-focus.sh` 改为直接给托盘窗口发图标回调消息来打开菜单。

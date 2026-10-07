@@ -10,6 +10,8 @@
 //!   (drag = move the caret, a second finger's tap = start selecting).
 //! - Modifiers (Shift, Ctrl, Alt, Win, Fn): tap = next key only, double tap = locked, held
 //!   while another finger taps = a real chord. A lone Win tap presses Win; long-press latches it.
+//!   A locked Ctrl / Alt / Win is really held down from the first key until unlocked
+//!   ([`KeyboardView::hold_locked_mods`]), so locked Alt + Tab, Tab … walks the task switcher.
 //! - Edit keys (arrows, Tab, Del) fire on press and repeat; keys with a hold action (Tab → Esc,
 //!   toolbar ← → line start/end) fire on release instead.
 //! - The candidate strip, the T9 column and the grids scroll by dragging, with a short fling.
@@ -23,6 +25,7 @@ use crate::clip::{extends_selection, horizontal};
 use crate::layout::{
     self, BuildCtx, ColumnKind, Key, KeyAction, Latch, Layout, Metrics, Modifier, Mods, SelAct, SymTab, Tone,
 };
+use crate::pc::LOCK_HELD;
 use crate::scroll::{FRAME_MS, Scroller, VelocityTracker};
 use crate::settings::{CandidateSize, ShuangpinScheme};
 use crate::theme::{Theme, ThemeKind};
@@ -195,8 +198,11 @@ pub struct KeyboardView {
     pub(crate) pc: bool,
     /// 电脑键盘: Caps Lock as toggled by our Caps key.
     pub(crate) pc_caps: bool,
-    /// 电脑键盘: modifiers we sent down and not yet up (by [`Modifier::index`]; Fn is never sent).
-    pub(crate) pc_down: [bool; 5],
+    /// Modifiers we sent down (`KeyDown`) and not yet up, by [`Modifier::index`] (Fn is never
+    /// sent): on the 电脑键盘 held / latched ones around keys, elsewhere locked Ctrl / Alt / Win.
+    pub(crate) mods_down: [bool; 5],
+    /// A panel or layout change: modifiers held down for a lock go up with the next response.
+    pub(crate) lift_pending: bool,
     /// Selection mode: the selection bar replaces the toolbar; arrows extend the selection.
     pub(crate) selecting: bool,
     /// Trackpad: a second finger's tap started selecting (moves carry Shift).
@@ -273,7 +279,8 @@ impl KeyboardView {
             height_scale: 1.0,
             pc: false,
             pc_caps: false,
-            pc_down: [false; 5],
+            mods_down: [false; 5],
+            lift_pending: false,
             selecting: false,
             pad_select: false,
             pad_selected: false,
@@ -468,11 +475,13 @@ impl KeyboardView {
         self.voice_mode
     }
 
-    /// Turns every latched modifier off; on the 电脑键盘 also sends up the keys and modifiers we
-    /// hold down (actions go into `r`).
+    /// Turns every latched modifier off and sends up the modifiers held down for a lock; on the
+    /// 电脑键盘 also the keys and modifiers we hold down (actions go into `r`).
     pub(crate) fn release_modifiers(&mut self, r: &mut Response) {
         if self.pc {
             self.pc_release_all(r);
+        } else {
+            self.lift_mods(&mut r.actions);
         }
         if self.latch.iter().any(|l| *l != Latch::Off) {
             self.latch = [Latch::Off; 5];
@@ -644,6 +653,63 @@ impl KeyboardView {
             Latch::Once | Latch::Locked => Latch::Off,
         };
         self.last_mod_tap[i] = Some(self.now);
+    }
+
+    /// Locked Ctrl / Alt / Win are really held down (DESIGN.md §2「锁定 = 真按住」; on the
+    /// 电脑键盘 `pc_sync` does this). Rewrites the response's actions in order:
+    /// - A chord with a locked modifier: the modifier goes down first (once: it stays down) and
+    ///   is left out of the chord, which `SendInputSink` would otherwise press and release. So
+    ///   locked Alt + Tab, Tab sends Alt↓ Tab Tab, not Alt+Tab twice.
+    /// - A chord without it, typed text, cursor moves, voice, settings, hide: the held modifiers
+    ///   go up first (the lock stays lit and presses them again before the next key).
+    /// - A pending panel / layout change lifts them before everything; a modifier that is no
+    ///   longer locked goes up at the end (unlock).
+    ///
+    /// A lock without any key sends nothing (no lone Win = Start menu, lone Alt = menu bar).
+    fn hold_locked_mods(&mut self, r: &mut Response) {
+        let locked = |v: &Self, m: Modifier| v.latch[m.index()] == Latch::Locked;
+        if self.pc || !self.mods_down.contains(&true) && !LOCK_HELD.iter().any(|&(m, _)| locked(self, m)) {
+            self.lift_pending = false;
+            return;
+        }
+        let mut out = Vec::with_capacity(r.actions.len() + 2);
+        if std::mem::take(&mut self.lift_pending) {
+            self.lift_mods(&mut out);
+        }
+        for a in std::mem::take(&mut r.actions) {
+            match a {
+                UiAction::Input(Action::Key(mut c)) => {
+                    for (m, code) in LOCK_HELD {
+                        let i = m.index();
+                        let flag = match m {
+                            Modifier::Ctrl => &mut c.ctrl,
+                            Modifier::Alt => &mut c.alt,
+                            _ => &mut c.win,
+                        };
+                        if *flag && locked(self, m) {
+                            *flag = false;
+                            if !std::mem::replace(&mut self.mods_down[i], true) {
+                                out.push(UiAction::Input(Action::KeyDown(code)));
+                            }
+                        } else if std::mem::take(&mut self.mods_down[i]) {
+                            out.push(UiAction::Input(Action::KeyUp(code)));
+                        }
+                    }
+                    out.push(UiAction::Input(Action::Key(c)));
+                }
+                a if lifts_held_mods(&a) => {
+                    self.lift_mods(&mut out);
+                    out.push(a);
+                }
+                a => out.push(a),
+            }
+        }
+        for (m, code) in LOCK_HELD {
+            if !locked(self, m) && std::mem::take(&mut self.mods_down[m.index()]) {
+                out.push(UiAction::Input(Action::KeyUp(code)));
+            }
+        }
+        r.actions = out;
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1625,6 +1691,8 @@ impl KeyboardView {
 
     pub(crate) fn set_panel(&mut self, panel: Panel) {
         if self.panel != panel {
+            // A locked modifier must not stay down where its key may not be shown.
+            self.lift_pending |= !self.pc && self.mods_down.contains(&true);
             let tab_change = matches!((self.panel, panel), (Panel::Symbols(_), Panel::Symbols(_)));
             self.panel = panel;
             if tab_change || matches!(panel, Panel::Symbols(_)) {
@@ -1656,7 +1724,8 @@ impl KeyboardView {
     }
 
     /// Sets `timer_ms` to the earliest pending deadline.
-    pub(crate) fn finish(&self, mut r: Response) -> Response {
+    pub(crate) fn finish(&mut self, mut r: Response) -> Response {
+        self.hold_locked_mods(&mut r);
         let mut next: Option<u64> = None;
         let mut consider = |d: u64| next = Some(next.map_or(d, |n: u64| n.min(d)));
         for t in &self.touches {
@@ -1671,6 +1740,30 @@ impl KeyboardView {
         r.timer_ms = next.map(|d| d.saturating_sub(self.now).max(1));
         r
     }
+}
+
+/// Actions that must not run with a locked modifier held down: text and cursor moves ignore the
+/// modifiers (as they did before locks were held), and the host's voice / settings / paste / hide
+/// should not combine with them.
+fn lifts_held_mods(a: &UiAction) -> bool {
+    matches!(
+        a,
+        UiAction::Input(
+            Action::Char(_)
+                | Action::Text(_)
+                | Action::Backspace
+                | Action::Space
+                | Action::Enter
+                | Action::Select(_)
+                | Action::PickSpelling(_)
+                | Action::Edit(_)
+        ) | UiAction::Paste(_)
+            | UiAction::Voice
+            | UiAction::VoiceBall
+            | UiAction::Hide
+            | UiAction::OpenSettings
+            | UiAction::PcKeyboard(_)
+    )
 }
 
 fn expand(r: Rect, dx: f32, dy: f32) -> Rect {
@@ -1839,6 +1932,7 @@ impl View for KeyboardView {
         self.snapshot = Snapshot { commit: None, ..state.snapshot };
         if layout_changed {
             self.latch[Modifier::Shift.index()] = Latch::Off;
+            self.lift_pending |= !self.pc && self.mods_down.contains(&true);
             if self.panel == Panel::Menu {
                 self.panel = Panel::Keys;
             }

@@ -488,15 +488,22 @@ mod win {
     /// its `IShellDispatch2` and call its ShellExecute (it runs inside Explorer).
     fn shell_execute_as_user(file: &str, args: &str) -> windows::core::Result<()> {
         unsafe {
-            let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+            // Each step says where it failed (the chain crosses into Explorer's process).
+            let step = |what: &'static str| move |e: windows::core::Error| windows::core::Error::new(e.code(), format!("{what}: {}", e.message()));
+            let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER).map_err(step("ShellWindows"))?;
             let empty = VARIANT::default();
             let mut hwnd = 0i32;
-            let disp: IDispatch = windows.FindWindowSW(&empty, &empty, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
-            let sp: IServiceProvider = disp.cast()?;
-            let browser: IShellBrowser = sp.QueryService(&SID_STopLevelBrowser)?;
-            let view = browser.QueryActiveShellView()?;
-            let folder_view: IShellFolderViewDual = view.GetItemObject(SVGIO_BACKGROUND)?;
-            let shell: IShellDispatch2 = folder_view.Application()?.cast()?;
+            let disp: IDispatch =
+                windows.FindWindowSW(&empty, &empty, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH).map_err(step("FindWindowSW"))?;
+            let sp: IServiceProvider = disp.cast().map_err(step("IServiceProvider"))?;
+            let browser: IShellBrowser = sp.QueryService(&SID_STopLevelBrowser).map_err(step("QueryService"))?;
+            let view = browser.QueryActiveShellView().map_err(step("QueryActiveShellView"))?;
+            // As IDispatch first, then the dual interface (asking the view for
+            // IShellFolderViewDual directly fails with E_NOINTERFACE across processes).
+            let view_disp: IDispatch = view.GetItemObject(SVGIO_BACKGROUND).map_err(step("GetItemObject"))?;
+            let folder_view: IShellFolderViewDual = view_disp.cast().map_err(step("IShellFolderViewDual"))?;
+            let shell: IShellDispatch2 =
+                folder_view.Application().map_err(step("Application"))?.cast().map_err(step("IShellDispatch2"))?;
             shell.ShellExecute(
                 &BSTR::from(file),
                 &VARIANT::from(args),

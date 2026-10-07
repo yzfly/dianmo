@@ -371,12 +371,16 @@ mod imp {
         unsafe { e.GetDefaultAudioEndpoint(eRender, eConsole) }
     }
 
-    /// What we can write for a mix format.
-    fn sample_format(f: &WAVEFORMATEX) -> Option<SampleFormat> {
+    /// What we can write for a mix format. `p` must point at the whole format block as returned
+    /// by `GetMixFormat` (the extensible fields follow the `WAVEFORMATEX` header there; a copy of
+    /// the header alone would not have them).
+    unsafe fn sample_format(p: *const WAVEFORMATEX) -> Option<SampleFormat> {
+        // SAFETY: the caller passes a valid format block.
+        let f = unsafe { std::ptr::read_unaligned(p) };
         let (tag, bits) = (f.wFormatTag, f.wBitsPerSample);
         let sub = if tag == WAVE_FORMAT_EXTENSIBLE && f.cbSize >= 22 {
-            // SAFETY: cbSize says the extensible fields follow.
-            let x = unsafe { std::ptr::read_unaligned(f as *const WAVEFORMATEX as *const WAVEFORMATEXTENSIBLE) };
+            // SAFETY: cbSize says the extensible fields follow the header in the same block.
+            let x = unsafe { std::ptr::read_unaligned(p as *const WAVEFORMATEXTENSIBLE) };
             Some(x.SubFormat)
         } else {
             None
@@ -398,7 +402,7 @@ mod imp {
                 let client: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| format!("Activate: {e}"))?;
                 let mix = client.GetMixFormat().map_err(|e| format!("GetMixFormat: {e}"))?;
                 let f = std::ptr::read_unaligned(mix);
-                let fmt = sample_format(&f);
+                let fmt = sample_format(mix);
                 let (tag, bits) = (f.wFormatTag, f.wBitsPerSample);
                 let init = match fmt {
                     Some(_) => client

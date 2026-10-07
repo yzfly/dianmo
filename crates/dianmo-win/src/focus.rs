@@ -488,11 +488,12 @@ impl Shared {
             Some(kind) => FocusEvent::Editable { kind, by_touch },
             None => FocusEvent::NotEditable { by_touch },
         };
-        // Chromium/Electron editors (VS Code's `native-edit-context`) report an empty rect: use the
-        // nearest ancestor with a real one, so a tap into the already-focused editor re-shows us.
+        // Chromium/Electron editors (VS Code's `native-edit-context`) report an empty rect, and
+        // xterm.js terminals (VS Code's terminal) a caret-sized helper textarea: use the nearest
+        // ancestor with a real one, so a tap into the already-focused editor re-shows us.
         let field_rect = match console {
             Some(rc) => rc,
-            None if kind.is_some() && is_empty(&p.rect) => {
+            None if kind.is_some() && is_tiny(&p.rect) => {
                 let rc = ancestor_rect(el).unwrap_or(p.rect);
                 self.log(format_args!("empty field rect, using ancestor ({},{})-({},{})", rc.left, rc.top, rc.right, rc.bottom));
                 rc
@@ -775,7 +776,13 @@ fn is_empty(rc: &RECT) -> bool {
     rc.right <= rc.left || rc.bottom <= rc.top
 }
 
-/// Bounding rect of the nearest ancestor (control view) that has a non-empty one.
+/// Too small to be what the user taps (empty, or a caret-sized helper like xterm.js's textarea,
+/// 16×34 px at 200 %): a real text field is wider or taller than 48 px.
+fn is_tiny(rc: &RECT) -> bool {
+    is_empty(rc) || (rc.right - rc.left < 48 && rc.bottom - rc.top < 48)
+}
+
+/// Bounding rect of the nearest ancestor (control view) that is not [`is_tiny`].
 fn ancestor_rect(el: &IUIAutomationElement) -> Option<RECT> {
     thread_local! {
         static WALKER: std::cell::RefCell<Option<IUIAutomationTreeWalker>> = const { std::cell::RefCell::new(None) };
@@ -791,7 +798,7 @@ fn ancestor_rect(el: &IUIAutomationElement) -> Option<RECT> {
         for _ in 0..8 {
             cur = walker.GetParentElement(&cur).ok()?;
             let rc = cur.CurrentBoundingRectangle().ok()?;
-            if !is_empty(&rc) {
+            if !is_tiny(&rc) {
                 return Some(rc);
             }
         }

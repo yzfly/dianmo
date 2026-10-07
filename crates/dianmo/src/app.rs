@@ -104,6 +104,11 @@ pub struct DianmoApp {
     /// The engine is away on a job thread (`rime_ui.rs`).
     #[cfg(feature = "rime")]
     rime_busy: bool,
+    /// `now_ms()` of the last keyboard input (a word count waits for a pause, rime_ui).
+    last_input_ms: u64,
+    /// A delayed retry of a waiting word count is on its way (rime_ui).
+    #[cfg(feature = "rime")]
+    rime_idle_check: bool,
     #[cfg(feature = "rime")]
     rime_jobs: std::collections::VecDeque<rime_ui::RimeJob>,
     /// `dianmo.exe --deploy-user` is running; `fuzzy_again`: 模糊音 changed meanwhile.
@@ -115,6 +120,8 @@ pub struct DianmoApp {
     fuzzy_status: Status,
     user_words: Option<u32>,
     user_dict_status: Status,
+    /// The tray icon's 「新版本」 red dot (settings_ui).
+    update_badge: crate::update::Badge,
 }
 
 const ENGINES: usize = VoiceEngine::ALL.len();
@@ -266,6 +273,9 @@ impl DianmoApp {
             rime_options: None,
             #[cfg(feature = "rime")]
             rime_busy: false,
+            last_input_ms: 0,
+            #[cfg(feature = "rime")]
+            rime_idle_check: false,
             #[cfg(feature = "rime")]
             rime_jobs: Default::default(),
             #[cfg(feature = "rime")]
@@ -275,6 +285,7 @@ impl DianmoApp {
             fuzzy_status: Status::default(),
             user_words: None,
             user_dict_status: Status::default(),
+            update_badge: Default::default(),
         }
     }
 
@@ -375,6 +386,7 @@ impl DianmoApp {
     }
 
     fn input(&mut self, action: Action, view: &mut dyn View) -> Response {
+        self.last_input_ms = now_ms();
         self.ctl.handle(action);
         let mut r = view.set_input_state(self.input_state());
         self.sync_mode();
@@ -422,6 +434,7 @@ impl DianmoApp {
             r = self.input(Action::Space, view);
         }
         if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
+            r = merge(r, kv.release_locked_mods());
             r.repaint |= kv.set_pc_keyboard(pc);
             r.repaint |= kv.set_voice_mode(mode == InputMode::VoiceBall);
         }
@@ -628,13 +641,17 @@ impl App for DianmoApp {
             // Selection mode, the clipboard bar and toasts belong to the last text field.
             if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
                 kv.reset_transient();
+                voice = merge(voice, kv.release_locked_mods());
             }
         }
         self.refresh_tray(host);
         if !visible && self.ctl.is_composing() {
             // The target is probably gone; don't leave a stale composition behind.
-            return merge(voice, self.input(Action::ClearComposition, view));
+            voice = merge(voice, self.input(Action::ClearComposition, view));
         }
+        // A word count waits for the keyboard to hide (rime_ui).
+        #[cfg(feature = "rime")]
+        self.next_rime_job(host);
         voice
     }
 
@@ -858,7 +875,13 @@ fn voice_state_name(s: &VoiceState) -> &'static str {
 impl DianmoApp {
     fn event(&mut self, event: Box<dyn Any + Send>, view: &mut dyn View, host: &mut HostControl) -> Response {
         if let Some(ev) = event.downcast_ref::<FocusEvent>() {
-            return self.on_focus(*ev, view, host);
+            // A touch in an app: a locked Ctrl / Alt / Win must not stay held down there.
+            let touched = matches!(ev, FocusEvent::Editable { by_touch: true, .. } | FocusEvent::NotEditable { by_touch: true });
+            let lift = match view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
+                Some(kv) if touched => kv.release_locked_mods(),
+                _ => Response::none(),
+            };
+            return merge(lift, self.on_focus(*ev, view, host));
         }
         let event = match event.downcast::<ClipEvent>() {
             Ok(ev) => return self.on_clip_event(*ev, view, host),
@@ -910,6 +933,7 @@ impl DianmoApp {
                 // 模糊音: a customization without a matching user build (first start after an
                 // update, or changed while 点墨 was not running) is built now.
                 self.apply_fuzzy(host);
+                self.refresh_user_words(host);
                 return r;
             }
             Err(e) => e,
@@ -1020,7 +1044,7 @@ fn dump_keymap(view: &mut dyn View) {
         "redo", "selectall", "copy", "paste", "cut", "delword", "clear", "pc", "symbols", "numbers", "pcmode", "pcback",
         "prtsc", "select", "clipboard", "clipclose", "clearclips", "back", "sel_left", "sel_right", "sel_wordleft",
         "sel_wordright", "sel_up", "sel_down", "sel_home", "sel_end", "sel_copy", "sel_cut", "sel_paste", "sel_delete",
-        "sel_done", "voiceball", "exitvoice", "t9_1", "t9_2", "t9_3", "t9_4", "t9_5", "t9_6", "t9_7", "t9_8", "t9_9", "clip0", "clip1", "clip2", "clip3", "F1", "F4", "F5", "`", "-", "=", "[", "]", "\\", ";", "'", "/",
+        "sel_done", "voiceball", "exitvoice", "settings", "t9_1", "t9_2", "t9_3", "t9_4", "t9_5", "t9_6", "t9_7", "t9_8", "t9_9", "clip0", "clip1", "clip2", "clip3", "F1", "F4", "F5", "`", "-", "=", "[", "]", "\\", ";", "'", "/",
         ".",
     ];
     let letters: Vec<String> = ('a'..='z').chain('0'..='9').map(String::from).collect();

@@ -799,6 +799,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     Some(Some(w)) => {
                         let id = w.id;
                         drop(w);
+                        trim_heaps();
                         closed(id);
                     }
                     Some(None) => {}
@@ -807,6 +808,21 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
+}
+
+/// Gives freed heap memory back to the system after a window (and its WARP device) went away.
+/// Measured on the Surface (v0.2.1): a closed settings window still leaves ~35 MB of private
+/// memory behind (stable across reopenings, so pooled, not leaked); this and `IDXGIDevice3::Trim`
+/// changed little. Where it sits (WARP's pools?) is still open, see docs/status/dianmo.md.
+fn trim_heaps() {
+    use windows::Win32::System::Memory::{GetProcessHeaps, HeapCompact, HEAP_FLAGS};
+    unsafe {
+        let mut heaps = vec![Default::default(); 64];
+        let n = GetProcessHeaps(&mut heaps) as usize;
+        for h in heaps.into_iter().take(n.min(64)) {
+            HeapCompact(h, HEAP_FLAGS(0));
         }
     }
 }

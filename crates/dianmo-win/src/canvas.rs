@@ -214,6 +214,10 @@ impl Renderer {
                 ctx.ClearState();
                 ctx.Flush();
             }
+            // The driver's (WARP's) temporary allocations for this device.
+            if let Ok(d3) = gpu.d3d.cast::<windows::Win32::Graphics::Dxgi::IDXGIDevice3>() {
+                d3.Trim();
+            }
         }
         true
     }

@@ -10,6 +10,11 @@
 //!   (the stand-in engine types letters meanwhile; only when nothing is being composed), moved
 //!   to a short-lived thread, and handed back through `pending_rime` (`swap_in_rime`). One job
 //!   at a time; others queue.
+//! - The learned-word count (输入 page) is cached in `user_words`: counted once librime is up,
+//!   again whenever the settings window opens, and as part of 导出 / 导入 / 清空. A plain count
+//!   (`RimeJob::Count`) waits until the keyboard is hidden or has had no input for
+//!   [`COUNT_IDLE_MS`], so it never takes the engine away while someone types; the settings page
+//!   shows the cached number meanwhile.
 //! - The file dialogs run on their own threads, owned by the settings window.
 
 // Without librime most of this compiles to stubs.
@@ -24,6 +29,14 @@ use dianmo_win::HostControl;
 
 use super::DianmoApp;
 use crate::log;
+
+/// A word count runs once the keyboard has had no input for this long (or is hidden).
+#[cfg(feature = "rime")]
+const COUNT_IDLE_MS: u64 = 3000;
+
+/// Look again whether a waiting word count can run now.
+#[cfg(feature = "rime")]
+struct RimeIdleCheck;
 
 /// Which way the user dictionary file goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +79,8 @@ struct RimeJobDone {
     job: RimeJob,
     /// Words exported / imported / counted, or why it failed.
     result: Result<usize, String>,
+    /// The user dictionary's word count afterwards, if known.
+    words: Option<usize>,
 }
 
 /// `dianmo.exe --deploy-user` finished.
@@ -165,13 +180,29 @@ impl DianmoApp {
         self.next_rime_job(host);
     }
 
-    /// Starts the next queued job if the engine is free (here and not composing).
+    /// Starts the next queued job if the engine is free (here and not composing). A plain word
+    /// count waits until the keyboard is hidden or idle; other jobs go first.
     #[cfg(feature = "rime")]
     pub(super) fn next_rime_job(&mut self, host: &mut HostControl) {
         use crate::engine::AnyEngine;
-        if self.rime_busy || self.rime_jobs.is_empty() || self.ctl.is_composing() {
+        if self.rime_busy || self.ctl.is_composing() {
             return;
         }
+        let idle_for = dianmo_win::now_ms().saturating_sub(self.last_input_ms);
+        let typing = host.is_visible() && idle_for < COUNT_IDLE_MS;
+        let Some(next) = self.rime_jobs.iter().position(|j| !(typing && *j == RimeJob::Count)) else {
+            // Only a count is waiting: look again when the pause is long enough.
+            if !self.rime_jobs.is_empty() && !self.rime_idle_check {
+                self.rime_idle_check = true;
+                let proxy = host.proxy();
+                let wait = COUNT_IDLE_MS - idle_for.min(COUNT_IDLE_MS) + 50;
+                let _ = std::thread::Builder::new().name("dianmo-idle".into()).stack_size(64 * 1024).spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(wait));
+                    proxy.post(RimeIdleCheck);
+                });
+            }
+            return;
+        };
         let Some(opts) = self.rime_options.clone() else {
             self.rime_jobs.clear();
             return;
@@ -192,7 +223,7 @@ impl DianmoApp {
                 }
             }
         };
-        let Some(job) = self.rime_jobs.pop_front() else {
+        let Some(job) = self.rime_jobs.remove(next) else {
             self.pending_rime = Some(engine);
             return;
         };
@@ -202,15 +233,32 @@ impl DianmoApp {
         let spawned = std::thread::Builder::new().name("dianmo-rime-job".into()).spawn(move || {
             let mut engine = engine;
             let t = std::time::Instant::now();
-            let result = match &job {
-                RimeJob::Reload => engine.reload(&opts).map(|()| 0).map_err(|e| e.to_string()),
-                RimeJob::Export(p) => engine.export_user_dict(p).map_err(|e| e.to_string()),
-                RimeJob::Import(p) => engine.import_user_dict(p).map_err(|e| e.to_string()),
-                RimeJob::Clear => engine.clear_user_dict().map(|()| 0).map_err(|e| e.to_string()),
-                RimeJob::Count => engine.user_word_count().ok_or_else(|| "无法统计".to_owned()),
+            let (result, words) = match &job {
+                RimeJob::Reload => (engine.reload(&opts).map(|()| 0).map_err(|e| e.to_string()), None),
+                RimeJob::Export(p) => {
+                    // An export writes every entry: its count is the word count.
+                    let r = engine.export_user_dict(p).map_err(|e| e.to_string());
+                    let words = r.as_ref().ok().copied();
+                    (r, words)
+                }
+                RimeJob::Import(p) => {
+                    // Recount while the engine is away anyway (imported entries may merge).
+                    let r = engine.import_user_dict(p).map_err(|e| e.to_string());
+                    let words = if r.is_ok() { engine.user_word_count() } else { None };
+                    (r, words)
+                }
+                RimeJob::Clear => {
+                    let r = engine.clear_user_dict().map(|()| 0).map_err(|e| e.to_string());
+                    let words = r.is_ok().then_some(0);
+                    (r, words)
+                }
+                RimeJob::Count => {
+                    let words = engine.user_word_count();
+                    (words.ok_or_else(|| "无法统计".to_owned()), words)
+                }
             };
             log!("rime job {job:?} done in {} ms: {result:?}", t.elapsed().as_millis());
-            proxy.post(RimeJobDone { engine, job, result });
+            proxy.post(RimeJobDone { engine, job, result, words });
         });
         if let Err(e) = spawned {
             // The engine moved into the closure that failed to spawn is gone; librime keeps
@@ -255,7 +303,8 @@ impl DianmoApp {
         }
     }
 
-    /// The settings window opened: count the learned words.
+    /// Recounts the learned words (librime came up, or the settings window opened) once the
+    /// keyboard is hidden or idle; `user_words` keeps the last count meanwhile.
     pub(super) fn refresh_user_words(&mut self, host: &mut HostControl) {
         #[cfg(feature = "rime")]
         if self.rime_running() {
@@ -296,6 +345,15 @@ impl DianmoApp {
             Err(e) => e,
         };
         #[cfg(feature = "rime")]
+        let event = match event.downcast::<RimeIdleCheck>() {
+            Ok(_) => {
+                self.rime_idle_check = false;
+                self.next_rime_job(host);
+                return Ok(Response::none());
+            }
+            Err(e) => e,
+        };
+        #[cfg(feature = "rime")]
         let event = match event.downcast::<RimeJobDone>() {
             Ok(done) => return Ok(self.on_rime_job_done(*done, view, host)),
             Err(e) => e,
@@ -321,10 +379,15 @@ impl DianmoApp {
 
     #[cfg(feature = "rime")]
     fn on_rime_job_done(&mut self, done: RimeJobDone, view: &mut dyn View, host: &mut HostControl) -> Response {
-        let RimeJobDone { engine, job, result } = done;
+        let RimeJobDone { engine, job, result, words } = done;
         self.rime_busy = false;
         self.pending_rime = Some(engine);
         let r = self.swap_in_rime(view);
+        if let Some(n) = words {
+            self.user_words = Some(n.min(u32::MAX as usize) as u32);
+            // Fresh: a count still waiting for the keyboard to hide isn't needed.
+            self.rime_jobs.retain(|j| *j != RimeJob::Count);
+        }
         match (job, result) {
             (RimeJob::Reload, Ok(_)) => {
                 if !self.fuzzy_deploying {
@@ -343,15 +406,12 @@ impl DianmoApp {
             (RimeJob::Import(_), Ok(n)) => {
                 self.user_dict_status = Status::ok(format!("已导入 {n} 个词"));
                 self.toast(host, format!("已导入 {n} 个词"));
-                self.rime_jobs.push_back(RimeJob::Count);
             }
             (RimeJob::Clear, Ok(_)) => {
                 self.user_dict_status = Status::ok("已清空用户词库");
                 self.toast(host, "已清空用户词库");
-                self.user_words = Some(0);
             }
-            (RimeJob::Count, Ok(n)) => self.user_words = Some(n.min(u32::MAX as usize) as u32),
-            (RimeJob::Count, Err(_)) => {}
+            (RimeJob::Count, _) => {}
             (job, Err(e)) => {
                 let what = match job {
                     RimeJob::Export(_) => "导出",

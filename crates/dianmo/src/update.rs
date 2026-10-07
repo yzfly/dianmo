@@ -24,13 +24,74 @@
 //!
 //! JSON is read with a small built-in parser (below) instead of serde_json (saves ~100 KB).
 //! For tests, `DIANMO_UPDATE_REPO=owner/name` points the check at another repository, and
-//! `dianmo.exe --check-update` prints the result.
+//! `dianmo.exe --check-update` prints the result. `DIANMO_FAKE_VERSION=0.0.1` makes every check
+//! (automatic and manual) compare the latest release with that version instead of ours (and
+//! turns 「立即更新」 off); `DIANMO_UPDATE_DELAY_MS=5000` runs the first automatic check after that
+//! delay instead of 1 minute, regardless of `last_update_check`.
 
 // Used by app.rs (settings window); some parts only by tests and `--check-update`.
 #![allow(dead_code)]
 
 pub const REPO: &str = "yzfly/dianmo";
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
+
+/// Debug: pretend to be this version when checking for updates (see the module docs).
+pub const FAKE_VERSION_ENV: &str = "DIANMO_FAKE_VERSION";
+/// Debug: delay of the first automatic check in milliseconds (see the module docs).
+pub const UPDATE_DELAY_ENV: &str = "DIANMO_UPDATE_DELAY_MS";
+/// Default delay of the first automatic check after start.
+pub const FIRST_CHECK_DELAY_MS: u64 = 60_000;
+
+/// `DIANMO_FAKE_VERSION`, if set to a valid version.
+pub fn fake_version() -> Option<String> {
+    fake_from(std::env::var(FAKE_VERSION_ENV).ok().as_deref())
+}
+
+fn fake_from(v: Option<&str>) -> Option<String> {
+    let v = v?.trim();
+    Version::parse(v).is_some().then(|| v.trim_start_matches(['v', 'V']).to_owned())
+}
+
+/// The version checks compare the latest release with: ours, or `DIANMO_FAKE_VERSION`.
+pub fn compare_version() -> String {
+    fake_version().unwrap_or_else(|| CURRENT.to_owned())
+}
+
+/// `DIANMO_UPDATE_DELAY_MS`, if set to a number.
+pub fn debug_first_check_delay() -> Option<u64> {
+    delay_from(std::env::var(UPDATE_DELAY_ENV).ok().as_deref())
+}
+
+fn delay_from(v: Option<&str>) -> Option<u64> {
+    v?.trim().parse().ok()
+}
+
+/// The tray icon's 「新版本」 red dot: on while a newer version is available that hasn't been seen
+/// on the 关于 page yet. (The 关于 entry in the settings navigation keeps its own dot as long as
+/// the update is available.)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Badge {
+    /// The settings window is open on 关于.
+    about_shown: bool,
+    /// The newest available version shown on 关于.
+    seen: Option<String>,
+}
+
+impl Badge {
+    pub fn set_about_shown(&mut self, shown: bool) {
+        self.about_shown = shown;
+    }
+
+    /// Whether the dot should be on, given the version available now (if any). While 关于 is
+    /// shown, that version counts as seen.
+    pub fn update(&mut self, available: Option<&str>) -> bool {
+        let Some(v) = available else { return false };
+        if self.about_shown {
+            self.seen = Some(v.to_owned());
+        }
+        self.seen.as_deref() != Some(v)
+    }
+}
 
 /// A newer release.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -480,7 +541,10 @@ mod win {
     };
     use windows::core::{HSTRING, PCWSTR, w};
 
-    use super::{CURRENT, CheckOutcome, REPO, Release, UpdateEvent, parse_release};
+    use super::{
+        CURRENT, CheckOutcome, FIRST_CHECK_DELAY_MS, REPO, Release, UpdateEvent, compare_version,
+        debug_first_check_delay, fake_version, parse_release,
+    };
     use crate::log;
 
     static AUTO: AtomicBool = AtomicBool::new(true);
@@ -505,14 +569,19 @@ mod win {
 
     /// Starts the automatic check (once per process): first after 1 minute, then whenever a day
     /// has passed since the last check. `last_check` = unix seconds (0 = never).
+    /// `DIANMO_UPDATE_DELAY_MS`: the first check after that delay, whenever the last one was.
     pub fn start_auto_check(proxy: HostProxy, last_check: u64) {
         if AUTO_STARTED.swap(true, Ordering::SeqCst) {
             return;
         }
+        let debug_delay = debug_first_check_delay();
+        if let Some(ms) = debug_delay {
+            log!("update: first automatic check in {ms} ms (DIANMO_UPDATE_DELAY_MS)");
+        }
         let spawned =
             std::thread::Builder::new().name("dianmo-update".into()).stack_size(256 * 1024).spawn(move || {
-                std::thread::sleep(Duration::from_secs(60));
-                let mut last = last_check;
+                std::thread::sleep(Duration::from_millis(debug_delay.unwrap_or(FIRST_CHECK_DELAY_MS)));
+                let mut last = if debug_delay.is_some() { 0 } else { last_check };
                 loop {
                     let now = now_unix();
                     // A clock set back makes `last` look like the future: check then too.
@@ -566,6 +635,10 @@ mod win {
 
     /// Blocking check against GitHub. A missing repository or no release → `NoRelease`.
     pub fn check() -> Result<CheckOutcome, String> {
+        let current = compare_version();
+        if current != CURRENT {
+            log!("update check: comparing with {current} instead of {CURRENT} (DIANMO_FAKE_VERSION)");
+        }
         let url = format!("https://api.github.com/repos/{}/releases/latest", repo());
         let mut body = Vec::new();
         let status =
@@ -577,7 +650,7 @@ mod win {
                 true
             })?;
         match status {
-            200 => parse_release(&String::from_utf8_lossy(&body), CURRENT),
+            200 => parse_release(&String::from_utf8_lossy(&body), &current),
             404 => Ok(CheckOutcome::NoRelease),
             403 | 429 => Err("GitHub 暂时限制了访问次数，请过一会儿再试".into()),
             s => Err(format!("GitHub 返回 {s}")),
@@ -587,6 +660,12 @@ mod win {
     /// 「立即更新」: downloads the installer (posting `Progress`), verifies it, starts it with `/S`
     /// and posts `Installing` (or `Failed`).
     pub fn download_and_install(release: Release, proxy: HostProxy) {
+        if fake_version().is_some() {
+            // Testing the check with a pretend version: never install the (not newer) release.
+            log!("update {}: not installing, DIANMO_FAKE_VERSION is set", release.version);
+            proxy.post(UpdateEvent::Failed("调试中（设置了 DIANMO_FAKE_VERSION），不下载安装".into()));
+            return;
+        }
         if DOWNLOADING.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -887,6 +966,43 @@ mod tests {
         assert!(!is_newer("nightly", "0.1.0"));
         assert!(is_newer("1.91.1", "0.1.0"));
         assert_eq!(Version::parse("1.2.3.4"), None);
+    }
+
+    #[test]
+    fn fake_version_and_delay() {
+        assert_eq!(fake_from(Some("0.0.1")), Some("0.0.1".into()));
+        assert_eq!(fake_from(Some(" v0.1.0 ")), Some("0.1.0".into()));
+        assert_eq!(fake_from(Some("abc")), None);
+        assert_eq!(fake_from(Some("")), None);
+        assert_eq!(fake_from(None), None);
+        // A pretend old version sees the latest release as new (what the automatic and the
+        // manual check both do with `compare_version`).
+        let fake = fake_from(Some("0.0.1")).unwrap();
+        assert!(matches!(parse_release(SAMPLE, &fake), Ok(CheckOutcome::Available(r)) if r.version == "0.2.0"));
+        assert_eq!(delay_from(Some("5000")), Some(5000));
+        assert_eq!(delay_from(Some(" 0 ")), Some(0));
+        assert_eq!(delay_from(Some("1m")), None);
+        assert_eq!(delay_from(None), None);
+    }
+
+    #[test]
+    fn tray_badge_until_about_is_seen() {
+        let mut b = Badge::default();
+        assert!(!b.update(None));
+        // Found by the automatic check: dot on.
+        assert!(b.update(Some("0.3.0")));
+        // 关于 shown (navigation, tray 「关于点墨」…): off, and stays off for that version.
+        b.set_about_shown(true);
+        assert!(!b.update(Some("0.3.0")));
+        b.set_about_shown(false);
+        assert!(!b.update(Some("0.3.0")), "the daily check finds the same version again");
+        // A newer one: on again.
+        assert!(b.update(Some("0.3.1")));
+        // Checked while 关于 is open: seen at once.
+        b.set_about_shown(true);
+        assert!(!b.update(Some("0.4.0")));
+        // Updating / up to date: off.
+        assert!(!b.update(None));
     }
 
     #[test]

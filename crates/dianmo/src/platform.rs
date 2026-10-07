@@ -149,6 +149,14 @@ pub fn wait_for_instance(timeout: Duration, show: bool, settings: bool) -> bool 
     loop {
         unsafe {
             if let Ok(hwnd) = FindWindowExW(Some(HWND_MESSAGE), None, &class, PCWSTR::null()) {
+                // We were just started by the user (Start menu, shortcut): hand the right to come
+                // to the front over to the running instance, or Windows' foreground lock leaves
+                // the keyboard / settings window behind the active app.
+                let mut pid = 0u32;
+                windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                if pid != 0 {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(pid);
+                }
                 return msg.is_none_or(|m| PostMessageW(Some(hwnd), m, WPARAM(0), LPARAM(0)).is_ok());
             }
         }

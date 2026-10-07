@@ -58,6 +58,16 @@ pub(crate) fn text_w(text: &str, size: f32) -> f32 {
         * size
 }
 
+/// Estimated width of a chip label (14 DIP) with a margin for the estimate's error.
+fn chip_text_w(label: &str) -> f32 {
+    text_w(label, 14.0) * 1.1
+}
+
+/// Punctuation that must not begin a line.
+fn no_line_start(ch: char) -> bool {
+    matches!(ch, '，' | '。' | '、' | '；' | '：' | '！' | '？' | '）' | '」' | '』' | '》' | '〉' | '”' | '’' | '…' | ',' | ';' | '!' | '?' | ')')
+}
+
 /// Greedy line wrap for the estimate above; keeps ASCII words together when possible.
 pub(crate) fn wrap(text: &str, size: f32, max_w: f32) -> Vec<String> {
     let mut out = Vec::new();
@@ -73,7 +83,12 @@ pub(crate) fn wrap(text: &str, size: f32, max_w: f32) -> Vec<String> {
                 if !word.is_empty() {
                     tokens.push(std::mem::take(&mut word));
                 }
-                tokens.push(ch.to_string());
+                // Closing punctuation never starts a line (Chinese line-breaking rules): it
+                // sticks to what comes before it.
+                match tokens.last_mut() {
+                    Some(last) if no_line_start(ch) && last != " " => last.push(ch),
+                    _ => tokens.push(ch.to_string()),
+                }
             }
         }
         if !word.is_empty() {
@@ -594,7 +609,9 @@ fn layout_row(row: &Row, x0: f32, y: f32, w: f32, first: bool, ctx: &LayoutCtx) 
         let mut cx = text_x;
         let mut cy = bottom + 12.0;
         for c in &row.chips {
-            let cw = text_w(&c.label, 14.0) + 32.0;
+            // Room for the ✓ of a selected chip either way (toggling must not reflow the row) and
+            // some slack: the width is an estimate, DirectWrite's glyphs are a little wider.
+            let cw = chip_text_w(&c.label) + 32.0 + 20.0;
             if cx + cw > text_x + avail && cx > text_x {
                 cx = text_x;
                 cy += CHIP_H + 10.0;
@@ -920,13 +937,16 @@ fn paint_row(c: &mut dyn Canvas, lr: &LaidRow, p: &PaintCtx) {
         c.fill_rect(r, r.h / 2.0, if pressed { mix(bg, t.text, 0.08) } else { bg });
         c.stroke_rect(r, r.h / 2.0, 1.0, border);
         let check = if chip.on { "\u{E73E}" } else { "" };
-        let tw = text_w(&chip.label, 14.0);
+        let tw = chip_text_w(&chip.label);
         let total = tw + if chip.on { 20.0 } else { 0.0 };
         let x = r.x + (r.w - total) / 2.0;
         if chip.on {
             c.text(check, Rect::new(x - 2.0, r.y, 16.0, r.h), icon(12.0, fg));
         }
-        c.text(&chip.label, Rect::new(x + total - tw, r.y, tw + 4.0, r.h), style(14.0, dim(fg)));
+        // Left-aligned in a rect that reaches the chip's edge: an underestimated width must not
+        // clip the last glyph.
+        let lx = x + total - tw;
+        c.text(&chip.label, Rect::new(lx, r.y, (r.x + r.w - lx - 8.0).max(tw), r.h), style(14.0, dim(fg)));
     }
 }
 
@@ -1128,6 +1148,17 @@ mod tests {
         assert!(lines.len() >= 2);
         assert!(lines.iter().all(|l| text_w(l, 12.0) <= 120.0 + 0.1));
         assert_eq!(wrap("a\nb", 12.0, 100.0), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn wrap_keeps_closing_punctuation_off_line_starts() {
+        let text = "按键音：设置 › 键盘里打开。音量分小、中、大，音色有清脆和柔和两种；字母键和空格、删除、回车等功能键的声音略有不同。";
+        for max in (60..400).step_by(7) {
+            for l in wrap(text, 14.0, max as f32) {
+                let first = l.chars().next().unwrap_or(' ');
+                assert!(!no_line_start(first), "line starts with {first:?} at width {max}: {l}");
+            }
+        }
     }
 
     #[test]

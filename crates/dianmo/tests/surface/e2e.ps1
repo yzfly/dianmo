@@ -15,6 +15,8 @@
 #                       drag dx2, release (screenshots while dragging)
 #   TRAYMENU[:<downs>:<rights>]  open the test instance's tray menu, optionally move with the
 #               arrow keys (rights open a submenu), screenshot, Escape
+#   TRAYCLICK:<x>,<y>[;<x>,<y>…]  open the tray menu (cursor at 2200,1000) and click these screen
+#               points (menu item, submenu item), screenshots after each
 #   TRAYPICK<n> pick the n-th tray menu item (keyboard navigation); TRAYPICK:<keys> with
 #               d = down, r = right (submenu), e = enter, e.g. TRAYPICK:dddddrdde = 语音引擎 ▸ 3rd
 #   RUNKEY      print the HKCU Run entry
@@ -39,12 +41,34 @@
 #   SECOND      start dianmo.exe again (the running test instance should show its keyboard)
 #   SPEAK:<t>   say <t> with the zh-CN TTS voice (the microphone hears it; voice tests)
 #   TEXTKW:<kw> print the test Notepad's character count and whether it contains <kw> (not the text)
+#   BURST:<key>:<n>:<ms>  tap <key> n times, <ms> apart (fast typing)
+#   CHORD:<mod>:<key>  hold <mod> with one finger, tap <key> with another, release (a real chord)
+#   SYSDARK / SYSLIGHT  switch Windows' app theme (AppsUseLightTheme) and broadcast the change
+#               (「跟随系统」); the test restores the original value at the end
+#   THREADS     print the test instance's thread count and private memory
+#   SETTINGS    open the settings window (the keyboard's ⚙ key, else dianmo.exe --settings); its
+#               visible elements come from the DIANMO_SETTINGSMAP test hook
+#   STAP:<name> tap a settings element by name (nav title 「关于」, row key, button text, segment
+#               「theme/深色」, chip 「fuzzy/z~=~zh」 (~ = space)…); scrolls with PgDn until it is visible
+#   SKEY:<vk>   post a key to the settings window (decimal virtual-key code: 27 Esc, 35 End, 36 Home)
+#   SSHOT:<name> screenshot of the settings window frame to C:\Users\wecode\claude\dm-set-<name>.png
+#   SMAP        print the settings elements on screen
+#   SENDKEYS:<keys>  System.Windows.Forms.SendKeys to the foreground window ({ENTER}, {ESC}, ^v …)
+#   FG          print the foreground window's title and class
+#   CLOSEEXPLORER  close Explorer windows showing C:\Users\wecode\claude\… (opened by 导出 / 诊断包)
+#   CLOSETAB:<title part>  bring the top-level window whose title contains it to the front and
+#               press Ctrl+W (closes the browser tab a step opened, not the user's other tabs)
+#   FILE:<path> print whether <path> exists, its size and line count (not its content)
+#   LOGTAIL:<n> print the last n lines of the test instance's log
+#   METER:<sec> start sampling the default output device's peak meter in the background for <sec>
+#               seconds (key sound: does anything come out, does it clip); METEREND prints the result
 # Note: the keymap is rewritten when the app handles an action or event; panel switches inside
 # the keyboard (layout menu, trackpad end) don't produce one, so tap a key that does afterwards.
 $exe = Join-Path $RunDir 'dianmo.exe'
 $instance = 'Test'
 $dmArgs = @('--instance', $instance, '--no-elevate')
 $km = 'C:\Users\wecode\claude\dianmo-keymap.txt'
+$smap = 'C:\Users\wecode\claude\dianmo-settingsmap.txt'
 $applog = Join-Path $env:APPDATA "Dianmo-$instance\dianmo.log"
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type -TypeDefinition @'
@@ -55,6 +79,30 @@ public static class G {
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref PT p);
+  [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int a, out RC r, int size);
+  // Visible window of `pid` with class `cls` whose title contains `title`.
+  public static IntPtr FindOfTitle(uint pid, string cls, string title) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p); if (p != pid || !IsWindowVisible(h)) return true;
+      var sb = new StringBuilder(256); GetClassName(h, sb, 256); if (sb.ToString() != cls) return true;
+      var t = new StringBuilder(256); GetWindowText(h, t, 256); if (!t.ToString().Contains(title)) return true;
+      found = h; return false; }, IntPtr.Zero);
+    return found; }
+  public static string Title(IntPtr h) { var t = new StringBuilder(256); GetWindowText(h, t, 256); return t.ToString(); }
+  public static string Cls(IntPtr h) { var t = new StringBuilder(256); GetClassName(h, t, 256); return t.ToString(); }
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, string l, uint f, uint t, out IntPtr r);
+  public static void BroadcastTheme() { IntPtr r; SendMessageTimeout((IntPtr)0xffff, 0x001A, IntPtr.Zero, "ImmersiveColorSet", 2, 3000, out r); }
+  public static PT Origin(IntPtr h) { var p = new PT(); ClientToScreen(h, ref p); return p; }
+  public static void Key(IntPtr h, int vk) { PostMessage(h, 0x100, (IntPtr)vk, IntPtr.Zero); PostMessage(h, 0x101, (IntPtr)vk, IntPtr.Zero); }
+  public static void ShotWin(IntPtr h, string path) {
+    RC r; DwmGetWindowAttribute(h, 9, out r, 16);
+    using (var bmp = new System.Drawing.Bitmap(r.right - r.left, r.bottom - r.top)) {
+      using (var g = System.Drawing.Graphics.FromImage(bmp)) g.CopyFromScreen(r.left, r.top, 0, 0, bmp.Size);
+      bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png); } }
   public static IntPtr FindOf(uint pid, string cls) {
     IntPtr found = IntPtr.Zero;
     EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p); if (p != pid) return true;
@@ -90,7 +138,7 @@ public static class G {
   public static bool Up() { return Inj(M(0, cx, cy, UP)); }
   public static void MoveY(int dy) { cy += dy; Inj(M(0, cx, cy, UPDATE|INRANGE|INCONTACT)); }
 }
-'@
+'@ -ReferencedAssemblies System.Drawing
 function Shot($name) { $b = [System.Windows.Forms.SystemInformation]::VirtualScreen; $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
   [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size); $bmp.Save("C:\Users\wecode\claude\dm-$name.png", [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose() }
 function TabTip { $k = Get-ItemProperty 'HKCU:\Software\Microsoft\TabletTip\1.7' -ErrorAction SilentlyContinue
@@ -162,6 +210,7 @@ $nh = $np.MainWindowHandle; $edit = [T]::FindWindowEx($nh, [IntPtr]::Zero, 'Edit
 [T]::Tap(1200, 16) | Out-Null; Start-Sleep -Milliseconds 300
 Remove-Item $km -ErrorAction SilentlyContinue
 $env:DIANMO_KEYMAP = $km
+$env:DIANMO_SETTINGSMAP = $smap; Remove-Item $smap -ErrorAction SilentlyContinue
 $env:DIANMO_FOCUS_LOG = "C:\Users\wecode\claude\dianmo-focus.log"; Remove-Item $env:DIANMO_FOCUS_LOG -ErrorAction SilentlyContinue
 $t0 = Get-Date
 $dm = Start-Process $exe -ArgumentList $dmArgs -PassThru
@@ -175,7 +224,7 @@ try {
   "foreground still notepad: $([T]::GetForegroundWindow() -eq $nh)"
   $k = New-Object T+RECT; [T]::GetWindowRect($kh, [ref]$k) | Out-Null; "keyboard rect: $(Fmt $k)"
   $s = [T]::GetDpiForWindow($kh) / 96.0
-  function LoadMap { $m = @{}; Get-Content $km -Encoding UTF8 -ErrorAction SilentlyContinue | % { $f = $_ -split ' '; if ($f.Count -ge 3) { $m[$f[0]] = @([double]$f[1], [double]$f[2]) } }; $m }
+  function LoadMap { $m = @{}; Get-Content $km -Encoding UTF8 -ErrorAction SilentlyContinue | % { $f = $_ -split ' '; if ($f.Count -ge 3 -and $f[0] -ne 'page') { $m[$f[0]] = @([double]$f[1], [double]$f[2]) } elseif ($f[0] -eq 'page') { $script:spage = $f[1] } }; $m }
   $map = LoadMap
   "keymap entries: $($map.Count)"
   # Screen pixel of a key (keymap and window rect read fresh: layouts and AppBar stacking change).
@@ -205,6 +254,18 @@ try {
         $i++; Shot "step$i"
       }
       [G]::Up() | Out-Null; Start-Sleep -Milliseconds 300
+      continue
+    }
+    if ($key -like 'TRAYCLICK:*') {
+      # Opens the tray menu (as TRAYMENU) and clicks the given screen points with the mouse, a
+      # screenshot after each (keyboard navigation needs the foreground, which a posted callback
+      # doesn't get; a real tap on the icon does).
+      $th = [G]::FindOf([uint32]$dm.Id, 'DianmoTray')
+      if ($th -eq [IntPtr]::Zero) { "no tray window"; continue }
+      [T]::SetCursorPos(2200, 1000) | Out-Null
+      [T]::PostMessage($th, 0x8004, [IntPtr]::Zero, [IntPtr]0x7B) | Out-Null; Start-Sleep -Milliseconds 700
+      $i++; Shot "step$i"
+      foreach ($pt in ($key.Substring(10) -split ';')) { $xy = $pt -split ','; [T]::Click([int]$xy[0], [int]$xy[1]); Start-Sleep -Milliseconds 700; $i++; Shot "step$i" }
       continue
     }
     if ($key -like 'TRAYPICK*' -or $key -like 'TRAYMENU*') {
@@ -274,6 +335,72 @@ try {
       try { $tts.SelectVoice('Microsoft Huihui Desktop') } catch {}
       $tts.Volume = 100; $tts.Speak($key.Substring(6)); $tts.Dispose(); continue }
     if ($key -like 'TEXTKW:*') { $t = [T]::Text($edit); "notepad: chars=$(if ($t) { $t.Length } else { 0 }) keyword=$(if ($t) { $t.Contains($key.Substring(7)) } else { $false })"; continue }
+    if ($key -like 'BURST:*') {
+      $f = $key -split ':'; $p = KeyPx $f[1]; if (-not $p) { "no key $($f[1])"; continue }
+      for ($j = 0; $j -lt [int]$f[2]; $j++) { [T]::Tap($p[0], $p[1]) | Out-Null; Start-Sleep -Milliseconds ([int]$f[3]) }
+      Start-Sleep -Milliseconds 200; continue }
+    if ($key -like 'CHORD:*') {
+      $f = $key -split ':'; $a = KeyPx $f[1]; $b = KeyPx $f[2]; if (-not $a -or -not $b) { "no key $($f[1]) / $($f[2])"; continue }
+      [G]::Down($a[0], $a[1]) | Out-Null; [G]::Hold(150); [G]::Aux($b[0], $b[1]); [G]::Hold(100); [G]::Up() | Out-Null; Start-Sleep -Milliseconds 300; continue }
+    if ($key -eq 'SYSDARK' -or $key -eq 'SYSLIGHT') {
+      $pz = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+      if ($null -eq $script:themeBackup) { $script:themeBackup = (Get-ItemProperty $pz).AppsUseLightTheme }
+      Set-ItemProperty $pz AppsUseLightTheme ([int]($key -eq 'SYSLIGHT')) -Type DWord
+      [G]::BroadcastTheme(); Start-Sleep -Milliseconds 1200; "system apps theme: $(if ($key -eq 'SYSDARK') { 'dark' } else { 'light' })"; continue }
+    if ($key -eq 'THREADS') { $pp = Get-Process -Id $dm.Id; "threads=$($pp.Threads.Count) private=$([math]::Round($pp.PrivateMemorySize64/1MB,1))MB"; continue }
+    if ($key -like 'SENDKEYS:*') { [System.Windows.Forms.SendKeys]::SendWait($key.Substring(9)); Start-Sleep -Milliseconds 400; continue }
+    if ($key -eq 'FG') { $fh = [T]::GetForegroundWindow(); "fg: title=[$([G]::Title($fh))] class=[$([G]::Cls($fh))] is_test_notepad=$($fh -eq $nh)"; continue }
+    if ($key -eq 'CLOSEEXPLORER') { (New-Object -ComObject Shell.Application).Windows() | ? { $_.LocationURL -like '*wecode/claude*' -or $_.LocationURL -like '*Documents*' -or $_.LocationURL -like '*Downloads*' -or $_.LocationURL -like '*Desktop*' } | % { "explorer window closed: $($_.LocationName)"; $_.Quit() }; Start-Sleep -Milliseconds 400; continue }
+    if ($key -like 'CLOSETAB:*') {
+      $part = $key.Substring(9) -replace '~', ' '; $hit = $null
+      foreach ($pp in Get-Process | ? { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like "*$part*" }) { $hit = $pp; break }
+      if (-not $hit) { "closetab: no window with [$part]"; continue }
+      "closetab: [$($hit.MainWindowTitle)] ($($hit.ProcessName))"
+      [G]::SetForegroundWindow($hit.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 500
+      [System.Windows.Forms.SendKeys]::SendWait('^w'); Start-Sleep -Milliseconds 600; continue }
+    if ($key -like 'FILE:*') { $fp = $key.Substring(5); if (Test-Path $fp) { "file: $fp size=$((Get-Item $fp).Length) lines=$(@(Get-Content $fp -Encoding UTF8).Count)" } else { "file: $fp missing" }; continue }
+    if ($key -like 'LOGTAIL:*') { Get-Content $applog -Encoding UTF8 -Tail ([int]$key.Substring(8)) | % { "log: $_" }; continue }
+    if ($key -like 'SETTINGS*') {
+      # The keyboard's ⚙ key (like the user), else a second `dianmo.exe --settings`.
+      if (KeyPx 'settings') { TapKey 'settings' } else {
+        $p2 = Start-Process $exe -ArgumentList ($dmArgs + @('--settings')) -PassThru; $null = $p2.WaitForExit(5000) }
+      $sw = [IntPtr]::Zero; $dl = (Get-Date).AddSeconds(6)
+      while ($sw -eq [IntPtr]::Zero -and (Get-Date) -lt $dl) { Start-Sleep -Milliseconds 100; $sw = [G]::FindOfTitle([uint32]$dm.Id, 'DianmoAppWindow', '设置') }
+      Start-Sleep -Milliseconds 1200; "settings window: $($sw -ne [IntPtr]::Zero)"; continue }
+    if ($key -like 'STAP:*' -or $key -eq 'SMAP') {
+      function SMapLoad { $m = [ordered]@{}; Get-Content $smap -Encoding UTF8 -ErrorAction SilentlyContinue | % { $f = $_ -split "`t"; if ($f.Count -ge 3 -and $f[0] -ne 'page') { $m[$f[0]] = @([double]$f[1], [double]$f[2]) } elseif ($f[0] -eq 'page') { $script:spage = $f[1] } }; $m }
+      if ($key -eq 'SMAP') { "settings map: $((SMapLoad).Keys -join ' | ') (page $script:spage)"; continue }
+      $name = $key.Substring(5) -replace '~', ' '; $m = SMapLoad; $tries = 0
+      if (-not $m.Contains($name)) { [G]::Key($sw, 0x24); Start-Sleep -Milliseconds 300; $m = SMapLoad }
+      while (-not $m.Contains($name) -and $tries -lt 8) { [G]::Key($sw, 0x22); Start-Sleep -Milliseconds 400; $m = SMapLoad; $tries++ }
+      if (-not $m.Contains($name)) { "no settings element $name"; continue }
+      $o = [G]::Origin($sw); $sc = [T]::GetDpiForWindow($sw) / 96.0; $pt = $m[$name]
+      [T]::Tap([int]($o.x + $pt[0] * $sc), [int]($o.y + $pt[1] * $sc)) | Out-Null; Start-Sleep -Milliseconds 500; continue }
+    if ($key -like 'SKEY:*') { [G]::Key($sw, [int]$key.Substring(5)); Start-Sleep -Milliseconds 300; continue }
+    if ($key -like 'SSHOT:*') { [G]::ShotWin($sw, "C:\Users\wecode\claude\dm-set-$($key.Substring(6)).png"); continue }
+    if ($key -like 'METER:*') {
+      $meterJob = Start-Job -ArgumentList ([int]$key.Substring(6)) -ScriptBlock { param($sec)
+        Add-Type @'
+using System; using System.Runtime.InteropServices; using System.Diagnostics;
+[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDE {}
+[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)] interface IMMDE { int EnumAudioEndpoints(int f, int s, out IntPtr c); int GetDefaultAudioEndpoint(int flow, int role, out IMMD d); }
+[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)] interface IMMD { int Activate(ref Guid iid, int ctx, IntPtr p, [MarshalAs(UnmanagedType.IUnknown)] out object o); }
+[Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)] interface IMeter { int GetPeakValue(out float p); }
+public static class Meter {
+  // Samples the peak every 2 ms; returns "max=<peak> loud_ms=<ms above 0.01> bursts=<n> clip=<samples >= 0.99>".
+  public static string Run(int sec) {
+    IMMD d; ((IMMDE)new MMDE()).GetDefaultAudioEndpoint(0, 0, out d);
+    Guid iid = typeof(IMeter).GUID; object o; d.Activate(ref iid, 23, IntPtr.Zero, out o); var m = (IMeter)o;
+    var sw = Stopwatch.StartNew(); float max = 0; int loud = 0, bursts = 0, clip = 0; bool on = false;
+    while (sw.ElapsedMilliseconds < sec * 1000) { float p; m.GetPeakValue(out p); if (p > max) max = p;
+      if (p > 0.01f) { loud++; if (!on) bursts++; on = true; } else on = false; if (p >= 0.99f) clip++;
+      System.Threading.Thread.Sleep(2); }
+    return String.Format("max={0:F3} loud_samples={1} bursts={2} clip={3}", max, loud, bursts, clip); }
+}
+'@
+        [Meter]::Run($sec) }
+      Start-Sleep -Milliseconds 800; continue }
+    if ($key -eq 'METEREND') { if ($meterJob) { "meter: $(Receive-Job $meterJob -Wait -AutoRemoveJob)"; $meterJob = $null }; continue }
     if ($key -eq 'INI') { "settings: $((Get-Content $ini -Encoding UTF8 -ErrorAction SilentlyContinue | ? { $_ -match '^(voice|ball)' }) -join '; ')"; continue }
     if ($key -eq 'VIS') { "keyboard visible: $([T]::IsWindowVisible($kh))  fg=$([T]::GetForegroundWindow() -eq $nh)  work=$(Fmt ([T]::Work()))"; continue }
     if ($key -eq 'TEXT') { "text: [$(([T]::Text($edit)) -replace "`r`n",'\n')]"; continue }
@@ -294,7 +421,8 @@ try {
   $dm2 = Start-Process $exe -ArgumentList $dmArgs -PassThru; $null = $dm2.WaitForExit(5000)
   Start-Sleep -Milliseconds 500
   "second instance exited=$($dm2.HasExited); keyboard visible again=$([T]::IsWindowVisible($kh)); test dianmo processes=$(@(Get-Process dianmo | ? { $_.Path -and $_.Path.StartsWith($RunDir, [StringComparison]::OrdinalIgnoreCase) }).Count)"
-} finally {
+} catch { "ERROR: $_ (line $($_.InvocationInfo.ScriptLineNumber))" } finally {
+  if ($null -ne $script:themeBackup) { Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' AppsUseLightTheme $script:themeBackup -Type DWord; [G]::BroadcastTheme(); "system apps theme restored ($script:themeBackup)" }
   if ($kh -ne [IntPtr]::Zero) { [T]::PostMessage($kh, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null }
   if (!$dm.WaitForExit(5000)) { "dianmo did not exit on WM_CLOSE, killing"; Stop-Process -Id $dm.Id -Force } else { "dianmo exited, code $($dm.ExitCode)" }
   Start-Sleep -Milliseconds 300

@@ -6,7 +6,8 @@
 //!   after [`REPEAT_DELAY_MS`] every [`PC_REPEAT_MS`] (typematic).
 //! - Modifiers keep the rules of the other layouts (tap = next key, double tap = locked, held =
 //!   chord) but are real keys here: a modifier goes down right before the first key it applies to
-//!   and up when it no longer applies (latched: after that key; held: when the finger lifts). A
+//!   and up when it no longer applies (one-shot: after that key; locked Ctrl / Alt / Win: when
+//!   unlocked, like on the other layouts; held: when the finger lifts). A
 //!   long-pressed Shift / Ctrl / Alt is really held down even without another key (Shift alone
 //!   switches 中/英 in most Chinese IMEs; Ctrl + touching the app zooms).
 
@@ -21,6 +22,11 @@ use crate::view::{Response, UiAction};
 const SENT: [(Modifier, KeyCode); 4] =
     [(Modifier::Ctrl, KeyCode::Ctrl), (Modifier::Shift, KeyCode::Shift), (Modifier::Alt, KeyCode::Alt), (Modifier::Win, KeyCode::Win)];
 
+/// Modifiers whose lock really holds the key down (DESIGN.md §2「锁定 = 真按住」). Shift's lock is
+/// caps lock for typing: held down it would also shift committed text and taps in the app.
+pub(crate) const LOCK_HELD: [(Modifier, KeyCode); 3] =
+    [(Modifier::Ctrl, KeyCode::Ctrl), (Modifier::Alt, KeyCode::Alt), (Modifier::Win, KeyCode::Win)];
+
 impl KeyboardView {
     /// Turns the 电脑键盘 on or off. Returns true if it changed. Turning it off releases every
     /// key we hold down (the actions go into `r`).
@@ -28,9 +34,8 @@ impl KeyboardView {
         if self.pc == on {
             return false;
         }
-        if !on {
-            self.pc_release_all(r);
-        }
+        // Leaving: the keys we hold down; entering: modifiers held down for a lock.
+        self.pc_release_all(r);
         self.pc = on;
         self.latch = [Latch::Off; 5];
         self.selecting = false;
@@ -98,18 +103,25 @@ impl KeyboardView {
         r.repaint = true;
     }
 
+    /// A finger holds modifier `m` down (engaged: it applied to a key or was long-pressed).
+    fn finger_holds(&self, m: Modifier) -> bool {
+        self.touches.iter().any(|t| {
+            t.engaged && !t.consumed && matches!(&t.target, Target::Key(Key { action: KeyAction::Mod(tm), .. }) if *tm == m)
+        })
+    }
+
     /// Sends modifier downs / ups so that exactly the modifiers that apply are down: held ones
-    /// that are engaged, and latched ones while a pass-through key is pressed.
+    /// that are engaged, latched ones while a pass-through key is pressed, and locked Ctrl / Alt /
+    /// Win from their first key until unlocked.
     pub(crate) fn pc_sync(&mut self, r: &mut Response) {
         let key_down = self.touches.iter().any(|t| matches!(t.target, Target::Key(Key { action: KeyAction::Raw(_), .. })));
         for (m, code) in SENT {
-            let held = self.touches.iter().any(|t| {
-                t.engaged && !t.consumed && matches!(&t.target, Target::Key(Key { action: KeyAction::Mod(tm), .. }) if *tm == m)
-            });
-            let want = self.pc && (held || key_down && self.latch[m.index()] != Latch::Off);
             let i = m.index();
-            if want != self.pc_down[i] {
-                self.pc_down[i] = want;
+            let held = self.finger_holds(m);
+            let kept = self.mods_down[i] && m != Modifier::Shift && self.latch[i] == Latch::Locked;
+            let want = self.pc && (held || kept || key_down && self.latch[i] != Latch::Off);
+            if want != self.mods_down[i] {
+                self.mods_down[i] = want;
                 r.actions.push(UiAction::Input(if want { Action::KeyDown(code) } else { Action::KeyUp(code) }));
             }
         }
@@ -129,11 +141,36 @@ impl KeyboardView {
         for code in ups {
             r.actions.push(UiAction::Input(Action::KeyUp(code)));
         }
+        self.lift_mods(&mut r.actions);
+    }
+
+    /// Sends up every modifier we hold down (latches stay: a lock presses it again before the
+    /// next key).
+    pub(crate) fn lift_mods(&mut self, out: &mut Vec<UiAction>) {
         for (m, code) in SENT {
-            if std::mem::take(&mut self.pc_down[m.index()]) {
+            if std::mem::take(&mut self.mods_down[m.index()]) {
+                out.push(UiAction::Input(Action::KeyUp(code)));
+            }
+        }
+    }
+
+    /// For the host: sends up the modifiers held down for a lock (the lock stays lit and presses
+    /// them again before the next key). Call it when the keyboard hides, when focus moves by
+    /// touch, and before changing the input mode from outside (tray, settings), so no Ctrl / Alt
+    /// / Win stays stuck. Modifiers a finger holds on the 电脑键盘, or that apply to a key being
+    /// pressed, stay down.
+    pub fn release_locked_mods(&mut self) -> Response {
+        let mut r = Response::none();
+        let key_down = self.touches.iter().any(|t| matches!(t.target, Target::Key(Key { action: KeyAction::Raw(_), .. })));
+        for (m, code) in SENT {
+            let i = m.index();
+            if self.mods_down[i] && !self.finger_holds(m) && !(self.pc && key_down) {
+                self.mods_down[i] = false;
                 r.actions.push(UiAction::Input(Action::KeyUp(code)));
             }
         }
+        self.lift_pending = false;
+        r
     }
 
     /// The thin top bar of the 电脑键盘: 返回 on the left; voice and hide on the right.

@@ -94,6 +94,8 @@ pub struct SettingsView {
     slider_drag: Option<(usize, f32)>,
     /// A short message at the bottom of the content (text, hide time in ms).
     toast: Option<(String, u64)>,
+    /// Test hook: file that gets the visible elements after every paint (see `set_element_dump`).
+    dump: Option<(std::path::PathBuf, String)>,
 }
 
 impl SettingsView {
@@ -115,6 +117,7 @@ impl SettingsView {
             anim: None,
             slider_drag: None,
             toast: None,
+            dump: None,
         };
         v.relayout();
         v
@@ -137,6 +140,15 @@ impl SettingsView {
 
     pub fn page(&self) -> Page {
         self.page
+    }
+
+    /// [`Self::set_page`] by the user: also tells the host ([`SettingsAction::PageShown`]).
+    fn go_to(&mut self, page: Page) -> bool {
+        let changed = self.set_page(page);
+        if changed {
+            self.actions.push(SettingsAction::PageShown(page));
+        }
+        changed
     }
 
     pub fn set_page(&mut self, page: Page) -> bool {
@@ -212,6 +224,48 @@ impl SettingsView {
         let r = shift(h.press, self.content_dy());
         let r = if r.w > 0.0 { r } else { shift(h.rect, self.content_dy()) };
         Some((r.x + r.w / 2.0, r.y + r.h / 2.0))
+    }
+
+    /// The navigation entries and the elements of the current page that are on screen, with
+    /// their centers (DIPs, window coordinates).
+    pub fn visible_elements(&self) -> Vec<(String, f32, f32)> {
+        let mut out: Vec<(String, f32, f32)> = Page::ALL
+            .iter()
+            .map(|p| {
+                let r = self.nav_rect(*p);
+                (p.title().to_owned(), r.x + r.w / 2.0, r.y + r.h / 2.0)
+            })
+            .collect();
+        let vp = self.viewport();
+        for h in &self.laid.hits {
+            let r = shift(h.press, self.content_dy());
+            let r = if r.w > 0.0 { r } else { shift(h.rect, self.content_dy()) };
+            let (x, y) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+            if !h.name.is_empty() && y >= vp.y && y <= vp.y + vp.h {
+                out.push((h.name.clone(), x, y));
+            }
+        }
+        out
+    }
+
+    /// Test hook for GUI automation: after every paint, writes `name<TAB>x<TAB>y` lines
+    /// ([`Self::visible_elements`]) to `path` when they changed.
+    pub fn set_element_dump(&mut self, path: Option<std::path::PathBuf>) {
+        self.dump = path.map(|p| (p, String::new()));
+    }
+
+    fn write_dump(&mut self) {
+        let Some((path, last)) = &self.dump else { return };
+        let mut text = format!("page\t{}\t0\n", self.page.title());
+        for (n, x, y) in self.visible_elements() {
+            text.push_str(&format!("{n}\t{x:.1}\t{y:.1}\n"));
+        }
+        if &text != last {
+            let _ = std::fs::write(path, &text);
+            if let Some((_, last)) = &mut self.dump {
+                *last = text;
+            }
+        }
     }
 
     /// Scrolls so the named element is visible. Returns whether it exists.
@@ -568,7 +622,7 @@ impl SettingsView {
                     }
                     PressMode::Pending => match p.target {
                         PressTarget::Nav(page) => {
-                            self.set_page(page);
+                            self.go_to(page);
                             Response::repaint()
                         }
                         PressTarget::Hit(i) => {
@@ -620,7 +674,7 @@ impl SettingsView {
             // Tab: next page.
             0x09 => {
                 let i = Page::ALL.iter().position(|&p| p == self.page).unwrap_or(0);
-                self.set_page(Page::ALL[(i + 1) % Page::ALL.len()]);
+                self.go_to(Page::ALL[(i + 1) % Page::ALL.len()]);
                 return Response::repaint();
             }
             _ => return Response::none(),
@@ -666,6 +720,7 @@ impl View for SettingsView {
         self.paint_nav(c);
         self.paint_scrollbar(c);
         self.paint_toast(c);
+        self.write_dump();
     }
 
     fn pointer(&mut self, e: PointerEvent) -> Response {

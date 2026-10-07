@@ -147,10 +147,13 @@ impl DianmoApp {
                 host.update_window(id, move |v| {
                     if settings_view(v).is_some_and(|s| s.set_page(p)) { Response::repaint() } else { Response::none() }
                 });
+                self.page_shown(p, host);
             }
             return;
         }
         let mut view = SettingsView::new(self.model(), self.theme_kind());
+        // Test hook (GUI automation on the Surface): the visible elements, after every paint.
+        view.set_element_dump(std::env::var_os("DIANMO_SETTINGSMAP").map(PathBuf::from));
         if let Some(p) = page {
             view.set_page(p);
         }
@@ -167,6 +170,7 @@ impl DianmoApp {
         log!("settings window opened ({page:?})");
         self.settings_win = Some(id);
         self.shown_model = None;
+        self.page_shown(page.unwrap_or_default(), host);
         // Fresh system state for the window.
         self.check_admin_task(host);
         self.check_voice_engines(host);
@@ -209,6 +213,7 @@ impl DianmoApp {
     pub(super) fn window_closed(&mut self, id: WindowId) {
         if self.settings_win == Some(id) {
             self.settings_win = None;
+            self.update_badge.set_about_shown(false);
             log!("settings window closed");
         }
         if self.onboarding_win == Some(id) {
@@ -440,8 +445,8 @@ impl DianmoApp {
                 Response::none()
             }
             A::InstallUpdate => {
-                host.set_tray_badge(false);
                 self.install_update(host);
+                self.refresh_tray_badge(host);
                 Response::none()
             }
             A::ReportIssue => {
@@ -481,7 +486,27 @@ impl DianmoApp {
                 host.close_window(from);
                 Response::none()
             }
+            A::PageShown(p) => {
+                self.page_shown(p, host);
+                Response::none()
+            }
         }
+    }
+
+    /// The settings window now shows `page`: seeing 关于 clears the tray icon's red dot (the
+    /// navigation keeps its dot while the update is available).
+    fn page_shown(&mut self, page: Page, host: &mut HostControl) {
+        self.update_badge.set_about_shown(page == Page::About);
+        self.refresh_tray_badge(host);
+    }
+
+    /// The tray icon's 「新版本」 red dot (`update::Badge`).
+    fn refresh_tray_badge(&mut self, host: &mut HostControl) {
+        let available = match &self.update {
+            UpdateState::Available { version, .. } => Some(version.as_str()),
+            _ => None,
+        };
+        host.set_tray_badge(self.update_badge.update(available));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -690,13 +715,11 @@ impl DianmoApp {
                 match outcome {
                     Ok(CheckOutcome::Available(r)) => {
                         log!("update {} available", r.version);
-                        // Red dot on the tray icon until updated.
-                        host.set_tray_badge(true);
+                        // Red dot on the tray icon until 关于 is seen (`refresh_tray_badge`).
                         self.update = UpdateState::Available { version: r.version.clone(), notes: r.notes.clone() };
                         self.release = Some(r);
                     }
                     Ok(CheckOutcome::UpToDate { .. } | CheckOutcome::NoRelease) => {
-                        host.set_tray_badge(false);
                         self.release = None;
                         self.update = UpdateState::UpToDate;
                     }
@@ -716,6 +739,7 @@ impl DianmoApp {
             }
             UpdateEvent::Failed(e) => self.update = UpdateState::Failed(e),
         }
+        self.refresh_tray_badge(host);
     }
 
     fn export_diagnostics(&mut self, host: &mut HostControl) {

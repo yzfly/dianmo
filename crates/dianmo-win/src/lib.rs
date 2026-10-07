@@ -11,24 +11,42 @@
 //! - App windows (settings, about, onboarding): [`HostControl::open_window`] shows a
 //!   [`dianmo_ui::View`] in an ordinary activatable window on the same thread and devices.
 //!
-//! The crate is empty on non-Windows targets so the workspace still builds and tests on Linux.
-#![cfg(windows)]
+//! On non-Windows targets the crate only has its platform-independent helpers (e.g. the floating
+//! ball's geometry, unit-tested there) so the workspace still builds and tests on Linux.
 
+mod ball_geom;
+#[cfg(windows)]
 mod appbar;
+#[cfg(windows)]
 mod canvas;
+#[cfg(windows)]
 mod clock;
+#[cfg(windows)]
 pub mod focus;
+#[cfg(windows)]
 mod handle;
+#[cfg(windows)]
 mod host;
+#[cfg(windows)]
 mod sink;
+#[cfg(windows)]
 pub mod tabtip;
+#[cfg(windows)]
 mod tray;
+#[cfg(windows)]
 mod window;
 
+#[cfg(windows)]
 pub use clock::now_ms;
+#[cfg(windows)]
 pub use handle::{BallEdge, BallEvent, BallPos, BallState};
+#[cfg(windows)]
 pub use focus::{FieldKind, FocusEvent, FocusWatcher, start_focus_watcher};
+#[cfg(windows)]
 pub use host::{App, HostControl, HostOptions, HostProxy, enable_per_monitor_dpi, run, run_with};
+#[cfg(windows)]
 pub use tray::TrayItem;
+#[cfg(windows)]
 pub use window::{WindowId, WindowOptions, system_dark_mode};
+#[cfg(windows)]
 pub use sink::{SendInputSink, send_chord, send_edit_key, send_key_event, send_text, start_voice_typing};

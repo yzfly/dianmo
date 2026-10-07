@@ -791,24 +791,16 @@ fn unavailable_reason(e: VoiceEngine, doubao_exe_setting: Option<&Path>, may_lau
             if doubao_ime_service().is_none() {
                 return Some("豆包输入法没有在运行".into());
             }
+            // Measured on the Surface (2026-10-07, 豆包输入法 0.9.1.22): it ignores injected
+            // keys. Neither its 「免按模式」 (right Alt+Space) nor its 「长按模式」 (hold right Alt)
+            // reacted to SendInput, with 豆包输入法 as the target window's input method, with
+            // `enableGlobalVoiceShortcut` on (its settings window has no switch for it) or off;
+            // the system menu opened instead. So it can't be driven until it accepts them.
             let cfg = doubao_ime_config().unwrap_or_default();
             if !cfg.shortcut {
                 return Some("豆包输入法关闭了语音快捷键（豆包输入法设置 → 语音输入）".into());
             }
-            if cfg.mode != "right_alt_space" {
-                // Seen: `null` after its settings window was first opened (meaning unknown).
-                return Some(if cfg.mode == "null" || cfg.mode.is_empty() {
-                    "豆包输入法没有设置「免按模式」语音快捷键（豆包输入法设置 → 语音输入）".to_owned()
-                } else {
-                    format!("豆包输入法的语音快捷键不是「右 Alt+空格」（{}）", cfg.mode)
-                });
-            }
-            // Without the global shortcut it only works while 豆包输入法 is the target window's
-            // input method, and elsewhere right Alt+Space opens the window's system menu.
-            if !cfg.global {
-                return Some("豆包输入法没有打开全局语音快捷键（豆包输入法设置 → 语音输入）".into());
-            }
-            None
+            Some("豆包输入法不响应模拟按键，点墨暂时调不起它的语音；请先用微信输入法".into())
         }
         VoiceEngine::DoubaoVoice => {
             let Some(cfg) = doubao_config() else {
@@ -1181,7 +1173,13 @@ fn blocked_by_elevated_foreground(engine: VoiceEngine) -> Option<String> {
         VoiceEngine::DoubaoVoice => find_process(|n| n.starts_with(DOUBAO_PREFIX)),
         VoiceEngine::System => None,
     }?;
-    let fg = integrity_level(foreground_pid()?)?;
+    let fg_pid = foreground_pid()?;
+    // Our own window in front (right after the tray menu, which activates its hidden window):
+    // no text field to type into, and not an administrator window either.
+    if fg_pid == std::process::id() {
+        return Some("先点一下要输入文字的地方，再点麦克风".to_owned());
+    }
+    let fg = integrity_level(fg_pid)?;
     let eng = integrity_level(engine_pid)?;
     (fg > eng).then(|| format!("{}收不到管理员窗口里的语音快捷键（Windows 权限隔离），请在普通窗口里使用", engine.label()))
 }
