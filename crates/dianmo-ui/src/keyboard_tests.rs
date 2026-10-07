@@ -1919,3 +1919,38 @@ fn shuangpin_scheme_changes_the_key_faces() {
     w.tap("layout");
     assert!(w.v.keys.iter().any(|k| k.sub.as_deref() == Some("搜狗双拼")));
 }
+
+#[test]
+fn url_and_email_fields_get_quick_keys() {
+    let mut kb = KeyboardView::default();
+    kb.resize(1440.0, 520.0);
+    assert!(kb.key_center(".com").is_none());
+    assert!(kb.set_field_hint(FieldHint::Url));
+    assert!(!kb.set_field_hint(FieldHint::Url));
+    for k in [".com", "/", "www."] {
+        assert!(kb.key_center(k).is_some(), "{k}");
+    }
+    assert!(kb.set_field_hint(FieldHint::Email));
+    assert!(kb.key_center("@").is_some());
+    assert!(kb.key_center("@qq.com").is_some());
+    assert!(kb.key_center("/").is_none());
+    // Portrait Surface (960 DIP): fewer quick keys, the most useful ones stay.
+    kb.resize(960.0, 420.0);
+    assert!(kb.key_center(".com").is_some());
+    assert!(kb.set_field_hint(FieldHint::Text));
+    assert!(kb.key_center("@qq.com").is_none());
+}
+
+#[test]
+fn pc_keyboard_is_taller_in_portrait() {
+    let mut kb = KeyboardView::default();
+    let phone = kb.preferred_height(960.0);
+    let wide = kb.preferred_height(1440.0);
+    assert!(kb.set_pc_keyboard(true));
+    let h = kb.preferred_height(960.0);
+    assert!(h > phone + 40.0, "{h} vs {phone}");
+    kb.resize(960.0, h);
+    assert!(kb.m.row_h >= 44.0, "row {}", kb.m.row_h);
+    // Landscape keeps the wide height.
+    assert_eq!(kb.preferred_height(1440.0), wide);
+}

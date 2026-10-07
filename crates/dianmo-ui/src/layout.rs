@@ -662,6 +662,14 @@ pub(crate) fn preferred_height_wide(width: f32, scale: f32) -> f32 {
     wide_bar(width) + WIDE_ROWS as f32 * row + 10.0 * row0 / 64.0
 }
 
+/// 电脑键盘 height on a narrow (portrait) screen: six rows of about 46 DIP instead of squeezing
+/// them into the phone height (portrait Surface: 312 DIP rather than 250).
+pub(crate) fn preferred_height_pc(width: f32) -> f32 {
+    let row = preferred_row(width);
+    let s = row / 64.0;
+    (bar_height(row) * 0.62).clamp(28.0, 38.0) + PC_ROWS as f32 * row * 0.92 + 10.0 * s
+}
+
 /// Rows of the 电脑键盘 layout (the function-key row counts as one).
 pub(crate) const PC_ROWS: usize = 6;
 /// Width of the 电脑键盘 in key units (a laptop keyboard row).

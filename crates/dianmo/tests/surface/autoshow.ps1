@@ -41,6 +41,10 @@ function HideKeyTap {
   $f = $line -split ' '; $r = New-Object T+RECT; [T]::GetWindowRect($kh, [ref]$r) | Out-Null; $s = [T]::GetDpiForWindow($kh) / 96.0
   [T]::Tap([int]($r.left + [double]$f[1] * $s), [int]($r.top + [double]$f[2] * $s)) | Out-Null; Start-Sleep -Milliseconds 700
 }
+# Whether the keyboard shows a key (keymap test hook; names as in app.rs dump_keymap).
+# Sets the clipboard text, retrying while another process (点墨's listener) has it open.
+function SetClip($t) { for ($k = 0; $k -lt 10; $k++) { try { [System.Windows.Forms.Clipboard]::SetText($t); return $true } catch { Start-Sleep -Milliseconds 150 } }; $false }
+function KmHas($name) { [bool](Get-Content $km -Encoding UTF8 -ErrorAction SilentlyContinue | ? { $_.StartsWith("$name ") }) }
 function On($n) { $Sections -eq 'all' -or ($Sections -split ',') -contains $n }
 $edge = 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
 $edgeDir = "$dir\edge-focus-profile"
@@ -95,8 +99,12 @@ try {
       $search = FindDesc $ewin $AEl::ClassNameProperty 'UniversalSearchBand'
       TapEl $search 'explorer: search box' $true
       Shot 'explorer'
-      $list = FindDesc $ewin $AEl::ClassNameProperty 'UIItemsView'
-      TapEl $list 'explorer: file list (not editable)' $false
+      $list = WaitFind $ewin $AEl::ClassNameProperty 'UIItemsView' 5000
+      # A file in the list (a tap selects it); the list's blank middle may not take focus.
+      $item = if ($list) { $list.FindFirst($TS::Descendants, (Cond $AEl::ControlTypeProperty ([System.Windows.Automation.ControlType]::ListItem))) }
+      if ($item) { "explorer: tapping list item [$($item.Current.Name)]"; TapEl $item 'explorer: file list item (not editable)' $false 1500 }
+      else { TapEl $list 'explorer: file list (not editable)' $false 1500 }
+      Shot 'explorer-list'
       $exWin.Quit(); $exWin = $null; Start-Sleep -Milliseconds 600
     } else { $results.Add('FAIL  explorer window not found') }
   }
@@ -123,7 +131,27 @@ try {
       TapEl (FindDesc $edgeWin $AEl::AutomationIdProperty 'txt') 'edge: text input after the button' $true
       Shot 'edge-area'
       TapEl (FindDesc $edgeWin $AEl::ClassNameProperty 'OmniboxViewViews') 'edge: address bar' $true
+      "edge address bar: quick keys .com=$(KmHas '.com') /=$(KmHas '/')"
+      Shot 'edge-omnibox'
       [F]::Key(0x1B); Start-Sleep -Milliseconds 300
+      # Field types (v0.2.2): number / tel -> number pad, url / email -> quick keys, password ->
+      # no clipboard history.
+      foreach ($f in @('num', 'pw', 'url', 'mail', 'tel', 'txt2')) {
+        TapEl (FindDesc $edgeWin $AEl::AutomationIdProperty $f) "edge: $f input" $true 1200
+        "edge $f`: number pad=$(KmHas 'back') quick .com=$(KmHas '.com') @=$(KmHas '@') www.=$(KmHas 'www.')"
+        Shot "edge-$f"
+      }
+      # Clipboard changes while a password field has focus are not recorded (another app's copy,
+      # as Chromium itself won't copy out of a password field); then the same in a text field.
+      $clipSaved = try { [System.Windows.Forms.Clipboard]::GetText() } catch { '' }
+      TapEl (FindDesc $edgeWin $AEl::AutomationIdProperty 'pw') 'edge: password again' $true 800
+      $null = SetClip 'dianmo-secret-test'; Start-Sleep -Milliseconds 800
+      "edge password focused, clipboard set: clip card shown=$(KmHas 'clip0')"
+      Shot 'edge-pw-clip'
+      TapEl (FindDesc $edgeWin $AEl::AutomationIdProperty 'txt2') 'edge: text 2 again' $true 800
+      $null = SetClip 'dianmo-plain-test'; Start-Sleep -Milliseconds 800
+      "edge text focused, clipboard set: clip card shown=$(KmHas 'clip0')"
+      if ($clipSaved) { $null = SetClip $clipSaved }
     } else { $results.Add('FAIL  edge test page not found') }
     CloseEdge
   }

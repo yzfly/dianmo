@@ -99,7 +99,7 @@ Set-Location '$dir'
 if (-not (Test-Path \$exe)) { \$exe = 'target\release\dianmo.exe' }
 if (-not (Test-Path \$exe)) { throw "dianmo.exe not built" }
 \$imports = llvm-objdump -p \$exe | Select-String 'DLL Name: (.+)' | % { \$_.Matches[0].Groups[1].Value.ToLower() }
-\$system = 'kernel32.dll','user32.dll','gdi32.dll','advapi32.dll','shell32.dll','ole32.dll','oleaut32.dll','d2d1.dll','d3d11.dll','dxgi.dll','dwrite.dll','dcomp.dll','dwmapi.dll','uxtheme.dll','comctl32.dll','shcore.dll','ws2_32.dll','bcrypt.dll','bcryptprimitives.dll','ntdll.dll','userenv.dll','uiautomationcore.dll','imm32.dll','msvcrt.dll','ucrtbase.dll','version.dll','winmm.dll','propsys.dll','combase.dll','synchronization.dll','winhttp.dll'
+\$system = 'kernel32.dll','user32.dll','gdi32.dll','advapi32.dll','shell32.dll','ole32.dll','oleaut32.dll','d2d1.dll','d3d11.dll','dxgi.dll','dwrite.dll','dcomp.dll','dwmapi.dll','uxtheme.dll','comctl32.dll','shcore.dll','ws2_32.dll','bcrypt.dll','bcryptprimitives.dll','ntdll.dll','userenv.dll','uiautomationcore.dll','imm32.dll','msvcrt.dll','ucrtbase.dll','version.dll','winmm.dll','propsys.dll','combase.dll','synchronization.dll','winhttp.dll','oleacc.dll'
 \$bad = @(\$imports | ? { \$_ -notin \$system -and \$_ -notlike 'api-ms-win-*' })
 "imports: \$(\$imports -join ', ')"
 if (\$bad.Count) { throw "unexpected DLL imports: \$(\$bad -join ', ')" }

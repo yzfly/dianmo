@@ -166,11 +166,15 @@ impl DianmoApp {
             dark: prefs::window_dark(self.settings.theme),
             ..WindowOptions::default()
         };
+        crate::memdiag::report("before settings");
         let id = host.open_window(Box::new(view), opts);
         log!("settings window opened ({page:?})");
         self.settings_win = Some(id);
         self.shown_model = None;
         self.page_shown(page.unwrap_or_default(), host);
+        if disabled("settings-checks") {
+            return;
+        }
         // Fresh system state for the window.
         self.check_admin_task(host);
         self.check_voice_engines(host);
@@ -215,6 +219,15 @@ impl DianmoApp {
             self.settings_win = None;
             self.update_badge.set_about_shown(false);
             log!("settings window closed");
+            if crate::memdiag::enabled() {
+                crate::memdiag::report("settings closed");
+                std::thread::spawn(|| {
+                    for s in [3, 10] {
+                        std::thread::sleep(std::time::Duration::from_secs(if s == 3 { 3 } else { 7 }));
+                        crate::memdiag::report(&format!("settings closed +{s}s"));
+                    }
+                });
+            }
         }
         if self.onboarding_win == Some(id) {
             self.onboarding_win = None;

@@ -38,6 +38,8 @@ mod diag;
 mod elevate;
 #[cfg(windows)]
 mod install;
+#[cfg(windows)]
+mod memdiag;
 mod update;
 mod engine;
 mod log;

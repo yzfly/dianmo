@@ -212,7 +212,9 @@ pub(crate) fn open(p: PendingWindow) {
             return;
         }
     };
-    let renderer = match Renderer::new(hwnd, hardware, false) {
+    // Diagnostics: `DIANMO_WINDOW_GPU=shared` draws with the keyboard's devices.
+    let shared = std::env::var("DIANMO_WINDOW_GPU").is_ok_and(|v| v == "shared");
+    let renderer = match Renderer::new(hwnd, hardware, shared) {
         Ok(r) => r,
         Err(_) => unsafe {
             let _ = DestroyWindow(hwnd);
@@ -799,6 +801,12 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     Some(Some(w)) => {
                         let id = w.id;
                         drop(w);
+                        // The last app window went: start the keyboard's devices afresh too, so
+                        // WARP's memory from the window goes with them (the keyboard repaints
+                        // with new ones, ~50 ms CPU).
+                        if with(|h| h.windows.is_empty()) == Some(true) {
+                            crate::host::renew_keyboard_device();
+                        }
                         trim_heaps();
                         closed(id);
                     }
@@ -812,18 +820,26 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     }
 }
 
-/// Gives freed heap memory back to the system after a window (and its WARP device) went away.
-/// Measured on the Surface (v0.2.1): a closed settings window still leaves ~35 MB of private
-/// memory behind (stable across reopenings, so pooled, not leaked); this and `IDXGIDevice3::Trim`
-/// changed little. Where it sits (WARP's pools?) is still open, see docs/status/dianmo.md.
-fn trim_heaps() {
-    use windows::Win32::System::Memory::{GetProcessHeaps, HeapCompact, HEAP_FLAGS};
+/// Gives freed heap memory back to the system after a window (and its WARP device) went away:
+/// `HeapCompact` coalesces, `HeapOptimizeResources` (Windows 8.1+) decommits what it can. Measured
+/// on the Surface (v0.2.2) both change little on their own: the ~35 MB a closed settings window
+/// used to leave behind was the user's IME loaded into our process (see `host::run_with`), and
+/// the rest went once the keyboard's WARP device is renewed with the last window.
+pub(crate) fn trim_heaps() {
+    use windows::Win32::System::Memory::{GetProcessHeaps, HEAP_FLAGS, HeapCompact, HeapOptimizeResources, HeapSetInformation};
+    #[repr(C)]
+    struct OptimizeResources {
+        version: u32,
+        flags: u32,
+    }
     unsafe {
         let mut heaps = vec![Default::default(); 64];
         let n = GetProcessHeaps(&mut heaps) as usize;
         for h in heaps.into_iter().take(n.min(64)) {
             HeapCompact(h, HEAP_FLAGS(0));
         }
+        let info = OptimizeResources { version: 1, flags: 0 };
+        let _ = HeapSetInformation(None, HeapOptimizeResources, Some(&info as *const _ as *const _), size_of::<OptimizeResources>());
     }
 }
 

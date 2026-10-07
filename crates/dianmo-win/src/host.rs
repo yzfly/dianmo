@@ -90,6 +90,18 @@ pub(crate) fn post_reap() {
     }
 }
 
+/// Drops the keyboard's device resources (and so, when no app window is open, every WARP
+/// device of the process); a visible keyboard repaints with new ones.
+pub(crate) fn renew_keyboard_device() {
+    with(|h| {
+        if h.renderer.release() && h.visible {
+            unsafe {
+                let _ = InvalidateRect(Some(h.hwnd), None, false);
+            }
+        }
+    });
+}
+
 /// Host configuration.
 #[derive(Clone, Debug)]
 pub struct HostOptions {
@@ -472,6 +484,9 @@ pub(crate) struct Host {
     appbar_on: bool,
     appbar: AppBar,
     dpi: u32,
+    /// Width (DIPs) and the view's preferred height when the window was last docked: when the
+    /// view wants another height (电脑键盘 on a narrow screen, height setting), it is docked again.
+    docked: (f32, f32),
     /// Client size in px and the DPI the view was last resized for.
     sized: (i32, i32, u32),
     down: Vec<u32>,
@@ -561,6 +576,11 @@ pub fn run(view: Box<dyn View>, app: Box<dyn App>) -> Result<()> {
 pub fn run_with(view: Box<dyn View>, app: Box<dyn App>, opts: HostOptions) -> Result<()> {
     enable_per_monitor_dpi();
     unsafe {
+        // No IME on the UI thread: we never take text input there, and the first activatable
+        // window (settings) would otherwise load the user's IME into our process — Sogou's TSF
+        // module and its bundles kept ~30 MB of heap after the settings window closed (v0.2.2).
+        // File dialogs run on threads of their own and keep theirs.
+        let _ = windows::Win32::UI::Input::Ime::ImmDisableIME(0);
         let _ = EnableMouseInPointer(true);
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
         let instance = GetModuleHandleW(None)?.into();
@@ -635,6 +655,7 @@ pub fn run_with(view: Box<dyn View>, app: Box<dyn App>, opts: HostOptions) -> Re
                 appbar_on,
                 appbar: AppBar::default(),
                 dpi,
+                docked: (0.0, 0.0),
                 sized: (0, 0, 0),
                 down: Vec::new(),
                 tray,
@@ -742,6 +763,11 @@ impl Host {
         }
         if let Some(on) = ctl.req.tray_badge.take() {
             self.set_tray_badge(on);
+        }
+        let (w, pref) = self.docked;
+        if self.visible && w > 0.0 && (self.view.preferred_height(w) - pref).abs() > 0.5 {
+            self.docked.1 = self.view.preferred_height(w);
+            post_cmd(self.hwnd, CMD_LAYOUT);
         }
         ctl.req
     }
@@ -1123,7 +1149,9 @@ fn layout() {
             if let Some(t) = &mut h.tray {
                 t.set_dpi(dpi);
             }
-            h.view.preferred_height(width as f32 / scale)
+            let pref = h.view.preferred_height(width as f32 / scale);
+            h.docked = (width as f32 / scale, pref);
+            pref
         }) else {
             return;
         };
@@ -1275,11 +1303,10 @@ extern "system" fn keyboard_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             }
             WM_TIMER if wp.0 == TIMER_TRIM => {
                 let _ = KillTimer(Some(hwnd), TIMER_TRIM);
-                with(|h| {
-                    if !h.visible {
-                        h.renderer.release();
-                    }
-                });
+                if with(|h| !h.visible && h.renderer.release()) == Some(true) {
+                    // And the heap memory the device and its caches used.
+                    crate::window::trim_heaps();
+                }
                 LRESULT(0)
             }
             WM_TIMER if wp.0 == TIMER_ID => {

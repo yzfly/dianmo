@@ -48,6 +48,12 @@
 #   THREADS     print the test instance's thread count and private memory
 #   SETTINGS    open the settings window (the keyboard's ⚙ key, else dianmo.exe --settings); its
 #               visible elements come from the DIANMO_SETTINGSMAP test hook
+#   SETTINGSCMD open it with dianmo.exe --settings (the Start menu shortcut), keyboard or not
+#   SCLOSE      close the settings window (WM_CLOSE, like its ×)
+#   ROTATE:<deg> turn the primary display to 0 / 90 / 180 / 270 degrees (portrait: 90); restored
+#               at the end of the test
+#   TASKINFO    print the test instance's scheduled task (exe, run level, logon trigger = autostart)
+#   IDLE:<sec>  idle CPU for <sec> s, per thread every 10 s (name or start module) and in total
 #   STAP:<name> tap a settings element by name (nav title 「关于」, row key, button text, segment
 #               「theme/深色」, chip 「fuzzy/z~=~zh」 (~ = space)…); scrolls with PgDn until it is visible
 #   SKEY:<vk>   post a key to the settings window (decimal virtual-key code: 27 Esc, 35 End, 36 Home)
@@ -361,8 +367,9 @@ try {
     if ($key -like 'FILE:*') { $fp = $key.Substring(5); if (Test-Path $fp) { "file: $fp size=$((Get-Item $fp).Length) lines=$(@(Get-Content $fp -Encoding UTF8).Count)" } else { "file: $fp missing" }; continue }
     if ($key -like 'LOGTAIL:*') { Get-Content $applog -Encoding UTF8 -Tail ([int]$key.Substring(8)) | % { "log: $_" }; continue }
     if ($key -like 'SETTINGS*') {
-      # The keyboard's ⚙ key (like the user), else a second `dianmo.exe --settings`.
-      if (KeyPx 'settings') { TapKey 'settings' } else {
+      # The keyboard's ⚙ key (like the user), else (or SETTINGSCMD) a second `dianmo.exe --settings`
+      # (the Start menu shortcut 「点墨设置」).
+      if ($key -ne 'SETTINGSCMD' -and (KeyPx 'settings')) { TapKey 'settings' } else {
         $p2 = Start-Process $exe -ArgumentList ($dmArgs + @('--settings')) -PassThru; $null = $p2.WaitForExit(5000) }
       $sw = [IntPtr]::Zero; $dl = (Get-Date).AddSeconds(6)
       while ($sw -eq [IntPtr]::Zero -and (Get-Date) -lt $dl) { Start-Sleep -Milliseconds 100; $sw = [G]::FindOfTitle([uint32]$dm.Id, 'DianmoAppWindow', '设置') }
@@ -376,6 +383,66 @@ try {
       if (-not $m.Contains($name)) { "no settings element $name"; continue }
       $o = [G]::Origin($sw); $sc = [T]::GetDpiForWindow($sw) / 96.0; $pt = $m[$name]
       [T]::Tap([int]($o.x + $pt[0] * $sc), [int]($o.y + $pt[1] * $sc)) | Out-Null; Start-Sleep -Milliseconds 500; continue }
+    if ($key -like 'IDLE:*') {
+      # Idle CPU of the test instance for <sec> seconds, per thread every 10 s (thread name, or the
+      # module its start address is in: uiautomationcore = the focus watcher's UIA threads).
+      if (-not ('TD' -as [type])) { Add-Type @'
+using System; using System.Runtime.InteropServices;
+public static class TD {
+  [DllImport("kernel32.dll")] static extern IntPtr OpenThread(uint a, bool i, uint id);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll")] static extern int GetThreadDescription(IntPtr h, out IntPtr d);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
+  [DllImport("kernel32.dll")] static extern bool GetThreadTimes(IntPtr h, out long c, out long e, out long k, out long u);
+  [DllImport("ntdll.dll")] static extern int NtQueryInformationThread(IntPtr h, int c, out IntPtr info, int len, IntPtr ret);
+  public static string Name(uint id) { IntPtr h = OpenThread(0x0800, false, id); if (h == IntPtr.Zero) return "";
+    IntPtr d; string s = ""; if (GetThreadDescription(h, out d) >= 0) { s = Marshal.PtrToStringUni(d); LocalFree(d); } CloseHandle(h); return s; }
+  public static long Cpu(uint id) { IntPtr h = OpenThread(0x0800, false, id); if (h == IntPtr.Zero) return -1;
+    long c, e, k, u; GetThreadTimes(h, out c, out e, out k, out u); CloseHandle(h); return (k + u) / 10000; }
+  public static long Start(uint id) { IntPtr h = OpenThread(0x0040, false, id); if (h == IntPtr.Zero) return 0;
+    IntPtr a; NtQueryInformationThread(h, 9, out a, IntPtr.Size, IntPtr.Zero); CloseHandle(h); return (long)a; }
+}
+'@ }
+      function TSnap { $m = @{}; (Get-Process -Id $dm.Id).Threads | % { $m[[uint32]$_.Id] = [TD]::Cpu([uint32]$_.Id) }; $m }
+      function TName($tid) { $n = [TD]::Name($tid); if ($n) { return $n }; $a = [TD]::Start($tid)
+        foreach ($mo in (Get-Process -Id $dm.Id).Modules) { $b = [long]$mo.BaseAddress; if ($a -ge $b -and $a -lt $b + $mo.ModuleMemorySize) { return $mo.ModuleName } }; '?' }
+      $sec = [int]$key.Substring(5); $pp = Get-Process -Id $dm.Id; $c00 = $pp.TotalProcessorTime.TotalMilliseconds; $prev = TSnap
+      for ($j = 10; $j -le $sec; $j += 10) { Start-Sleep 10; $now = TSnap
+        $d = @($now.Keys | % { $a = $now[$_]; $b = if ($prev.ContainsKey($_)) { $prev[$_] } else { 0 }; if ($a - $b -gt 0) { "$(TName $_)+$($a - $b)" } })
+        "idle ${j}s: threads=$($now.Count) $($d -join ' ')"; $prev = $now }
+      $pp.Refresh(); "idle total ${sec}s: cpu +$([int]($pp.TotalProcessorTime.TotalMilliseconds - $c00))ms private=$([math]::Round($pp.PrivateMemorySize64/1MB,1))MB"
+      continue }
+    if ($key -like 'ROTATE:*') {
+      # Primary display orientation: 0 (landscape, the Surface's own), 90 / 270 (portrait). The
+      # original orientation is restored at the end of the test (finally).
+      if (-not ('Rot' -as [type])) { Add-Type @'
+using System; using System.Runtime.InteropServices;
+public static class Rot {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] public struct DM {
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+    public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra; public int dmFields;
+    public int dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+    public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+    public short dmLogPixels; public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+    public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight; }
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplaySettings(string dev, int mode, ref DM dm);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int ChangeDisplaySettingsEx(string dev, ref DM dm, IntPtr h, int flags, IntPtr p);
+  public static int Get() { var d = new DM(); d.dmSize = (short)Marshal.SizeOf(typeof(DM)); EnumDisplaySettings(null, -1, ref d); return d.dmDisplayOrientation; }
+  // orientation: 0..3 (DMDO_DEFAULT, 90, 180, 270). Returns the ChangeDisplaySettingsEx result (0 = ok).
+  public static int Set(int o) { var d = new DM(); d.dmSize = (short)Marshal.SizeOf(typeof(DM)); EnumDisplaySettings(null, -1, ref d);
+    if ((d.dmDisplayOrientation % 2) != (o % 2)) { int t = d.dmPelsWidth; d.dmPelsWidth = d.dmPelsHeight; d.dmPelsHeight = t; }
+    d.dmDisplayOrientation = o; d.dmFields = 0x80 | 0x80000 | 0x100000; return ChangeDisplaySettingsEx(null, ref d, IntPtr.Zero, 0, IntPtr.Zero); }
+}
+'@ }
+      if ($null -eq $script:rotBackup) { $script:rotBackup = [Rot]::Get() }
+      $r = [Rot]::Set([int]$key.Substring(7) / 90); Start-Sleep -Milliseconds 2500
+      $sc = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $k = New-Object T+RECT; [T]::GetWindowRect($kh, [ref]$k) | Out-Null
+      "rotate $($key.Substring(7)): result=$r screen=$($sc.Width)x$($sc.Height) keyboard=$(Fmt $k) ($([math]::Round(($k.bottom - $k.top) / $s)) DIP high)"; continue }
+    if ($key -eq 'TASKINFO') {
+      $tk = Get-ScheduledTask -TaskName "Dianmo$instance" -ErrorAction SilentlyContinue
+      "task Dianmo${instance}: $(if ($tk) { "$($tk.Actions[0].Execute) runlevel=$($tk.Principal.RunLevel) logon_trigger=$([bool]($tk.Triggers | ? { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' }))" } else { 'none' })"; continue }
+    if ($key -eq 'SCLOSE') { [T]::PostMessage($sw, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null; Start-Sleep -Milliseconds 500; continue }
     if ($key -like 'SKEY:*') { [G]::Key($sw, [int]$key.Substring(5)); Start-Sleep -Milliseconds 300; continue }
     if ($key -like 'SSHOT:*') { [G]::ShotWin($sw, "C:\Users\wecode\claude\dm-set-$($key.Substring(6)).png"); continue }
     if ($key -like 'METER:*') {
@@ -422,6 +489,7 @@ public static class Meter {
   Start-Sleep -Milliseconds 500
   "second instance exited=$($dm2.HasExited); keyboard visible again=$([T]::IsWindowVisible($kh)); test dianmo processes=$(@(Get-Process dianmo | ? { $_.Path -and $_.Path.StartsWith($RunDir, [StringComparison]::OrdinalIgnoreCase) }).Count)"
 } catch { "ERROR: $_ (line $($_.InvocationInfo.ScriptLineNumber))" } finally {
+  if ($null -ne $script:rotBackup) { "display orientation restored: $([Rot]::Set($script:rotBackup)) (to $($script:rotBackup))"; Start-Sleep -Milliseconds 1500 }
   if ($null -ne $script:themeBackup) { Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' AppsUseLightTheme $script:themeBackup -Type DWord; [G]::BroadcastTheme(); "system apps theme restored ($script:themeBackup)" }
   if ($kh -ne [IntPtr]::Zero) { [T]::PostMessage($kh, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null }
   if (!$dm.WaitForExit(5000)) { "dianmo did not exit on WM_CLOSE, killing"; Stop-Process -Id $dm.Id -Force } else { "dianmo exited, code $($dm.ExitCode)" }

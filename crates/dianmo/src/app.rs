@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use dianmo_core::{Action, Engine, InputController};
 use dianmo_ui::settings::{InputMode, LayoutChoice, Page, SettingsModel, Status, ThemeChoice, UpdateState};
-use dianmo_ui::{InputState, KeyboardView, Response, ThemeKind, UiAction, View};
+use dianmo_ui::{FieldHint, InputState, KeyboardView, Response, ThemeKind, UiAction, View};
 use dianmo_win::tabtip::SystemKeyboardSettings;
 use dianmo_win::{
     App, BallEdge, BallEvent, BallState, FieldKind, FocusEvent, FocusWatcher, HostControl, HostProxy,
@@ -1045,7 +1045,7 @@ fn dump_keymap(view: &mut dyn View) {
         "prtsc", "select", "clipboard", "clipclose", "clearclips", "back", "sel_left", "sel_right", "sel_wordleft",
         "sel_wordright", "sel_up", "sel_down", "sel_home", "sel_end", "sel_copy", "sel_cut", "sel_paste", "sel_delete",
         "sel_done", "voiceball", "exitvoice", "settings", "t9_1", "t9_2", "t9_3", "t9_4", "t9_5", "t9_6", "t9_7", "t9_8", "t9_9", "clip0", "clip1", "clip2", "clip3", "F1", "F4", "F5", "`", "-", "=", "[", "]", "\\", ";", "'", "/",
-        ".",
+        ".", ".com", "@", "www.", "@qq.com",
     ];
     let letters: Vec<String> = ('a'..='z').chain('0'..='9').map(String::from).collect();
     for name in names.iter().copied().chain(letters.iter().map(String::as_str)) {
@@ -1223,11 +1223,17 @@ impl DianmoApp {
                 self.focus_seq += 1;
                 let mut repaint = false;
                 if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
+                    let hint = match kind {
+                        FieldKind::Url => FieldHint::Url,
+                        FieldKind::Email => FieldHint::Email,
+                        _ => FieldHint::Text,
+                    };
+                    repaint |= kv.set_field_hint(hint);
                     if kind == FieldKind::Number {
-                        repaint = kv.show_numbers();
+                        repaint |= kv.show_numbers();
                         self.numbers_for_field = true;
                     } else if self.numbers_for_field {
-                        repaint = kv.show_letters();
+                        repaint |= kv.show_letters();
                         self.numbers_for_field = false;
                     }
                 }
@@ -1239,12 +1245,17 @@ impl DianmoApp {
                 Response { repaint, ..Response::none() }
             }
             FocusEvent::NotEditable { by_touch } => {
+                // The quick keys of a web address / email field don't outlive it.
+                let repaint = view
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<KeyboardView>())
+                    .is_some_and(|kv| kv.set_field_hint(FieldHint::Text));
                 let grace = self.manual_show_at.is_some_and(|t| t.elapsed().as_millis() < MANUAL_SHOW_GRACE_MS as u128);
                 if by_touch && host.is_visible() && !grace {
                     self.focus_seq += 1;
                     self.hide_later(host);
                 }
-                Response::none()
+                Response { repaint, ..Response::none() }
             }
         }
     }

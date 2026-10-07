@@ -52,7 +52,8 @@ use windows::Win32::UI::Accessibility::{
     UIA_ClassNamePropertyId, UIA_ComboBoxControlTypeId, UIA_ControlTypePropertyId, UIA_CustomControlTypeId,
     UIA_DataItemControlTypeId, UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_GroupControlTypeId,
     UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_IsPasswordPropertyId, UIA_IsReadOnlyAttributeId,
-    UIA_IsTextPatternAvailablePropertyId, UIA_IsValuePatternAvailablePropertyId, UIA_NativeWindowHandlePropertyId,
+    UIA_IsTextPatternAvailablePropertyId, UIA_IsValuePatternAvailablePropertyId, UIA_LocalizedControlTypePropertyId,
+    UIA_NativeWindowHandlePropertyId,
     UIA_PROPERTY_ID, UIA_PaneControlTypeId, UIA_ProcessIdPropertyId, UIA_SpinnerControlTypeId, UIA_TextPatternId,
     UIA_ValueIsReadOnlyPropertyId,
 };
@@ -73,11 +74,13 @@ use crate::sink::LAST_SEND_TICK;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldKind {
     Text,
-    /// Spinner / `input type=number` / Win32 `ES_NUMBER` edit.
+    /// Spinner / `input type=number|tel` / Win32 `ES_NUMBER` edit.
     Number,
     Password,
-    /// Browser address bar, Explorer address bar.
+    /// Browser address bar, Explorer address bar, `input type=url`.
     Url,
+    /// `input type=email`.
+    Email,
     /// `role=searchbox` / `input type=search`, search boxes (Start, Explorer, apps).
     Search,
 }
@@ -447,7 +450,7 @@ impl Shared {
     }
 
     fn on_focus(&self, el: &IUIAutomationElement, initial: bool) {
-        let p = Props::read(el);
+        let mut p = Props::read(el);
         if p.pid == self.own_pid || p.pid == 0 && p.control_type == 0 {
             return;
         }
@@ -455,7 +458,7 @@ impl Shared {
         // Consoles (conhost, Windows Terminal) report their text area and their window in turn,
         // in any order, and taps inside don't move focus: the whole window counts as one field.
         let console = console_window(&p);
-        let kind = if console.is_some() { Some(FieldKind::Text) } else { classify(el, &p) };
+        let kind = if console.is_some() { Some(FieldKind::Text) } else { classify(el, &mut p) };
         if kind.is_none() && !initial && p.pid == shell_pid() {
             // Our tray icon (tap = show/hide, press-and-hold = menu) focuses the taskbar: that's
             // our own UI, not leaving the text field.
@@ -544,7 +547,7 @@ impl Shared {
 // ---------------------------------------------------------------------------------------------
 // Classification
 
-const PROPS: [UIA_PROPERTY_ID; 13] = [
+const PROPS: [UIA_PROPERTY_ID; 14] = [
     UIA_ProcessIdPropertyId,
     UIA_ControlTypePropertyId,
     UIA_IsEnabledPropertyId,
@@ -558,6 +561,7 @@ const PROPS: [UIA_PROPERTY_ID; 13] = [
     UIA_AriaRolePropertyId,
     UIA_NativeWindowHandlePropertyId,
     UIA_BoundingRectanglePropertyId,
+    UIA_LocalizedControlTypePropertyId,
 ];
 
 #[derive(Debug, Default)]
@@ -573,6 +577,10 @@ struct Props {
     class: String,
     automation_id: String,
     aria_role: String,
+    /// For the focus log (Edge says 「编辑」 for every `<input type>`, so it doesn't tell them apart).
+    localized_type: String,
+    /// `<input type>` of a web text box, from IAccessible2 (`kind_of`; empty if not asked/known).
+    input_type: String,
     hwnd: isize,
     rect: RECT,
 }
@@ -599,6 +607,8 @@ impl Props {
                 class: bstr(el.CachedClassName()),
                 automation_id: bstr(el.CachedAutomationId()),
                 aria_role: bstr(el.CachedAriaRole()),
+                localized_type: bstr(el.CachedLocalizedControlType()),
+                input_type: String::new(),
                 hwnd: el.CachedNativeWindowHandle().map(|h| h.0 as isize).unwrap_or(0),
                 rect: el.CachedBoundingRectangle().unwrap_or_default(),
             }
@@ -607,7 +617,7 @@ impl Props {
 
     fn describe(&self) -> String {
         format!(
-            "pid={} ct={} en={} kf={} pw={} vp={} ro={} tp={} class={:?} aid={:?} aria={:?} hwnd={:#x} rect=({},{})-({},{})",
+            "pid={} ct={} en={} kf={} pw={} vp={} ro={} tp={} class={:?} aid={:?} aria={:?} lct={:?} type={:?} hwnd={:#x} rect=({},{})-({},{})",
             self.pid,
             self.control_type,
             self.enabled as u8,
@@ -619,12 +629,88 @@ impl Props {
             self.class,
             self.automation_id,
             self.aria_role,
+            self.localized_type,
+            self.input_type,
             self.hwnd,
             self.rect.left,
             self.rect.top,
             self.rect.right,
             self.rect.bottom
         )
+    }
+}
+
+/// The `text-input-type` object attribute of a Chromium text box (`email`, `url`, `tel`, …) from
+/// IAccessible2 (UIA doesn't expose the input type; Edge has no legacy-IAccessible pattern on
+/// its UIA elements, and the root's `accFocus` answers the document): the focused window's MSAA
+/// object → hit test at the middle of the text box → `IAccessible2::get_attributes`. Four
+/// cross-process calls, only for web text boxes. `Err`: the step that failed (focus log).
+unsafe fn ia2_input_type(pid: u32, rect: RECT) -> std::result::Result<String, String> {
+    use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
+    use windows::Win32::UI::WindowsAndMessaging::{GUITHREADINFO, GetGUIThreadInfo};
+    const OBJID_CLIENT: i32 = -4;
+    unsafe {
+        let mut gti = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+        if GetGUIThreadInfo(0, &mut gti).is_err() || gti.hwndFocus.is_invalid() {
+            return Err("no focus window".into());
+        }
+        let mut owner = 0u32;
+        GetWindowThreadProcessId(gti.hwndFocus, Some(&mut owner));
+        if owner != pid {
+            return Err("focus window of another process".into());
+        }
+        let mut raw = std::ptr::null_mut();
+        if AccessibleObjectFromWindow(gti.hwndFocus, OBJID_CLIENT as u32, &IAccessible::IID, &mut raw).is_err() || raw.is_null() {
+            return Err("no accessible object".into());
+        }
+        let root = IAccessible::from_raw(raw);
+        // Chromium's hit test answers the deepest node.
+        let v = root
+            .accHitTest((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+            .map_err(|e| format!("hit test {:#x}", e.code().0))?;
+        let inner = &v.Anonymous.Anonymous;
+        if inner.vt != windows::Win32::System::Variant::VT_DISPATCH {
+            return Err(format!("hit test vt {}", inner.vt.0));
+        }
+        match inner.Anonymous.pdispVal.as_ref().map(|d| d.cast::<IAccessible>()) {
+            Some(Ok(acc)) => ia2_attr(&acc),
+            _ => Err("hit test: no IAccessible".into()),
+        }
+    }
+}
+
+/// `text-input-type` from `IAccessible2::get_attributes` of `acc` (`Err`: the failing step).
+unsafe fn ia2_attr(acc: &windows::Win32::UI::Accessibility::IAccessible) -> std::result::Result<String, String> {
+    use windows::Win32::System::Com::IServiceProvider;
+    use windows::Win32::UI::Accessibility::IAccessible;
+    use windows::core::{GUID, HRESULT, IUnknown};
+    const IID_IACCESSIBLE2: GUID = GUID::from_u128(0xE89F726E_C4F4_4C19_BB19_B647D7FA8478);
+    // IAccessible2::get_attributes: after IUnknown (3), IDispatch (4), IAccessible (21) and the
+    // 17 IAccessible2 methods before it.
+    const GET_ATTRIBUTES: usize = 45;
+    unsafe {
+        let sp: IServiceProvider = acc.cast().map_err(|e| format!("sp:{:#x}", e.code().0))?;
+        let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hr = (Interface::vtable(&sp).QueryService)(sp.as_raw(), &IAccessible::IID, &IID_IACCESSIBLE2, &mut raw);
+        if hr.is_err() || raw.is_null() {
+            return Err(format!("qs:{:#x}", hr.0));
+        }
+        let ia2 = IUnknown::from_raw(raw); // released on return
+        let vtbl = *(ia2.as_raw() as *const *const usize);
+        let get_attributes: unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut u16) -> HRESULT =
+            std::mem::transmute(*vtbl.add(GET_ATTRIBUTES));
+        let mut b: *mut u16 = std::ptr::null_mut();
+        let hr = get_attributes(ia2.as_raw(), &mut b);
+        if hr.is_err() || b.is_null() {
+            return Err(format!("attrs:{:#x}", hr.0));
+        }
+        let attrs = BSTR::from_raw(b).to_string();
+        // `name:value;` pairs (`\` escapes `:` `;` `,` `=` inside values; not in input types).
+        match attrs.split(';').find_map(|kv| kv.strip_prefix("text-input-type:")) {
+            Some(t) => Ok(t.trim().to_ascii_lowercase()),
+            // Only the tag (the attributes can hold page text, e.g. a placeholder).
+            None => Err(format!("no type, {}", attrs.split(';').find(|kv| kv.starts_with("tag:")).unwrap_or("no tag"))),
+        }
     }
 }
 
@@ -644,7 +730,7 @@ fn is(ct: i32, id: UIA_CONTROLTYPE_ID) -> bool {
 
 /// Editable or not, and what kind. Mostly from cached properties; a caret check through the text
 /// pattern (one more cross-process call) only for documents and containers that may be editable.
-fn classify(el: &IUIAutomationElement, p: &Props) -> Option<FieldKind> {
+fn classify(el: &IUIAutomationElement, p: &mut Props) -> Option<FieldKind> {
     if !p.enabled {
         return None;
     }
@@ -683,7 +769,7 @@ fn classify(el: &IUIAutomationElement, p: &Props) -> Option<FieldKind> {
     Some(kind_of(p))
 }
 
-fn kind_of(p: &Props) -> FieldKind {
+fn kind_of(p: &mut Props) -> FieldKind {
     if p.password {
         return FieldKind::Password;
     }
@@ -696,6 +782,21 @@ fn kind_of(p: &Props) -> FieldKind {
     }
     if p.class == "OmniboxViewViews" || aria == "url" {
         return FieldKind::Url;
+    }
+    // Web page text boxes (Chromium: no class name): UIA doesn't tell `input type`, IAccessible2's
+    // object attributes do (`text-input-type:email;`). One more cross-process call, only here.
+    if is(p.control_type, UIA_EditControlTypeId) && p.class.is_empty() && p.aria_role.eq_ignore_ascii_case("textbox") {
+        let t = unsafe { ia2_input_type(p.pid, p.rect) };
+        p.input_type = t.clone().unwrap_or_else(|e| format!("?{e}"));
+        if let Ok(t) = t {
+            match t.as_str() {
+                "email" => return FieldKind::Email,
+                "url" => return FieldKind::Url,
+                "tel" | "number" => return FieldKind::Number,
+                "search" => return FieldKind::Search,
+                _ => {}
+            }
+        }
     }
     let hwnd = HWND(p.hwnd as *mut _);
     if p.hwnd != 0 {

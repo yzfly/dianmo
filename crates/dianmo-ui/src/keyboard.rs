@@ -238,6 +238,33 @@ pub struct KeyboardView {
     pub(crate) cand_size: CandidateSize,
     /// 双拼方案 (user setting): key-face finals and the `；` key.
     pub(crate) shuangpin: ShuangpinScheme,
+    /// What the focused field takes: web address / email fields get quick-insert keys
+    /// (`.com` `/` `@` …) at the start of the idle toolbar.
+    pub(crate) field_hint: FieldHint,
+}
+
+/// What the focused text field takes (from the host's focus watcher), see
+/// [`KeyboardView::set_field_hint`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FieldHint {
+    #[default]
+    Text,
+    /// Address bars, `input type=url`.
+    Url,
+    /// `input type=email`.
+    Email,
+}
+
+impl FieldHint {
+    /// The quick-insert keys of the idle toolbar, most useful first (dropped from the end when
+    /// the bar is narrow).
+    pub fn quick_keys(self) -> &'static [&'static str] {
+        match self {
+            FieldHint::Text => &[],
+            FieldHint::Url => &[".com", "/", ".", "www.", ".cn", "https://"],
+            FieldHint::Email => &["@", ".com", ".", "@qq.com", "@163.com", "@gmail.com"],
+        }
+    }
 }
 
 impl Default for KeyboardView {
@@ -299,6 +326,7 @@ impl KeyboardView {
             full_width_punct: true,
             cand_size: CandidateSize::Standard,
             shuangpin: ShuangpinScheme::Xiaohe,
+            field_hint: FieldHint::Text,
         };
         v.rebuild();
         v
@@ -435,6 +463,21 @@ impl KeyboardView {
         let changed = self.panel != Panel::Keys;
         self.set_panel(Panel::Keys);
         changed
+    }
+
+    /// Sets what the focused field takes: web address and email fields get quick-insert keys
+    /// (`.com` `/` `@` …) in the idle toolbar. Returns true if it changed; the caller repaints.
+    pub fn set_field_hint(&mut self, hint: FieldHint) -> bool {
+        let changed = self.field_hint != hint;
+        self.field_hint = hint;
+        if changed {
+            self.rebuild();
+        }
+        changed
+    }
+
+    pub fn field_hint(&self) -> FieldHint {
+        self.field_hint
     }
 
     /// The letter layout currently shown (or that the keyboard returns to).
@@ -837,8 +880,33 @@ impl KeyboardView {
                 tools.pop();
             }
         }
+        // Web address / email fields: quick-insert keys first; the edit tools give way to them.
+        let mut quick: Vec<(f32, Key)> = Vec::new();
+        if !self.voice_mode {
+            let room = right.x - m.pad_x - apps_w - 16.0 * m.s;
+            let mut used = 0.0;
+            for s in self.field_hint.quick_keys() {
+                let w = quick_key_w(s, m.bar_h);
+                if used + w > room {
+                    break;
+                }
+                used += w;
+                let mut k = Key::text(s).scaled(0.62);
+                k.tone = Tone::Flat;
+                k.bubble = false;
+                quick.push((w, k));
+            }
+            while !tools.is_empty() && used + tools.iter().map(|(w, _)| w).sum::<f32>() > room {
+                tools.pop();
+            }
+        }
         let mut keys = Vec::new();
         let mut x = m.pad_x + 6.0 * m.s;
+        for (w, mut k) in quick.iter().cloned() {
+            k.cell = Rect::new(x, 0.0, w, m.bar_h);
+            x += w;
+            keys.push(k);
+        }
         if self.voice_mode {
             // Voice mode: the way back to the keyboard comes first and stands out; edit tools
             // that no longer fit are dropped (the wide edit area still has them).
@@ -858,7 +926,7 @@ impl KeyboardView {
             keys.push(k);
         }
         // Apps go right-aligned before the hide chevron when there are tools, else left.
-        let mut ax = if tools.is_empty() && !self.voice_mode { m.pad_x + 6.0 * m.s } else { right.x - apps_w };
+        let mut ax = if tools.is_empty() && quick.is_empty() && !self.voice_mode { m.pad_x + 6.0 * m.s } else { right.x - apps_w };
         for mut k in apps {
             let w = app_w(&k);
             k.cell = Rect::new(ax, 0.0, w, m.bar_h);
@@ -1803,7 +1871,10 @@ impl View for KeyboardView {
     }
 
     fn preferred_height(&self, width: f32) -> f32 {
-        if layout::is_wide(width) {
+        if self.pc && !layout::is_wide(width) {
+            // Six key rows: the phone height would leave them about 36 DIP high (portrait).
+            layout::preferred_height_pc(width) * self.height_scale
+        } else if layout::is_wide(width) {
             layout::preferred_height_wide(width, self.height_scale)
         } else {
             layout::preferred_height(width) * self.height_scale
@@ -1998,3 +2069,9 @@ impl View for KeyboardView {
 #[cfg(test)]
 #[path = "keyboard_tests.rs"]
 mod tests;
+
+/// Width of a quick-insert key (`.com`, `@qq.com`) in a bar `bar_h` high.
+fn quick_key_w(s: &str, bar_h: f32) -> f32 {
+    let n = s.chars().count() as f32;
+    (bar_h * 0.9).max(bar_h * (0.5 + 0.27 * n))
+}

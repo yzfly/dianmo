@@ -15,7 +15,7 @@ pub mod theme;
 
 pub use canvas::{Align, Canvas, Color, Font, Rect, TextStyle};
 pub use clip::clip_preview;
-pub use keyboard::{KeyboardConfig, KeyboardView, MORE_BATCH};
+pub use keyboard::{FieldHint, KeyboardConfig, KeyboardView, MORE_BATCH};
 pub use layout::{Layout, SymTab};
 pub use settings::{OnboardingView, SettingsAction, SettingsModel, SettingsView};
 pub use theme::{SettingsTheme, Theme, ThemeKind};

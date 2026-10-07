@@ -423,3 +423,86 @@ Surface（Win10 LTSC 21H2，2880×1920，200%）空出来后，对已安装的 v
 - 竖屏布局、数字 / 密码 / 网址输入框的特殊处理没测。
 - 测试副本的托盘菜单只能用鼠标点（posted 回调拿不到前台，键盘导航无效），真实点托盘图标没问题。
 - README 只换了 3 张真机截图（宽屏全拼输入中、剪贴板卡片、电脑键盘），其余仍是渲染图。
+
+## v0.2.2（TODO #43，2026-10-07）
+
+把「v0.2.1 实机验证」剩下的问题修完。Surface 上的测试副本一律 `--instance Test`（gui 任务提权，副本 `elevated=true`）；测试期间用户的点墨用 `--quit` 关掉，测完由计划任务 `Dianmo` 重新启动。构建 `C:\dev\dianmo-final2`，包 `C:\dev\dianmo-dist\final2`。
+
+### 结果总表
+
+| 项 | 结果 | 说明 |
+|---|---|---|
+| 设置窗口关闭后内存不释放 | **修复** | 见下「内存」 |
+| 空闲 CPU 偶发 16–47 ms/10 s | **确认是一次性的** | 见下「空闲 CPU」 |
+| 升级全流程 | 通过 | 测试实例目录 `%LOCALAPPDATA%\Dianmo-Test` 静默装 0.2.0（GitHub Release 原包，sha256 一致）→ 0.2.0 启动 1 分钟后自动检查：`0.2.1 available (22068319 bytes, sha256 true)`，关于页「发现新版本 0.2.1」→ 点「立即更新」→ 6 秒下载完 → 安装包 `/S --instance Test` → 旧进程退出 → `--install --quiet` → 点击后约 12 秒 0.2.1 在后台运行，「应用和功能」显示 0.2.1。安装包日志有一句「can't rename … (os error 32); copying over it」（目录被占用时的回退路径，结果正确）。之后 `--uninstall --delete-data --quiet` 把测试安装（目录、数据、任务、快捷方式、卸载项）清干净 |
+| 新手引导 | 通过 | 四屏点完：选「九宫格」→ ini `schema=t9`；选「豆包语音」再选回「微信输入法」→ `voice_engine` 跟着变；「开始使用」→ 窗口关、`onboarded=true`、键盘显示 |
+| 开始菜单「点墨设置」 | 通过 | 记事本在前台时经 explorer（普通权限，同点开始菜单）打开「点墨设置 Test」快捷方式 → 设置窗口在最前面（`foreground=True`） |
+| 一键修复 | 通过（提权路径） | 任务 `DianmoTest` 指向别的 exe 时设置页显示「一键修复」→ 点了以后任务改指向当前 exe、`RunLevel=Highest`，提示「已开启管理员窗口支持」。弹 UAC 的那条路（点墨以普通权限运行时）没测：UAC 在安全桌面上，注入的输入点不到，测了会把提示框留在用户屏幕上 |
+| 开机自启开关 | 通过 | 打开 → 任务有登录触发器；关掉 → 没有 |
+| 竖屏 | 通过 / **修复** | `ROTATE:90`（ChangeDisplaySettingsEx，测完恢复横屏）：全拼、双拼（韵母小字）、九宫格、数字面板都正常，手机布局键盘 250 DIP；电脑键盘原来六行挤在 250 DIP 里（每行约 36 DIP）→ 改为竖屏单独的首选高度 312 DIP（每行约 46 DIP），实测 `keyboard=(0,2176)-(1920,2800)` |
+| Edge 输入框类型 | 通过 / **新增** | 数字框 → 数字面板；电话框 → 数字面板（新）；网址框 → 工具栏 `.com / . www. .cn https://`（新）；邮箱框 → `@ .com . @qq.com @163.com @gmail.com`（新）；地址栏 → 网址快捷键；密码框获得焦点时别处写入剪贴板 → 不出剪贴板卡片，换到普通框再写 → 出卡片 |
+| 资源管理器文件列表收起键盘 | 通过 | 这次点在列表里的一个文件上（UIA 找 `UIItemsView` 下第一个 ListItem），键盘收起 |
+| 自动弹出全套 | 通过 | `run-autoshow.sh all` 36 项全部 PASS（记事本、资源管理器、Edge、VS Code 编辑区和终端、管理员 PowerShell） |
+| 耳机插拔跟随默认设备 | **无法验证** | Surface 上只有内置扬声器一个输出设备（`Get-PnpDevice -Class AudioEndpoint`），没有可切换的默认设备。代码路径：停顿 3 秒后的下一次按键先确认默认设备、流出错重开（sound.rs），没变 |
+| README 真机截图 | 完成 | 双拼、九宫格、深色输入中、Ctrl 提示、Fn 层、触控板、选择栏、剪贴板面板换成真机截图（键盘窗口 2880×704 px 缩到 1440×352）；新增语音球真机图 `kb-voice-ball.png`（语音一节）。截图内容都是测试实例的数据（剪贴板是测试写入的三条） |
+| Surface 清理 | 完成 | 见下 |
+| 默认输入法 | 只读 | 见下 |
+
+### 内存
+
+**原因**：设置窗口是普通的可激活窗口，获得焦点时 Windows 会把用户当前的输入法装进窗口所在的线程——Surface 上是搜狗拼音：`sogoupy.ime`、`sogoutsf.ime` 和 `ai_voice_input_bundle64.dll`、`ichat_bundle64.dll`、`picface64.dll`、`isgpet_bundle64.dll`、`systembeautify_bundle64.dll` 等十几个模块，关窗后不卸载，它们在默认堆里占着约 28 MB（`busy`，不是空闲块，所以 Trim / HeapCompact 都没用）。之前猜的 WARP 池不是主因。
+
+定位用的是新加的诊断（`DIANMO_MEMLOG=1`，`memdiag.rs`）：打开设置前、关掉时、关掉后 3 秒 / 10 秒，在日志里写每个堆的已提交 / 在用 / 空闲字节、不属于任何堆的私有分配（前 12 个）、线程数和新加载 / 卸载的模块。
+
+**修复**：
+1. `host::run_with` 开头 `ImmDisableIME(0)`：UI 线程（键盘、设置、引导、悬浮球都在这个线程）不加载输入法。点墨自己的窗口没有文字输入；文件对话框在自己的线程上，输入法照常可用。
+2. 最后一个应用窗口关掉时键盘的渲染设备也重建一次（`host::renew_keyboard_device`，键盘显示时重画一帧约 50 ms CPU），这样整个进程的 WARP 设备一起换新；然后 `trim_heaps`（`HeapCompact` + `HeapOptimizeResources`）。键盘收起 5 秒释放设备后也 `trim_heaps`。
+3. 调试开关 `DIANMO_WINDOW_GPU=shared`（设置窗口用键盘那份设备）：实测比各用各的差一点（关后 +2.3 MB 对 +1.7 MB），默认不变。
+
+**实测**（Surface，测试副本，外部读 `PrivateMemorySize64`）：
+
+| 场景 | 打开前 | 开着 | 关掉后 |
+|---|---|---|---|
+| v0.2.1（修复前，键盘显示） | 25 MB 左右 | 73–83 MB | 61–68 MB |
+| 修复后，键盘显示（⚙ 键打开） | 29.7 MB | 48.5 MB | 29.2 MB |
+| 修复后，键盘收起（`--settings`，即开始菜单） | 13.5 / 18.1 MB | 30 / 33.8 MB | 15.2 → 15.3 → 15.8 MB（开关三次）/ 17.4 MB |
+
+反复开关键盘显示时：26 → 27.8 → 28.4 → 28.9 MB（三次），不再涨到 39 MB。目标「≤ 打开前 +5 MB」达到。
+
+### 空闲 CPU
+
+新 e2e 步骤 `IDLE:<秒>`：每 10 秒按线程（线程名，没名字的看起始地址所在模块）列出 CPU 增量。
+- 键盘收起 60 秒：0 ms。
+- 键盘显示 60 秒：只有启动后第 60 秒那一次自动检查更新（`dianmo-update` +15–31 ms，WinHTTP 线程池 +16–31 ms，UI 线程处理结果 +16 ms），其余 10 秒窗口全是 0。这个检查每天最多一次；之后更新线程每小时醒一次只比较时间（不联网）。
+- 词数统计（`RimeJob::Count`）只在 librime 起来时、每次打开设置时、导出 / 导入 / 清空时各一次，不重复。
+- 用户自己的点墨在测试期间偶尔有 15–60 ms 的唤醒，全在 `uiautomationcore.dll` 的线程上：那是焦点监听在处理桌面上真实的焦点事件（就是测试脚本开的窗口），不是点墨自己的周期性唤醒。
+
+### Surface 清理
+
+删掉 `C:\dev\dianmo-asr`（实际 4.1 GB：下载的安装包 1.7 GB + 模型 2.3 GB）、`C:\dev\asrapp-root`（本地 ASR 的运行时和模型，182 MB）；`dianmo-appwin / asr-build / asrapp / icon / rime / rime2 / voicebuild / win` 的 `target\`；`dianmo-dist` 下的 app、elevate、final、hotfix、layout、pcclip、settings、rel，以及测试完的 qa020。C: 可用空间 170.46 GB → 177.09 GB（释放 6.64 GB），后面又删了 qa020（50 MB）和 final2 的 target（打包脚本最后清）。保留：`dianmo-data`、`tools`、`dianmo-dist\{qa, rel2, final2}`、各工作目录的源码（每个几 MB）、`dianmo-voice\installers`（微信 / 豆包输入法安装包，117 MB，留着重装用）。
+
+### 默认输入法（只读，没改）
+
+- `Get-WinDefaultInputMethodOverride`：`0804:{E7EA138E-…}{E7EA138F-…}` = **搜狗拼音输入法**。
+- 语言列表只有 zh-Hans-CN，输入法顺序：搜狗拼音输入法 → 豆包输入法（`{9D2B2E2B-…}`）→ 微信输入法 WeType（`{86598FB9-…}`）→ 微软拼音（`{81D4E9C9-…}`）。
+
+### 本轮改动（服务器 `cargo test --workspace` 189 个全过；`cargo clippy --workspace --all-targets`、`cargo clippy -p dianmo -p dianmo-win -p dianmo-ui --target x86_64-pc-windows-gnullvm --tests`（带 / 不带 rime）、`cargo check --workspace --examples --target x86_64-pc-windows-gnullvm` 干净）
+
+- `dianmo-win/host.rs`：`ImmDisableIME(0)`；`renew_keyboard_device`；收起后释放设备时 `trim_heaps`；`docked`（上次停靠时的宽度和视图首选高度）——视图想要的高度变了就自己重新停靠（切电脑键盘、高度设置）。
+- `dianmo-win/window.rs`：最后一个窗口关掉时重建键盘设备；`trim_heaps` 加 `HeapOptimizeResources`；`DIANMO_WINDOW_GPU=shared`。
+- `dianmo-win/focus.rs`：`FieldKind::Email`；Chromium 文本框经 IAccessible2 取 `text-input-type`（焦点窗口的 MSAA 对象 → 输入框中点 `accHitTest` → `get_attributes`；先确认焦点窗口属于同一进程）：email → Email，url → Url，tel / number → Number，search → Search。焦点日志加 `lct=`（LocalizedControlType）和 `type=`（取到的类型或失败在哪一步，只记标签名不记属性值）。试过但不行的路：Edge 的 LocalizedControlType 全是「编辑」；UIA 元素没有 LegacyIAccessible 模式；根对象的 `accFocus` 返回文档本身；运行时 ID 末位不是 IA2 的 uniqueID。
+- `dianmo-ui`：`FieldHint { Text, Url, Email }`、`KeyboardView::set_field_hint`，空闲工具栏最前面放快捷输入键（放不下从后往前去掉，编辑工具让位）；`layout::preferred_height_pc`（竖屏电脑键盘）。测试 2 个。
+- `dianmo/app.rs`：焦点事件设置 `FieldHint`（焦点离开文本框时清掉）；keymap 测试钩子加 `.com @ www. @qq.com`。
+- `scripts/surface/package.sh`：导入表白名单加 `oleacc.dll`（IAccessible2 那条路用 `AccessibleObjectFromWindow`；系统自带，UIA 本来就会加载它）。
+- 打包：`package.sh final2 --setup` → `dist/DianmoSetup-0.2.2.exe`（22,081,998 字节；装好后 50 MB，exe 1526 KB）；打包后的副本又跑了一遍记事本 + Edge 自动弹出（21 项全过，版本 0.2.2）。
+- `dianmo/memdiag.rs`（新）：`DIANMO_MEMLOG=1` 时打开 / 关闭设置窗口前后写内存明细；`DIANMO_NO=settings-checks` 打开设置时不做管理员任务 / 语音引擎 / 词数检查（排查用）。
+- 版本 0.2.2，CHANGELOG、README（新截图、语音球图、输入框类型、内存数据）、DESIGN（输入框类型、竖屏电脑键盘、内存一节）。
+- 测试：e2e 新步骤 `SETTINGSCMD`、`SCLOSE`、`IDLE:<秒>`、`TASKINFO`、`ROTATE:<度>`（测完一定恢复），`run.sh` 支持 `GUI_TIMEOUT`；`autoshow.ps1` 的 Edge 一节加数字 / 密码 / 网址 / 邮箱 / 电话框和密码框剪贴板检查，资源管理器改点列表里的文件；`focus-test.html` 加电话框。
+
+### 未验证 / 遗留
+
+- 一键修复的 UAC 路径、耳机插拔（见上表）。
+- 网址 / 邮箱快捷键只在 Chromium 系（Edge、Chrome、VS Code 等 Electron）的网页输入框和浏览器 / 资源管理器地址栏上有；UWP / WinUI 的 `InputScope` 没接（UIA 不暴露）。
+- 网址 / 邮箱框里不会自动切到英文（有意的：可能要打中文备注）；要不要像手机那样自动切，可以再定。
+- 更新线程每小时醒一次（只比较时间），算不上负担，没改成按到期时间睡。
+- 安装包覆盖安装时如果安装目录被占用（rename 失败）会退回逐个复制，结果正确，但目录里的旧文件不会删掉。
