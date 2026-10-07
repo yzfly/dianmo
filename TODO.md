@@ -51,9 +51,10 @@
 | 41 | 2026-10-07 | 本地 ASR 中文识别要精准；做完直接装上通知 | ⏸ 2026-10-07 用户叫停（「别搞那么复杂，先停了」）。半成品保存在本地分支 `wip/local-asr`；调研结论见 docs/research/voice-local.md；GitHub 上留有预发布 asr-models-v1（模型镜像） |
 | 42 | 2026-10-07 | ASR 先停，把其他的做完；Surface 现在空出来了，可以做真机测试 | ✅ v0.2.1 已打包（未安装、未发布）：真机验证结果见 docs/status/dianmo.md「v0.2.1 实机验证」；修了按键音不响、VS Code 终端不重新弹出、锁定 Alt 连点 Tab、悬浮球边缘手势、关于页红点、词数统计抢引擎、托盘后语音提示、反馈问题以提权打开浏览器等；豆包输入法实测不响应模拟按键，暂不可用 |
 | 43 | 2026-10-07 | 继续把剩下的问题修完，做完直接装上通知 | ✅ v0.2.2 已装到 Surface 并发布：设置窗口内存回落、空闲 CPU 无周期唤醒、竖屏电脑键盘加高、网址/邮箱便捷键、升级全流程实测通过、README 真机截图、Surface 清理约 7.6GB |
+| 44 | 2026-10-07 | 开发结束，把清理做了 | ✅ Surface：删 DianmoGui 任务、`C:\Users\wecode\claude`、所有开发工作目录与安装包（保留工具链和 Rime 数据）；R2 安装脚本已删；服务器 `cargo clean` 释放 8.5GB，dist 只留 0.2.2 |
 
 ## 待清理 / 收尾
 
 - [x] Codex 那版原型（`%LOCALAPPDATA%\SurfaceTouchKeyboard`、Codex 工作区 `outputs\SurfaceTouchKeyboard`、桌面图标）：用户同意，2026-10-06 已删
-- [ ] 计划任务 `DianmoGui`（scripts/surface/gui.sh 用）和 `C:\Users\wecode\claude`：开发结束后删除（旧的 `ClaudeShot` 已删）
-- [ ] R2 上的一次性 Surface 安装脚本（含隧道钥匙）：2026-10-13 链接过期后删除
+- [x] 计划任务 `DianmoGui`（scripts/surface/gui.sh 用）和 `C:\Users\wecode\claude`：开发结束后删除（旧的 `ClaudeShot` 已删）——2026-10-07 已删（之后再用 gui.sh 会自动重建）；Surface 上 `C:\dev` 只保留 `tools`（Rust/llvm-mingw 工具链）和 `dianmo-data`（Rime 数据），其余工作目录、构建产物、安装包、测试脚本都已删
+- [x] R2 上的一次性 Surface 安装脚本（含隧道钥匙）：2026-10-13 链接过期后删除——2026-10-07 已提前删除（连同安装日志）
