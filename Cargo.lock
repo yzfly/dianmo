@@ -75,6 +75,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dianmo-asr"
+version = "0.2.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "dianmo-core"
 version = "0.2.0"
 
