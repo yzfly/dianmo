@@ -29,11 +29,14 @@ $DepsSha = '9EF5608D8A54FF52BBAD7A9B4128DE42B232F8E3DD1F5FD3BFF42A0B1BACD7E8'
 # rime-ice main @ 2026-10-05 "dict: 增改词汇 (#1636)"
 $IceCommit = 'da1fbe602e38f26db846fa10120ee64c2b0324c0'
 $IceFiles = @(
-  'rime_ice.schema.yaml', 'rime_ice.dict.yaml', 'double_pinyin_flypy.schema.yaml', 't9.schema.yaml',
+  'rime_ice.schema.yaml', 'rime_ice.dict.yaml', 't9.schema.yaml',
+  'double_pinyin_flypy.schema.yaml', 'double_pinyin.schema.yaml', 'double_pinyin_mspy.schema.yaml',
+  'double_pinyin_sogou.schema.yaml',
   'melt_eng.schema.yaml', 'melt_eng.dict.yaml', 'radical_pinyin.schema.yaml', 'radical_pinyin.dict.yaml',
   'symbols_v.yaml', 'symbols_caps_v.yaml', 'custom_phrase.txt', 'default.yaml',
   'cn_dicts/8105.dict.yaml', 'cn_dicts/base.dict.yaml', 'cn_dicts/ext.dict.yaml', 'cn_dicts/others.dict.yaml',
   'en_dicts/en.dict.yaml', 'en_dicts/en_ext.dict.yaml', 'en_dicts/cn_en.txt', 'en_dicts/cn_en_flypy.txt',
+  'en_dicts/cn_en_double_pinyin.txt', 'en_dicts/cn_en_mspy.txt', 'en_dicts/cn_en_sogou.txt',
   'opencc/emoji.json', 'opencc/emoji.txt', 'opencc/others.txt',
   'lua/select_character.lua', 'lua/date_translator.lua', 'lua/convert_ar_num_to_zh.lua', 'lua/lunar.lua',
   'lua/lunar.db', 'lua/uuid.lua', 'lua/unicode.lua', 'lua/number_translator.lua', 'lua/calc_translator.lua',
@@ -105,8 +108,11 @@ if (-not (Test-Path "$data\opencc\s2t.json")) {
 }
 
 # ---- rime-ice -----------------------------------------------------------------------------------
-if ((Get-Content "$data\RIME_ICE_COMMIT" -ErrorAction SilentlyContinue) -ne $IceCommit) {
-  foreach ($f in $IceFiles) {
+# A new pinned commit re-fetches everything; otherwise only files added to $IceFiles since.
+$sameCommit = (Get-Content "$data\RIME_ICE_COMMIT" -ErrorAction SilentlyContinue) -eq $IceCommit
+$fetch = @($IceFiles | Where-Object { -not $sameCommit -or -not (Test-Path (Join-Path $data ($_ -replace '/', '\'))) })
+if ($fetch.Count -gt 0) {
+  foreach ($f in $fetch) {
     Get-File "https://raw.githubusercontent.com/iDvel/rime-ice/$IceCommit/$f" (Join-Path $data ($f -replace '/', '\'))
   }
   $utf8 = New-Object Text.UTF8Encoding($false)
@@ -116,11 +122,15 @@ if ((Get-Content "$data\RIME_ICE_COMMIT" -ErrorAction SilentlyContinue) -ne $Ice
     [IO.File]::WriteAllText($Path, $n, $utf8)
   }
   # Skip the 17MB Tencent word-vector dictionary (deploy time + size); base/ext cover daily use.
-  Edit-Text "$data\rime_ice.dict.yaml" { param($t) $t -replace '(?m)^(\s*)- cn_dicts/tencent', '$1# - cn_dicts/tencent' }
+  if ($fetch -contains 'rime_ice.dict.yaml') {
+    Edit-Text "$data\rime_ice.dict.yaml" { param($t) $t -replace '(?m)^(\s*)- cn_dicts/tencent', '$1# - cn_dicts/tencent' }
+  }
   # rime-ice PR #1451 added an iOS-only C++ processor (t9_processor) that librime doesn't have.
-  Edit-Text "$data\t9.schema.yaml" { param($t) $t -replace '(?m)^\s*- t9_processor.*\r?\n', '' }
+  if ($fetch -contains 't9.schema.yaml') {
+    Edit-Text "$data\t9.schema.yaml" { param($t) $t -replace '(?m)^\s*- t9_processor.*\r?\n', '' }
+  }
   Set-Content "$data\RIME_ICE_COMMIT" $IceCommit
-  "rime-ice: $IceCommit ($($IceFiles.Count) files)"
+  "rime-ice: $IceCommit ($($fetch.Count) of $($IceFiles.Count) files fetched)"
 }
 
 # ---- Dianmo's own config (default.custom.yaml etc. from the repo) -------------------------------

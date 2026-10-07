@@ -61,7 +61,7 @@ pub struct OnboardingView {
 
 const LAYOUTS: [(LayoutChoice, &str, &str); 3] = [
     (LayoutChoice::Pinyin, "全拼", "和手机一样的 26 键，打完整拼音"),
-    (LayoutChoice::Shuangpin, "小鹤双拼", "每个字只按两下，熟练后更快"),
+    (LayoutChoice::Shuangpin, "双拼", "每个字按两下，默认小鹤方案"),
     (LayoutChoice::T9, "九宫格", "按键大，适合单手和竖屏"),
 ];
 

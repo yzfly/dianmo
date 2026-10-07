@@ -317,3 +317,30 @@ struct Release { version, tag, notes /* 纯文本，≤1200 字 */, url /* 空 =
 - 语音球的「出来 + 气泡」（`reveal_ball`）这次截图被用户自己的键盘挡住了，只有日志。
 - 托盘图标的「有新版」小红点没做（只改了菜单文字）。
 - 候选字号、全角标点、空格上屏首选、模糊音、按键音、用户词库导入导出清空：界面已接，功能下个版本。
+
+## v0.2.0：设置里「下个版本」的功能全部接通（TODO #38，2026-10-07）
+
+**改动**
+- 版本 `0.2.0`（workspace）；`CHANGELOG.md` 加 `[0.2.0]`。
+- **按键音** `src/sound.rs`：4 个 WAV（`res/sounds/{crisp,soft}_{char,func}.wav`，48 kHz 单声道 16 位，3.7–5.3 KB，`res/sounds/gen.py` 合成，`include_bytes!` 编进 exe）。`KeySound`：一个音频线程，WASAPI 共享模式事件驱动，启动即打开设备（不 Start）；`play(KeyClick)` = 发命令 + `SetEvent`；最多 4 个声音混音；预排两个设备周期；播完 Stop 后无限等待；停顿 3 s 后查默认设备是否变了；WASAPI 不可用时动态加载 winmm 的 `PlaySoundW(SND_MEMORY|SND_ASYNC)`。关掉按键音 = drop `KeySound`（线程退出、释放设备）。纯逻辑（WAV 解析、重采样、混音、写设备格式、兜底 WAV 缩放）5 个测试。Cargo features 加 `Win32_Media_Audio`、`Win32_System_Com_StructuredStorage`（不新增静态导入的 DLL）。`DIANMO_NO=sound` 可关掉。
+- `UiAction::KeyClick(KeyClick::{Char, Func})`：键盘在按下时发（排在输入动作前）；`on_action` 里直接 `sound.play` 后返回，不刷新托盘 / 设置窗口。设置里改开关 / 音量 / 音色时立即应用并试听一声。
+- **候选字号 / 全角标点 / 空格上屏首选**：`KeyboardView::set_candidate_size` / `set_full_width_punct`，`InputController::set_full_width_punct` / `set_space_commits_first`；启动和「恢复默认」时都应用。`prefs::COMING_SOON` 清空（「下个版本生效」标签不再出现）。
+- **双拼方案**：settings.ini `shuangpin=xiaohe|ziranma|microsoft|sogou`；键面（`KeyboardView::set_shuangpin`）、`InputController::set_semicolon_input`（微软 / 搜狗的 `；` 组字时交给引擎）、`RimeEngine::set_shuangpin`；启动时 `Options::shuangpin` 按设置；librime 启动中或在后台做事时改的方案在引擎回来时补上（`swap_in_rime`）。托盘「布局」里的双拼项显示方案名。
+- **模糊音 / 用户词库** `src/app/rime_ui.rs`（流程见 DESIGN §3）：librime 启动线程里先 `set_fuzzy`；引擎起来后和每次改模糊音时 `apply_fuzzy`：`Deploy` → 子进程 `dianmo.exe --deploy-user [--instance x]`（`CREATE_NO_WINDOW`），设置页「正在应用模糊音…」，退出码 0 → 后台 `reload`，期间又改了就再部署一次；`Reload` → 后台 `reload`。`RimeJob {Reload, Export, Import, Clear, Count}`：把 `RimeEngine` 从控制器里取出（不在组字时；内置引擎顶着）、在后台线程做、`RimeJobDone` 回来经 `pending_rime` 换回，一次一件、排队。导出 / 导入：`shell::save_file` / `open_file`（`IFileSaveDialog` / `IFileOpenDialog`，后台线程，owner = 按标题找到的本进程「点墨设置」窗口），默认 `文档\点墨用户词库-YYYYMMDD.txt`；完成后状态行 + toast（导出后在资源管理器里选中文件，导入后重新计数）。清空：设置页行内确认后执行。打开设置窗口时统计词数（`user_words`）。
+- **托盘红点**：检查到新版本 `host.set_tray_badge(true)`；已是最新、点托盘「关于点墨」、点「立即更新」时关。
+- 设置模型新字段（`SysState`）：`fuzzy_supported`（= librime 在跑）、`fuzzy_status`、`user_words`、`user_dict_status`。
+
+**测试**：服务器 `cargo test --workspace` 158 个全过（dianmo 25，新增 sound 5 个，settings / prefs 测试补了新键；dianmo-core 15，新增 3 个：空格规则、全角标点、`；` 组字；dianmo-ui 100，新增 8 个）。`cargo clippy --workspace --all-targets`、`cargo clippy -p dianmo --target x86_64-pc-windows-gnullvm --tests`（带 / 不带 rime feature）、`cargo check --workspace --examples --target x86_64-pc-windows-gnullvm` 干净（dianmo-win/window.rs 有一个别人的 clippy 警告）。
+
+**需要实机验证（没在 Surface 上跑过）**
+- 按键音：能响、两种音色和三档音量听感、按下到出声延迟（目标 < 30 ms；可录屏 + 录音对比，或在日志里看 `key sound: WASAPI … lead … frames`）、快速连打不截断不爆音、关掉后线程退出（进程线程数 / 私有内存回落）、空闲 CPU 0、插拔耳机后跟随默认设备、无声卡时的 PlaySound 兜底。合成的声音没人听过，可能要调 `gen.py` 的参数。
+- 导出 / 导入的文件对话框：是否在设置窗口前面、模态（设置窗口禁用）、取消不报错、中文路径。
+- 模糊音：点芯片后状态行出现→约 1 秒后消失并提示「模糊音已生效」；连续点多个芯片只多部署一次；`--instance` 测试实例的数据目录正确。
+- 用户词库：导出→清空（确认）→导入，词数变化；做这些时键盘在打字的情况。
+- 双拼四种方案的键面、竖屏布局的「；」键、微软 / 搜狗 `x;` = xing。
+- 托盘红点（需要一个比当前新的 release 才会亮）。
+
+**遗留**
+- 退出时如果引擎正好在后台做事（约 0.1 s 的窗口），`Drop` 里的 `dianmo_rime::shutdown()` 和后台线程可能并发；概率很小，没处理。
+- 设置窗口导航里切到「关于」页不会关托盘红点（视图内部切页主程序不知道），只有托盘「关于点墨」和「立即更新」会。
+- 打开设置窗口时统计词数要把引擎移走约 0.1 s；这期间在键盘上打字会先用内置引擎（只出字母），组字结束才换回。

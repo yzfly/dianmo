@@ -7,7 +7,7 @@
 - **默认用 WARP（软件渲染）**：硬件驱动（Intel igc64 等）要多占约 47MB 私有内存（56MB 对 9.8MB），而一次整屏重绘的 CPU 两者一样（约 6–7ms）。`HostOptions::hardware_gpu` 或环境变量 `DIANMO_D3D=hardware` 可改回 GPU。
 - **计时器**：同一时间只保留一个单次计时器，新请求覆盖旧请求；Response 合并（repaint / timer / 嵌套 actions 交回 App）。
 - **SendInputSink**：文字用 KEYEVENTF_UNICODE，代理对拆成两个事件，整串一次 SendInput；EditKey 发真实虚拟键，方向键、Home、End、Delete 加 EXTENDEDKEY。**Win+H**：一次 SendInput。
-- **托盘**：图标优先用 exe 的图标资源 1（`LoadImageW`，按当前 DPI 的小图标尺寸，DPI 变了重载）；没有资源（如 demo）时用 GDI 画的「墨」。点一下切换显示/隐藏；菜单有显示/隐藏、AppBar 开关、退出。
+- **托盘**：图标优先用 exe 的图标资源 1（`LoadImageW`，按当前 DPI 的小图标尺寸，DPI 变了重载）；没有资源（如 demo）时用 GDI 画的「墨」。点一下切换显示/隐藏；菜单有显示/隐藏、AppBar 开关、退出。v0.2.0 加了新版本红点（`set_tray_badge`，见下面 v0.2.0 一节，未实测）。
 - **悬浮球**（取代原来的边缘把手，见下面「第三轮」）：键盘隐藏时出现，点一下呼出键盘。
 - **AppBar**：只在显示时注册；隐藏、退出、panic 时 ABM_REMOVE；收到 TaskbarCreated 重新注册；显示器变化重新布局；可开关。
 - **系统触摸键盘设置**：`tabtip` 模块读写 EnableDesktopModeAutoInvoke / TouchKeyboardTapInvoke，可快照并原样恢复（未在测试里改注册表）。
@@ -74,7 +74,7 @@
 - **外观**：
   - 普通顶层窗口，可激活，有任务栏按钮；标题栏和任务栏用 exe 图标资源 1（随 DPI 重新加载）。
   - 系统标题栏，`WS_EX_NOREDIRECTIONBITMAP` + DirectComposition。第一帧画好再显示，不会闪白。
-  - 深色标题栏用 `DWMWA_USE_IMMERSIVE_DARK_MODE`：`WindowOptions::dark = None` 时跟随系统「应用模式」，收到 `ImmersiveColorSet` 就更新；也可以强制指定，或运行时调 `set_window_dark`。Win10 上属性改了以后，标题栏要等下一次重画才变色，所以改完会切一下 `WM_NCACTIVATE` 强制重画（这一步没有实测）。
+  - 深色标题栏用 `DWMWA_USE_IMMERSIVE_DARK_MODE`：`WindowOptions::dark = None` 时跟随系统「应用模式」，收到 `ImmersiveColorSet` 就更新；也可以强制指定，或运行时调 `set_window_dark`。Win10 上属性改了以后，标题栏要等下一次重画才变色，所以改完会切一下 `WM_NCACTIVATE` 强制重画（这一步没有实测）。v0.2.0 的改法见下面「v0.2.0：托盘红点、深色标题栏」。
   - Win11 可以开 Mica（`DWMWA_SYSTEMBACKDROP_TYPE`，只作用于标题栏；Win10 上忽略）。
 - **位置和大小**：打开在最后一次指针所在的显示器上，在工作区里居中。工作区不含点墨键盘占用的 AppBar；窗口比工作区大时会缩到工作区大小。Per-Monitor-V2：`WM_DPICHANGED` 按系统建议的矩形移动；`min_width/min_height` 通过 `WM_GETMINMAXINFO` 生效。
 - **输入**：
@@ -108,6 +108,25 @@
     - 开、关多次后内存没有持续增长，看不出泄漏。
 - 演示里用的 PNG 由 `crates/dianmo/res/icon/*.svg` 用 cairosvg 生成，放在 `examples/res/`。`.gitignore` 加了这个目录的例外（全局忽略 `*.png`）。`build.rs` 用 llvm-windres 把 `examples/res/examples.rc`（图标资源 1 + `app-icon` RCDATA）链接进各个 example，所以 `demo.exe` 现在也有图标了。
 
+## v0.2.0：托盘红点、深色标题栏（2026-10-06，TODO #38，只在服务器上 cargo check / clippy，未实测）
+- **托盘新版本红点**：`HostControl::set_tray_badge(on)`、`HostProxy::set_tray_badge(on) -> bool`（任意线程，比如检查更新的线程）。
+  - 打开时，用当前托盘图标（exe 图标资源 1，或 demo 里画的「墨」）在内存里合成一个新 HICON：`GetIconInfo` + `GetDIBits` 取出图标自己的像素（没有 alpha 的老式图标按 AND 掩码补 alpha），右上角贴边画红点（#E81123，外径约为图标边长的 36%，最小 6px），外面一圈白描边（图标每 16px 宽 1px：100% 时 1px，200% 时 2px），4×4 超采样抗锯齿，按非预乘 alpha 叠加，再 `CreateIconIndirect`（32 位 + 按 alpha 生成的掩码），然后 `NIM_MODIFY`。
+  - 关闭时 `NIM_MODIFY` 换回原图标，再销毁合成的图标（shell 有自己的副本）。重复设置同一状态什么都不做；合成失败就保持原图标。
+  - 状态保存在 `Tray` 里：DPI 变了按新尺寸重新加载原图标并重新合成（各 DPI 都是按实际像素画的，不是缩放）；Explorer 重启（TaskbarCreated）后 `NIM_ADD` 用的就是当前显示的图标。没有托盘图标（`HostOptions::tray = false`）时无效果。
+- **深色标题栏**（`window.rs`）：
+  - 用 `RtlGetVersion` 取系统版本号（`GetVersionEx` 在没有兼容性清单时会谎报）。19041（20H1）及以后先用属性 20，1809–1909 先用 19，失败再试另一个；1809 之前不设。
+  - Win10 1903 及以后（< 22000）另外调一次 user32 的 `SetWindowCompositionAttribute(WCA_USEDARKMODECOLORS)`（未公开；Explorer、winit 用的就是这个），保证窗口框架自己记录的主题和 DWM 属性一致。
+  - 主题在 `CreateWindowExW` 之后立刻设置（Mica 也一样），早于渲染器创建和第一次 `ShowWindow`。
+  - 运行中切换（`set_window_dark`、系统主题变化）：先 `SetWindowPos(SWP_FRAMECHANGED | NOMOVE | NOSIZE | NOZORDER | NOACTIVATE)` 让框架重算重画；Win10 上再对 `DefWindowProc` 发一对 `WM_NCACTIVATE`（先反、再正，相当于失活再激活，但焦点和前台窗口都不变），让 DWM 用新颜色重画标题栏。Win11 自己会重画，只做第一步。
+  - 记录每个窗口当前的标题栏主题，`ImmersiveColorSet` 连发几次、或设成同一个值时不再重复重画。
+- **要实机看的点**（主会话合并到一次验证）：
+  1. 主程序有新版本时托盘图标右上角出现红点：100% 和 200% 下都清晰、有白边、不糊；关掉后恢复原图标，没有残影。
+  2. 红点亮着时改缩放（或把键盘拖到别的 DPI 的显示器）、重启 Explorer（`taskkill /f /im explorer.exe` 后再开），红点还在。
+  3. 系统为浅色时用 `--dark` 打开窗口（`window_demo.exe --open --dark`），一出现标题栏就是深色。
+  4. 窗口开着、处于前台时点「深色」/「浅色」，标题栏立即变色，窗口不闪、焦点不丢。窗口在后台时切换也要变色。
+  5. 系统「应用模式」切换时，跟随系统的窗口标题栏跟着变。
+  - 如果第 4 点还是不变色，下一步可以试：隐藏再显示窗口（`SW_HIDE` + `SW_SHOWNA`），或者把窗口宽度临时 +1px 再改回去。这两种都能确定触发重画，但会有闪烁或额外的交换链缩放，所以这次没有用。
+
 ## 未完成 / 已知问题
 - 没测：运行中改 DPI、多显示器、旋转屏幕、Explorer 重启（这些代码路径都已写好）。
 - 进程被强杀（TerminateProcess）时 AppBar 占的工作区不会释放，要等下一次有 AppBar 变化（比如再开一次点墨）才恢复。测试时请用 WM_CLOSE 关闭（e2e 脚本就是这样做的）。
@@ -120,7 +139,7 @@
 - 托盘菜单里调用 SetForegroundWindow 会激活隐藏的托盘窗口（这是 Windows 的已知要求）；这时用户本来就已经离开了目标应用。
 - 测试时 demo 由提权的计划任务启动，所以 UIPI 限制（普通权限的键盘向管理员窗口输入）没有覆盖到。
 - 应用窗口：
-  - 深色标题栏的 `WM_NCACTIVATE` 重画、Mica（Win11）、运行中改 DPI、多显示器，都没有实测。
+  - 深色标题栏运行中切换的重画（v0.2.0 改过，见上）、Mica（Win11）、运行中改 DPI、多显示器，都没有实测。
   - 关窗后内存只回落约 10MB，见上面的数据。
   - 应用窗口没有接 `WM_CHAR`，不能直接输入文字，以后要做搜索框得补上。
   - 在 Surface 上跑测试时，注入的触摸如果落在用户焦点所在的控制台里，正在运行的点墨会把它当成「点了输入框」，然后弹出自己的键盘（另一个进程，不算 bug）。这时 demo 的键盘条会被挤上去，所以测试脚本每次点之前都会重新读取位置。
@@ -129,7 +148,7 @@
 - `run(view: Box<dyn View>, app: Box<dyn App>) -> windows::core::Result<()>`；`run_with(view, app, HostOptions)`；`enable_per_monitor_dpi()`
 - `HostOptions { start_visible, appbar, tray, edge_handle /*悬浮球开关*/, tray_tip, max_height_fraction, hardware_gpu, tray_menu: Vec<TrayItem>, ball_pos: Option<BallPos>, image_dir: Option<PathBuf> }`（实现了 Default）
 - `trait App { on_start(..) /*默认空*/; on_action(&mut self, UiAction, &mut dyn View, &mut HostControl) -> Response; on_event(Box<dyn Any+Send>, ..) -> Response /*默认空*/; on_visibility_changed(bool, ..) /*默认空*/; on_tray_command(id: u32, ..) /*默认空*/; on_ball(BallEvent, ..) -> Response /*默认 Tap/LongPress → show()*/ }`
-- `HostControl`：`show / hide / toggle / is_visible / set_appbar / appbar_enabled / quit / proxy / set_tray_menu(Vec<TrayItem>) / fullscreen_app() / set_ball_state(BallState)`（请求在回调返回后才生效）
+- `HostControl`：`show / hide / toggle / is_visible / set_appbar / appbar_enabled / quit / proxy / set_tray_menu(Vec<TrayItem>) / set_tray_badge(bool) / fullscreen_app() / set_ball_state(BallState)`（请求在回调返回后才生效）
 - 应用窗口：
   - `HostControl::open_window(Box<dyn View>, WindowOptions) -> WindowId`：id 立即可用，窗口在回调返回后创建。
   - `close_window(id)`：在同一个回调里刚打开的窗口直接取消，不回调 `on_window_closed`。
@@ -150,7 +169,7 @@
   - `HostControl::set_ball_pos(BallPos)`（设置里「靠左 / 靠右」）、`set_ball_enabled(bool)`（运行中创建 / 销毁悬浮球，位置保留）。
   - `App::on_system_theme_changed(dark, view, host) -> Response`（默认空）：键盘窗口收到 `WM_SETTINGCHANGE "ImmersiveColorSet"` 时调用（Windows 一次切换会发好几次，app 自己去重）。
 - `focus::{start_focus_watcher(HostProxy) -> Result<FocusWatcher>, FocusWatcher /*Drop 即停止*/, FocusEvent::{Editable { kind, by_touch }, NotEditable { by_touch }}, FieldKind::{Text, Number, Password, Url, Search}, TOUCH_WINDOW_MS}`；第一条事件永远是当前焦点（by_touch=false）。App 在 `on_event` 里 `event.downcast::<FocusEvent>()`。
-- `HostProxy`（Send + Sync + Copy）：`post<T: Any+Send>(T)`（交给 `App::on_event`）、`show / hide / toggle / quit / hwnd`
+- `HostProxy`（Send + Sync + Copy）：`post<T: Any+Send>(T)`（交给 `App::on_event`）、`show / hide / toggle / quit / set_tray_badge(bool) / hwnd`
 - `SendInputSink`（实现 `TextSink`）、`send_text`、`send_edit_key`、`start_voice_typing`、`now_ms`
 - `tabtip::{read_dword, write_dword, SystemKeyboardSettings::{read, apply, auto_invoke_enabled}, disable_system_keyboard_auto_invoke}`
 

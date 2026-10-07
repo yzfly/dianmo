@@ -3,14 +3,17 @@
 //!
 //! The icon is the exe's icon resource 1 at the small-icon size for the current DPI (reloaded
 //! when the DPI changes); without such a resource (e.g. the demo) a 「墨」 is drawn with GDI.
+//! [`Tray::set_badge`] overlays a red "update available" dot, composited in memory from the
+//! icon's own pixels.
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, CreateBitmap, CreateCompatibleDC, CreateDIBSection,
+    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, CreateBitmap, CreateCompatibleDC, CreateDIBSection,
     CreateFontW, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
-    FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FW_BOLD, HGDIOBJ, SelectObject, SetBkMode,
+    FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FW_BOLD, GetDIBits, GetObjectW, HBITMAP, HGDIOBJ,
+    SelectObject, SetBkMode,
     SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -22,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, HICON, HMENU, ICONINFO, MF_CHECKED,
     MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, SM_CXSMICON, SetForegroundWindow, TPM_BOTTOMALIGN,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL, CreateIconIndirect, FindWindowW, GetWindowRect,
-    IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
+    IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, GetIconInfo,
 };
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::core::{HSTRING, PCWSTR, w};
@@ -79,7 +82,12 @@ pub(crate) const CMD_QUIT: u32 = 1003;
 pub(crate) struct Tray {
     hwnd: HWND,
     callback: u32,
+    /// The plain icon (exe resource 1 or the drawn 「墨」).
     icon: HICON,
+    /// `icon` with the red "update available" dot; built while `badge` is on (may stay invalid
+    /// if compositing failed, then the plain icon is shown).
+    badged: HICON,
+    badge: bool,
     /// Icon size in px.
     size: i32,
     tip: String,
@@ -88,27 +96,64 @@ pub(crate) struct Tray {
 impl Tray {
     pub(crate) fn new(hwnd: HWND, callback: u32, tip: &str, dpi: u32) -> Self {
         let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi) }.max(16);
-        let tray = Self { hwnd, callback, icon: load_icon(size), size, tip: tip.to_owned() };
+        let tray = Self {
+            hwnd,
+            callback,
+            icon: load_icon(size),
+            badged: HICON::default(),
+            badge: false,
+            size,
+            tip: tip.to_owned(),
+        };
         tray.add();
         OWNER.store(hwnd.0 as isize, Ordering::Relaxed);
         tray
     }
 
-    /// Reloads the icon at the small-icon size for `dpi` (after a DPI change).
+    /// Reloads the icon at the small-icon size for `dpi` (after a DPI change), keeping the badge.
     pub(crate) fn set_dpi(&mut self, dpi: u32) {
         let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi) }.max(16);
         if size == self.size {
             return;
         }
         let old = std::mem::replace(&mut self.icon, load_icon(size));
+        let new_badged = if self.badge { make_badged(self.icon) } else { HICON::default() };
+        let old_badged = std::mem::replace(&mut self.badged, new_badged);
         self.size = size;
+        self.modify_icon();
+        destroy(old);
+        destroy(old_badged);
+    }
+
+    /// Shows or removes the red dot in the icon's top-right corner (a new version is
+    /// available). Kept across DPI changes and Explorer restarts.
+    pub(crate) fn set_badge(&mut self, on: bool) {
+        if on == self.badge {
+            return;
+        }
+        self.badge = on;
+        if on {
+            if self.badged.is_invalid() {
+                self.badged = make_badged(self.icon);
+            }
+            self.modify_icon();
+        } else {
+            self.modify_icon();
+            // The shell keeps its own copy of the icon, so ours can go now.
+            destroy(std::mem::take(&mut self.badged));
+        }
+    }
+
+    /// The icon to show now.
+    fn shown(&self) -> HICON {
+        if self.badge && !self.badged.is_invalid() { self.badged } else { self.icon }
+    }
+
+    fn modify_icon(&self) {
         let mut d = self.data();
         d.uFlags = NIF_ICON;
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
-            if !old.is_invalid() {
-                let _ = DestroyIcon(old);
-            }
         }
     }
 
@@ -121,14 +166,15 @@ impl Tray {
         };
         d.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         d.uCallbackMessage = self.callback;
-        d.hIcon = self.icon;
+        d.hIcon = self.shown();
         for (dst, src) in d.szTip.iter_mut().zip(self.tip.encode_utf16().take(127)) {
             *dst = src;
         }
         d
     }
 
-    /// NIM_ADD + NOTIFYICON_VERSION_4. Called again after Explorer restarts (`TaskbarCreated`).
+    /// NIM_ADD + NOTIFYICON_VERSION_4 (with the badge if it is on). Called again after Explorer
+    /// restarts (`TaskbarCreated`).
     pub(crate) fn add(&self) {
         let mut d = self.data();
         unsafe {
@@ -137,7 +183,6 @@ impl Tray {
             let _ = Shell_NotifyIconW(NIM_SETVERSION, &d);
         }
     }
-
 }
 
 /// An app-defined tray menu entry ([`crate::HostOptions::tray_menu`],
@@ -238,9 +283,16 @@ impl Drop for Tray {
         let d = self.data();
         unsafe {
             let _ = Shell_NotifyIconW(NIM_DELETE, &d);
-            if !self.icon.is_invalid() {
-                let _ = DestroyIcon(self.icon);
-            }
+        }
+        destroy(self.icon);
+        destroy(self.badged);
+    }
+}
+
+fn destroy(icon: HICON) {
+    if !icon.is_invalid() {
+        unsafe {
+            let _ = DestroyIcon(icon);
         }
     }
 }
@@ -308,6 +360,150 @@ fn make_icon(size: i32) -> Option<HICON> {
 
         let mask_bits = vec![0u8; ((size + 15) / 16 * 2 * size) as usize];
         let mask = CreateBitmap(size, size, 1, 1, Some(mask_bits.as_ptr() as *const _));
+        let info = ICONINFO { fIcon: true.into(), xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
+        let icon = CreateIconIndirect(&info).ok();
+        let _ = DeleteObject(HGDIOBJ(mask.0));
+        let _ = DeleteObject(HGDIOBJ(color.0));
+        icon
+    }
+}
+
+/// `base` with the update badge: a red dot (about a third of the icon across) with a white ring
+/// (1 px per 16 px of icon) in the top-right corner, anti-aliased. Built from the icon's own
+/// pixels, so it is as sharp as the icon at every DPI. Invalid on failure.
+fn make_badged(base: HICON) -> HICON {
+    unsafe { badged_icon(base) }.unwrap_or_default()
+}
+
+unsafe fn badged_icon(base: HICON) -> Option<HICON> {
+    unsafe {
+        let mut info = ICONINFO::default();
+        GetIconInfo(base, &mut info).ok()?;
+        // GetIconInfo hands us copies of both bitmaps.
+        let (color, mask) = (info.hbmColor, info.hbmMask);
+        let result = (|| {
+            if color.is_invalid() {
+                return None; // monochrome icon
+            }
+            let mut bm = BITMAP::default();
+            if GetObjectW(HGDIOBJ(color.0), size_of::<BITMAP>() as i32, Some(&mut bm as *mut BITMAP as *mut _)) == 0 {
+                return None;
+            }
+            let (w, h) = (bm.bmWidth, bm.bmHeight);
+            if w <= 0 || h <= 0 || w > 256 || h > 256 {
+                return None;
+            }
+            let mut px = read_bits(color, w, h)?;
+            if px.iter().all(|p| p >> 24 == 0) {
+                // No alpha channel: opacity comes from the AND mask (set = transparent).
+                let m = read_bits(mask, w, h)?;
+                for (p, m) in px.iter_mut().zip(&m) {
+                    *p = if m & 0x00FF_FFFF != 0 { 0 } else { *p | 0xFF00_0000 };
+                }
+            }
+            draw_badge(&mut px, w, h);
+            icon_from_pixels(&px, w, h)
+        })();
+        if !color.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(color.0));
+        }
+        if !mask.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(mask.0));
+        }
+        result
+    }
+}
+
+fn bmi32(w: i32, h: i32) -> BITMAPINFO {
+    BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h, // top-down
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// `bmp` as top-down 0xAARRGGBB pixels.
+unsafe fn read_bits(bmp: HBITMAP, w: i32, h: i32) -> Option<Vec<u32>> {
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        let mut bmi = bmi32(w, h);
+        let mut px = vec![0u32; (w * h) as usize];
+        let lines = GetDIBits(dc, bmp, 0, h as u32, Some(px.as_mut_ptr() as *mut _), &mut bmi, DIB_RGB_COLORS);
+        let _ = DeleteDC(dc);
+        (lines == h).then_some(px)
+    }
+}
+
+/// Paints the badge into straight-alpha 0xAARRGGBB pixels (4×4 supersampled edges).
+fn draw_badge(px: &mut [u32], w: i32, h: i32) {
+    const RED: u32 = 0x00E8_1123;
+    const WHITE: u32 = 0x00FF_FFFF;
+    const N: i32 = 4;
+    let s = w.min(h) as f32;
+    let r_out = (s * 0.18).max(3.0);
+    let r_in = r_out - (s / 16.0).max(1.0);
+    let (cx, cy) = (w as f32 - r_out, r_out);
+    let x0 = ((cx - r_out).floor() as i32).max(0);
+    let y1 = ((cy + r_out).ceil() as i32).min(h);
+    for y in 0..y1 {
+        for x in x0..w {
+            let (mut outer, mut inner) = (0, 0);
+            for sy in 0..N {
+                for sx in 0..N {
+                    let dx = x as f32 + (sx as f32 + 0.5) / N as f32 - cx;
+                    let dy = y as f32 + (sy as f32 + 0.5) / N as f32 - cy;
+                    let d2 = dx * dx + dy * dy;
+                    outer += (d2 <= r_out * r_out) as i32;
+                    inner += (d2 <= r_in * r_in) as i32;
+                }
+            }
+            let p = &mut px[(y * w + x) as usize];
+            *p = over(*p, WHITE, outer as f32 / (N * N) as f32);
+            *p = over(*p, RED, inner as f32 / (N * N) as f32);
+        }
+    }
+}
+
+/// Colour `rgb` with coverage `a` over the straight-alpha pixel `dst`.
+fn over(dst: u32, rgb: u32, a: f32) -> u32 {
+    if a <= 0.0 {
+        return dst;
+    }
+    let da = (dst >> 24) as f32 / 255.0;
+    let oa = a + da * (1.0 - a);
+    let ch = |shift: u32| {
+        let s = ((rgb >> shift) & 0xFF) as f32;
+        let d = ((dst >> shift) & 0xFF) as f32;
+        (((s * a + d * da * (1.0 - a)) / oa).round() as u32).min(255)
+    };
+    (((oa * 255.0).round() as u32).min(255) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+/// A 32-bpp alpha icon from straight-alpha 0xAARRGGBB pixels (the AND mask follows alpha).
+unsafe fn icon_from_pixels(px: &[u32], w: i32, h: i32) -> Option<HICON> {
+    unsafe {
+        let bmi = bmi32(w, h);
+        let mut bits = std::ptr::null_mut();
+        let color = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        std::ptr::copy_nonoverlapping(px.as_ptr(), bits as *mut u32, px.len());
+        // 1 bpp, rows padded to 16 bits, most significant bit first; set = transparent.
+        let stride = ((w + 15) / 16 * 2) as usize;
+        let mut mask_bits = vec![0u8; stride * h as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                if px[y * w as usize + x] >> 24 == 0 {
+                    mask_bits[y * stride + x / 8] |= 0x80 >> (x % 8);
+                }
+            }
+        }
+        let mask = CreateBitmap(w, h, 1, 1, Some(mask_bits.as_ptr() as *const _));
         let info = ICONINFO { fIcon: true.into(), xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
         let icon = CreateIconIndirect(&info).ok();
         let _ = DeleteObject(HGDIOBJ(mask.0));

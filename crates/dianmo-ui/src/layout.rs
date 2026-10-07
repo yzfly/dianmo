@@ -4,6 +4,7 @@
 use dianmo_core::{Action, EditKey, KeyChord, KeyCode, Schema};
 
 use crate::canvas::Rect;
+use crate::settings::ShuangpinScheme;
 
 /// Segoe MDL2 Assets code points (present on Windows 10; Segoe Fluent Icons keeps them).
 pub mod icon {
@@ -39,7 +40,7 @@ pub mod icon {
 pub enum Layout {
     /// 26-key 全拼.
     Pinyin,
-    /// 26-key 小鹤双拼.
+    /// 26-key 双拼 (scheme: `KeyboardView::set_shuangpin`, 小鹤 by default).
     Shuangpin,
     /// 九宫格拼音.
     T9,
@@ -127,6 +128,115 @@ pub fn flypy_hint(c: char) -> Option<&'static str> {
     FLYPY.iter().find(|(k, _)| *k == c).map(|(_, h)| *h)
 }
 
+/// 自然码双拼 finals. Source for these three tables: the `speller/algebra` of rime-ice's
+/// `double_pinyin*.schema.yaml` (collected in docs/status/dianmo-rime.md「双拼键位」).
+pub const ZIRANMA: [(char, &str); 26] = [
+    ('q', "iu"),
+    ('w', "ia ua"),
+    ('e', "e"),
+    ('r', "uan üan"),
+    ('t', "üe"),
+    ('y', "ing uai"),
+    ('u', "sh"),
+    ('i', "ch"),
+    ('o', "uo"),
+    ('p', "un ün"),
+    ('a', "a"),
+    ('s', "ong iong"),
+    ('d', "iang uang"),
+    ('f', "en"),
+    ('g', "eng"),
+    ('h', "ang"),
+    ('j', "an"),
+    ('k', "ao"),
+    ('l', "ai"),
+    ('z', "ei"),
+    ('x', "ie"),
+    ('c', "iao"),
+    ('v', "zh ui"),
+    ('b', "ou"),
+    ('n', "in"),
+    ('m', "ian"),
+];
+
+/// 微软双拼 finals (Rime `double_pinyin_mspy`). `;` = ing.
+pub const MSPY: [(char, &str); 27] = [
+    ('q', "iu"),
+    ('w', "ia ua"),
+    ('e', "e"),
+    ('r', "er uan üan"),
+    ('t', "ue üe"),
+    ('y', "ü uai"),
+    ('u', "sh"),
+    ('i', "ch"),
+    ('o', "uo"),
+    ('p', "un ün"),
+    ('a', "a"),
+    ('s', "ong iong"),
+    ('d', "iang uang"),
+    ('f', "en"),
+    ('g', "eng"),
+    ('h', "ang"),
+    ('j', "an"),
+    ('k', "ao"),
+    ('l', "ai"),
+    (';', "ing"),
+    ('z', "ei"),
+    ('x', "ie"),
+    ('c', "iao"),
+    ('v', "zh ui ue"),
+    ('b', "ou"),
+    ('n', "in"),
+    ('m', "ian"),
+];
+
+/// 搜狗双拼 finals (Rime `double_pinyin_sogou`). `;` = ing. Same key faces as 微软 except v
+/// (no ue / üe); they differ mostly in zero-initial syllables.
+pub const SOGOU: [(char, &str); 27] = [
+    ('q', "iu"),
+    ('w', "ia ua"),
+    ('e', "e"),
+    ('r', "er uan üan"),
+    ('t', "ue üe"),
+    ('y', "ü uai"),
+    ('u', "sh"),
+    ('i', "ch"),
+    ('o', "uo"),
+    ('p', "un ün"),
+    ('a', "a"),
+    ('s', "ong iong"),
+    ('d', "iang uang"),
+    ('f', "en"),
+    ('g', "eng"),
+    ('h', "ang"),
+    ('j', "an"),
+    ('k', "ao"),
+    ('l', "ai"),
+    (';', "ing"),
+    ('z', "ei"),
+    ('x', "ie"),
+    ('c', "iao"),
+    ('v', "zh ui"),
+    ('b', "ou"),
+    ('n', "in"),
+    ('m', "ian"),
+];
+
+/// The key-face table of a 双拼 scheme.
+pub fn shuangpin_table(scheme: ShuangpinScheme) -> &'static [(char, &'static str)] {
+    match scheme {
+        ShuangpinScheme::Xiaohe => &FLYPY,
+        ShuangpinScheme::Ziranma => &ZIRANMA,
+        ShuangpinScheme::Microsoft => &MSPY,
+        ShuangpinScheme::Sogou => &SOGOU,
+    }
+}
+
+/// Finals shown under key `c` (a letter, or `;`) for a 双拼 scheme.
+pub fn shuangpin_hint(scheme: ShuangpinScheme, c: char) -> Option<&'static str> {
+    shuangpin_table(scheme).iter().find(|(k, _)| *k == c).map(|(_, h)| *h)
+}
+
 /// Extra long-press alternates for letters in English mode (after the secondary).
 pub fn english_accents(c: char) -> &'static [&'static str] {
     match c {
@@ -209,6 +319,8 @@ pub const PUNCT_EN: &[&str] = &[",", ".", "?", "!", "'", "\"", ":", ";", "@"];
 
 /// T9 left column when not composing.
 pub const T9_PUNCT: &[&str] = &["，", "。", "？", "！", "、", "：", "；", "……", "～", "“", "”"];
+/// The same with 全角标点 off.
+pub const T9_PUNCT_HALF: &[&str] = &[",", ".", "?", "!", ":", ";", "'", "\"", "~", "(", ")"];
 /// Number pad left column.
 pub const NUM_COLUMN: &[&str] = &["+", "-", "*", "/", "%", "=", ",", "@", "#", "(", ")", ":", "~"];
 
@@ -664,6 +776,10 @@ impl Mods {
 pub(crate) struct BuildCtx {
     pub layout: Layout,
     pub chinese: bool,
+    /// Punctuation keys are full-width (中文 with 全角标点 on).
+    pub zh_punct: bool,
+    /// 双拼 scheme (key-face finals, the `;` key).
+    pub sp: ShuangpinScheme,
     pub composing: bool,
     pub mods: Mods,
     /// Wide 26-key layout: show the two-column edit area on the right.
@@ -715,8 +831,19 @@ fn backspace_key() -> Key {
     Key::icon(KeyAction::Backspace, icon::BACKSPACE, Tone::Func)
 }
 
-fn space_key(layout: Layout) -> Key {
-    Key::new(KeyAction::Space, layout.name(), Tone::Char).scaled(0.5)
+/// The layout's name as the space bar and the menu show it (双拼 by scheme).
+pub(crate) fn layout_label(layout: Layout, sp: ShuangpinScheme) -> &'static str {
+    if layout == Layout::Shuangpin { sp.name() } else { layout.name() }
+}
+
+fn space_key(ctx: &BuildCtx) -> Key {
+    Key::new(KeyAction::Space, layout_label(ctx.layout, ctx.sp), Tone::Char).scaled(0.5)
+}
+
+/// 微软 / 搜狗双拼: the `；` key also types the final「ing」 while composing (the controller
+/// routes it to the engine).
+fn sp_semicolon(ctx: &BuildCtx) -> bool {
+    ctx.layout == Layout::Shuangpin && ctx.sp.uses_semicolon()
 }
 
 fn toggle_key() -> Key {
@@ -774,12 +901,12 @@ fn letter_key(c: char, row: usize, idx: usize, ctx: &BuildCtx, wide: bool) -> Ke
     let upper = ctx.shift();
     let label = if upper { c.to_ascii_uppercase().to_string() } else { c.to_string() };
     let sec = match row {
-        0 if wide && ctx.chinese => WIDE_SECONDARY_ROW1_ZH[idx],
+        0 if wide && ctx.zh_punct => WIDE_SECONDARY_ROW1_ZH[idx],
         0 if wide => WIDE_SECONDARY_ROW1_EN[idx],
         0 => SECONDARY_ROW1[idx],
         1 if ctx.chinese => SECONDARY_ROW2_ZH[idx],
         1 => SECONDARY_ROW2_EN[idx],
-        _ if ctx.chinese => SECONDARY_ROW3_ZH[idx],
+        _ if ctx.zh_punct => SECONDARY_ROW3_ZH[idx],
         _ => SECONDARY_ROW3_EN[idx],
     };
     let mut alts = Vec::new();
@@ -788,7 +915,7 @@ fn letter_key(c: char, row: usize, idx: usize, ctx: &BuildCtx, wide: bool) -> Ke
         alts.extend(english_accents(c).iter().map(|a| if upper { a.to_uppercase() } else { a.to_string() }));
     }
     let mut k = Key { bubble: true, ..Key::new(KeyAction::Letter(c), label, Tone::Char) }.with_secondary(sec, alts);
-    // While chording, the hint for the shortcut replaces the 小鹤 finals.
+    // While chording, the hint for the shortcut replaces the 双拼 finals.
     let chord_hint = if ctx.mods.on(Modifier::Ctrl) {
         hint(CTRL_HINTS, c)
     } else if ctx.mods.on(Modifier::Win) {
@@ -799,7 +926,16 @@ fn letter_key(c: char, row: usize, idx: usize, ctx: &BuildCtx, wide: bool) -> Ke
     if ctx.mods.chording() {
         k.sub = chord_hint.map(str::to_string);
     } else if ctx.layout == Layout::Shuangpin {
-        k.sub = flypy_hint(c).map(str::to_string);
+        k.sub = shuangpin_hint(ctx.sp, c).map(str::to_string);
+    }
+    k
+}
+
+/// 微软 / 搜狗双拼's extra `；` key on the phone layout (end of the a–l row): ing.
+fn semicolon_key(ctx: &BuildCtx) -> Key {
+    let mut k = Key::text(if ctx.zh_punct { "；" } else { ";" }).with_code(';');
+    if !ctx.mods.chording() {
+        k.sub = shuangpin_hint(ctx.sp, ';').map(str::to_string);
     }
     k
 }
@@ -825,19 +961,24 @@ pub(crate) fn build_letters(m: &Metrics, ctx: &BuildCtx) -> Built {
         for (i, c) in letters.chars().enumerate() {
             items.push((1.0, letter_key(c, row, i, ctx, false)));
         }
+        // 微软 / 搜狗双拼 need `；` (ing): a tenth key fills the a–l row.
+        let semicolon = row == 1 && sp_semicolon(ctx);
+        if semicolon {
+            items.push((1.0, semicolon_key(ctx)));
+        }
         if row == 2 {
             items.push((1.5, backspace_key()));
         }
-        let x0 = if row == 1 { area.x + unit * 0.5 } else { area.x };
+        let x0 = if row == 1 && !semicolon { area.x + unit * 0.5 } else { area.x };
         place(&mut keys, x0, m.row_y(row), h, unit, items);
     }
     let bottom = vec![
         (1.25, Key::func(KeyAction::Symbols, "符号")),
         (1.25, Key::func(KeyAction::Numbers, "123")),
         (1.0, Key::icon(KeyAction::LayoutMenu, icon::KEYBOARD, Tone::Func)),
-        (3.0, space_key(ctx.layout)),
+        (3.0, space_key(ctx)),
         (1.0, toggle_key()),
-        (1.0, punct_key(ctx.chinese)),
+        (1.0, punct_key(ctx.zh_punct)),
         (1.5, enter_key()),
     ];
     place(&mut keys, area.x, m.row_y(3), h, unit, bottom);
@@ -859,7 +1000,8 @@ fn build_letters_wide(m: &Metrics, ctx: &BuildCtx) -> Built {
     let letters_w = area.w - edit_w - sep;
     let unit = letters_w / WIDE_UNITS;
     let h = m.row_h;
-    let zh = ctx.chinese;
+    // Punctuation follows 全角标点; 分词 follows 中文.
+    let zh = ctx.zh_punct;
     let fn_on = ctx.mods.on(Modifier::Fn);
     let mut keys = Vec::new();
 
@@ -897,13 +1039,19 @@ fn build_letters_wide(m: &Metrics, ctx: &BuildCtx) -> Built {
     }
     let row2 = if zh { WIDE_ROW2_ZH } else { WIDE_ROW2_EN };
     for (i, (a, b)) in row2.iter().enumerate() {
-        items.push((1.0, sym_key(a, b, WIDE_ROW2_CODES[i], ctx)));
+        let mut k = sym_key(a, b, WIDE_ROW2_CODES[i], ctx);
+        if WIDE_ROW2_CODES[i] == ';' && sp_semicolon(ctx) && !ctx.mods.chording() {
+            // 微软 / 搜狗双拼: ； is also the final「ing」.
+            k.sub = shuangpin_hint(ctx.sp, ';').map(str::to_string);
+        }
+        items.push((1.0, k));
     }
     items.push((1.75, enter_key()));
     place(&mut keys, area.x, m.row_y(2), h, unit, items);
 
     // Row 3: shift (分词 while composing Chinese), z–m, ，。？, shift.
-    let left = if zh && ctx.composing { Key::func(KeyAction::Char('\''), "分词") } else { mod_key(Modifier::Shift, &ctx.mods) };
+    let left =
+        if ctx.chinese && ctx.composing { Key::func(KeyAction::Char('\''), "分词") } else { mod_key(Modifier::Shift, &ctx.mods) };
     let mut items: Vec<(f32, Key)> = vec![(2.25, left)];
     for (i, c) in LETTER_ROWS[2].chars().enumerate() {
         items.push((1.0, letter_key(c, 2, i, ctx, true)));
@@ -928,7 +1076,7 @@ fn build_letters_wide(m: &Metrics, ctx: &BuildCtx) -> Built {
         (1.0, mod_key(Modifier::Alt, &ctx.mods)),
         (1.0, mod_key(Modifier::Fn, &ctx.mods)),
         (1.25, Key::func(KeyAction::Symbols, "符号")),
-        (3.75, space_key(ctx.layout)),
+        (3.75, space_key(ctx)),
         (1.25, toggle_key()),
         (1.0, left_k),
     ];
@@ -1206,7 +1354,7 @@ fn t9_bottom(keys: &mut Vec<Key>, x: f32, w: f32, y: f32, h: f32, ctx: &BuildCtx
         vec![
             (1.5, Key::func(KeyAction::Numbers, "123")),
             (1.0, Key::icon(KeyAction::LayoutMenu, icon::KEYBOARD, Tone::Func)),
-            (2.5, space_key(ctx.layout)),
+            (2.5, space_key(ctx)),
             (1.0, toggle_key()),
         ],
     );
@@ -1236,7 +1384,7 @@ fn build_t9_wide(m: &Metrics, ctx: &BuildCtx) -> Built {
     t9_bottom(&mut keys, x_main, 3.0 * main, y0 + 3.0 * h, h, ctx);
     // Punctuation block, 2 × 4.
     let x_p = x_main + 3.0 * main + side + 0.5 * u;
-    let punct = if ctx.chinese { WIDE_T9_PUNCT_ZH } else { WIDE_T9_PUNCT_EN };
+    let punct = if ctx.zh_punct { WIDE_T9_PUNCT_ZH } else { WIDE_T9_PUNCT_EN };
     for (i, p) in punct.iter().enumerate() {
         let mut k = Key::text(p).scaled(0.85);
         k.tone = Tone::Func;
@@ -1288,7 +1436,7 @@ pub(crate) fn build_numbers(m: &Metrics, ctx: &BuildCtx) -> Built {
     let mut zero = Key::text("0").scaled(1.05);
     zero.cell = Rect::new(x_main + main, m.row_y(3), main, h);
     keys.push(zero);
-    let mut space = space_key(ctx.layout);
+    let mut space = space_key(ctx);
     space.label = String::new();
     space.cell = Rect::new(x_main + 2.0 * main, m.row_y(3), main, h);
     keys.push(space);
@@ -1341,7 +1489,7 @@ fn build_numbers_wide(m: &Metrics, ctx: &BuildCtx) -> Built {
     }
     put(Key::func(KeyAction::Symbols, "符号"), xd, 3, dw, 1.0);
     put(Key::text("0").scaled(1.05), xd + dw, 3, dw, 1.0);
-    let mut space = space_key(ctx.layout);
+    let mut space = space_key(ctx);
     space.label = String::new();
     put(space, xd + 2.0 * dw, 3, dw, 1.0);
     let xr = xd + 3.0 * dw;
@@ -1401,7 +1549,7 @@ pub(crate) fn build_pc_keys(m: &Metrics, ctx: &BuildCtx) -> Built {
         ],
     );
     let mods = &ctx.mods;
-    let mut space = space_key(ctx.layout);
+    let mut space = space_key(ctx);
     space.label = String::new();
     place(
         &mut keys,
@@ -1454,7 +1602,7 @@ pub(crate) fn build_symbols(m: &Metrics, tab: SymTab) -> Built {
         items.push((1.2, Key::func(KeyAction::Numbers, "123")));
     }
     let used: f32 = items.iter().map(|(w, _)| w).sum::<f32>() + 1.5;
-    items.push((units - used, space_key(Layout::Pinyin).scaled(0.5)));
+    items.push((units - used, Key::new(KeyAction::Space, "", Tone::Char).scaled(0.5)));
     items.push((1.5, backspace_key()));
     place(&mut keys, area.x, m.row_y(bottom), m.row_h, unit, items);
     if let Some(k) = keys.iter_mut().find(|k| k.action == KeyAction::Space) {
@@ -1489,11 +1637,11 @@ pub(crate) fn build_candidate_grid(m: &Metrics) -> Built {
 }
 
 /// `voice_mode`: the 语音球 tile is selected and turns voice mode off (「退出语音球」).
-pub(crate) fn build_menu(m: &Metrics, current: Layout, dark: bool, voice_mode: bool) -> Built {
+pub(crate) fn build_menu(m: &Metrics, current: Layout, sp: ShuangpinScheme, dark: bool, voice_mode: bool) -> Built {
     let area = m.keys_area();
     let tiles: [(KeyAction, &str, &str, bool); 7] = [
         (KeyAction::SetLayout(Layout::Pinyin), "拼", "全拼", current == Layout::Pinyin),
-        (KeyAction::SetLayout(Layout::Shuangpin), "鹤", "小鹤双拼", current == Layout::Shuangpin),
+        (KeyAction::SetLayout(Layout::Shuangpin), sp.glyph(), sp.name(), current == Layout::Shuangpin),
         (KeyAction::SetLayout(Layout::T9), "九", "九宫格", current == Layout::T9),
         (KeyAction::SetLayout(Layout::English), "En", "English", current == Layout::English),
         (KeyAction::SetLayout(Layout::Pc), "PC", "电脑键盘", current == Layout::Pc),

@@ -12,7 +12,7 @@ use windows::Win32::Storage::FileSystem::GetShortPathNameW;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW};
 use windows::core::{PCSTR, PCWSTR};
 
-use crate::ffi::{self, RimeApi, RimeSessionId, rime_struct};
+use crate::ffi::{self, RimeApi, RimeLeversApi, RimeSessionId, rime_struct};
 
 pub(crate) type Api = &'static RimeApi;
 
@@ -20,15 +20,26 @@ pub(crate) type Api = &'static RimeApi;
 static API: OnceLock<Result<Api, String>> = OnceLock::new();
 
 /// Process-wide librime state. glog must be initialised exactly once (`setup`), and
-/// `initialize` starts the service that sessions live in.
+/// `initialize` starts the service that sessions live in. `finalize` + `initialize` again is
+/// fine (that is how [`crate::RimeEngine::reload`] picks up a new user build), but after a
+/// deployer run (`deploy`, `deploy_user`) the process can't host an engine.
 pub(crate) struct State {
     pub setup: bool,
     pub initialized: bool,
-    /// `shutdown()` ran; librime can't be brought back in this process.
-    pub finalized: bool,
+    /// A deployer ran in this process (one-shot).
+    pub deployed: bool,
+    /// Live `RimeEngine`s (user-dictionary functions without an engine refuse to run while one
+    /// holds the user dictionary open).
+    pub engines: usize,
+    /// The running librime reads the user build (`<user>\\build`, fuzzy pinyin) first.
+    pub user_build: bool,
 }
 
-pub(crate) static STATE: Mutex<State> = Mutex::new(State { setup: false, initialized: false, finalized: false });
+pub(crate) static STATE: Mutex<State> = Mutex::new(State { setup: false, initialized: false, deployed: false, engines: 0, user_build: false });
+
+pub(crate) fn state() -> std::sync::MutexGuard<'static, State> {
+    STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Loads `dll` (first call wins; later calls reuse the loaded library) and returns the API table.
 pub(crate) fn load(dll: &Path) -> Result<Api, String> {
@@ -87,11 +98,34 @@ unsafe fn load_inner(dll: &Path) -> Result<Api, String> {
         api.set_input.is_some(),
         api.get_version.is_some(),
         api.highlight_candidate.is_some(),
+        api.deploy_schema.is_some(),
     ];
     if required.contains(&false) {
         return Err("RimeApi 缺少函数".into());
     }
     Ok(api)
+}
+
+pub(crate) type Levers = &'static RimeLeversApi;
+
+/// The "levers" module's API (user dictionary export/import), built into rime.dll.
+pub(crate) fn levers(api: Api) -> Result<Levers, String> {
+    let find = api.find_module.ok_or("RimeApi 没有 find_module")?;
+    let module = unsafe { find(c"levers".as_ptr()) };
+    if module.is_null() {
+        return Err("rime.dll 没有 levers 模块".into());
+    }
+    let get_api = unsafe { (*module).get_api }.ok_or("levers 模块没有 get_api")?;
+    let p = unsafe { get_api() } as *const RimeLeversApi;
+    if p.is_null() {
+        return Err("levers get_api 返回空指针".into());
+    }
+    let levers: Levers = unsafe { &*p };
+    let want = (std::mem::offset_of!(RimeLeversApi, customize_item) - std::mem::size_of::<c_int>()) as c_int;
+    if levers.data_size < want || levers.export_user_dict.is_none() || levers.import_user_dict.is_none() {
+        return Err("RimeLeversApi 太旧或缺少函数".into());
+    }
+    Ok(levers)
 }
 
 pub(crate) fn version(api: Api) -> String {
@@ -201,6 +235,9 @@ pub(crate) struct Context {
 }
 
 /// One session. Not `Clone`; destroyed on drop.
+///
+/// Id 0 means closed: librime treats unknown session ids as "no session" (calls return
+/// False / NULL), so a closed session is inert rather than dangling.
 pub(crate) struct Session {
     api: Api,
     id: RimeSessionId,
@@ -210,6 +247,21 @@ impl Session {
     pub fn create(api: Api) -> Option<Session> {
         let id = unsafe { (api.create_session.unwrap())() };
         (id != 0).then_some(Session { api, id })
+    }
+
+    /// Destroys the librime session (releasing the user dictionary it holds open).
+    pub fn close(&mut self) {
+        if self.id != 0 {
+            unsafe { (self.api.destroy_session.unwrap())(self.id) };
+            self.id = 0;
+        }
+    }
+
+    /// Closes the current session (if any) and creates a new one.
+    pub fn reopen(&mut self) -> bool {
+        self.close();
+        self.id = unsafe { (self.api.create_session.unwrap())() };
+        self.id != 0
     }
 
     pub fn version(&self) -> String {
@@ -302,7 +354,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        unsafe { (self.api.destroy_session.unwrap())(self.id) };
+        self.close();
     }
 }
 

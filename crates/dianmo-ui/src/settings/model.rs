@@ -169,13 +169,109 @@ pub enum CandidateSize {
     ExtraLarge,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+impl CandidateSize {
+    pub const ALL: [CandidateSize; 4] =
+        [CandidateSize::Small, CandidateSize::Standard, CandidateSize::Large, CandidateSize::ExtraLarge];
+
+    /// Candidate text size relative to the standard one (the candidate bar keeps its height).
+    pub fn scale(self) -> f32 {
+        match self {
+            CandidateSize::Small => 0.85,
+            CandidateSize::Standard => 1.0,
+            CandidateSize::Large => 1.15,
+            CandidateSize::ExtraLarge => 1.3,
+        }
+    }
+}
+
+/// 双拼方案. The keyboard shows the scheme's finals under the letters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ShuangpinScheme {
+    /// 小鹤双拼 (default).
     #[default]
     Xiaohe,
-    /// Not available yet (shown as「即将支持」).
+    /// 自然码.
     Ziranma,
+    /// 微软双拼 (`;` = ing).
     Microsoft,
+    /// 搜狗双拼 (`;` = ing).
+    Sogou,
+}
+
+impl ShuangpinScheme {
+    pub const ALL: [ShuangpinScheme; 4] =
+        [ShuangpinScheme::Xiaohe, ShuangpinScheme::Ziranma, ShuangpinScheme::Microsoft, ShuangpinScheme::Sogou];
+
+    /// Full name: the space bar, the layout menu, the tray.
+    pub fn name(self) -> &'static str {
+        match self {
+            ShuangpinScheme::Xiaohe => "小鹤双拼",
+            ShuangpinScheme::Ziranma => "自然码双拼",
+            ShuangpinScheme::Microsoft => "微软双拼",
+            ShuangpinScheme::Sogou => "搜狗双拼",
+        }
+    }
+
+    /// Short name (settings segments).
+    pub fn short(self) -> &'static str {
+        match self {
+            ShuangpinScheme::Xiaohe => "小鹤",
+            ShuangpinScheme::Ziranma => "自然码",
+            ShuangpinScheme::Microsoft => "微软",
+            ShuangpinScheme::Sogou => "搜狗",
+        }
+    }
+
+    /// One character for the layout menu tile.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            ShuangpinScheme::Xiaohe => "鹤",
+            ShuangpinScheme::Ziranma => "自",
+            ShuangpinScheme::Microsoft => "微",
+            ShuangpinScheme::Sogou => "搜",
+        }
+    }
+
+    /// The scheme types the final「ing」 with `;` (an extra key on the keyboard).
+    pub fn uses_semicolon(self) -> bool {
+        matches!(self, ShuangpinScheme::Microsoft | ShuangpinScheme::Sogou)
+    }
+}
+
+/// 按键音 volume.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeySoundVolume {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl KeySoundVolume {
+    pub const ALL: [KeySoundVolume; 3] = [KeySoundVolume::Low, KeySoundVolume::Medium, KeySoundVolume::High];
+
+    /// Linear gain applied to the samples.
+    pub fn gain(self) -> f32 {
+        match self {
+            KeySoundVolume::Low => 0.3,
+            KeySoundVolume::Medium => 0.6,
+            KeySoundVolume::High => 1.0,
+        }
+    }
+}
+
+/// 按键音 sound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeySoundStyle {
+    /// 清脆: a short bright click.
+    #[default]
+    Crisp,
+    /// 柔和: a soft low tap.
+    Soft,
+}
+
+impl KeySoundStyle {
+    pub const ALL: [KeySoundStyle; 2] = [KeySoundStyle::Crisp, KeySoundStyle::Soft];
 }
 
 /// One fuzzy-pinyin pair (模糊音).
@@ -337,8 +433,10 @@ pub struct SettingsModel {
     pub edit_area: bool,
     /// Bubble above pressed keys.
     pub key_popup: bool,
-    /// Key click sound (not implemented yet: shown disabled).
+    /// Key click sound.
     pub key_sound: bool,
+    pub key_sound_volume: KeySoundVolume,
+    pub key_sound_style: KeySoundStyle,
     pub long_press: LongPress,
     pub ball: bool,
     pub ball_side: Side,
@@ -349,14 +447,20 @@ pub struct SettingsModel {
     pub space_commits_first: bool,
     /// Indexed by [`FuzzyPair::index`].
     pub fuzzy: [bool; 7],
-    /// Whether fuzzy pinyin is wired into the rime schema yet (false: the switches are stored
-    /// but a note says they take effect in a later version).
+    /// Whether fuzzy pinyin can be applied (librime is running; false: the switches are stored
+    /// and a tag says they take effect later).
     pub fuzzy_supported: bool,
+    /// Applying 模糊音 (redeploying the schemes, ~20 s) or the last failure; empty = nothing to
+    /// say.
+    pub fuzzy_status: Status,
     pub shuangpin: ShuangpinScheme,
     /// Dictionary (rime) state, e.g. ok "雾凇拼音词库已加载".
     pub dictionary: Status,
     /// Number of words the user taught (None = unknown).
     pub user_words: Option<u32>,
+    /// Import / export / clear of the user dictionary in progress or failed; empty = nothing to
+    /// say. The buttons are disabled while one is running (level `Unknown`).
+    pub user_dict_status: Status,
 
     // ---- 语音
     pub voice_engine: VoiceEngineChoice,
@@ -397,6 +501,8 @@ impl Default for SettingsModel {
             edit_area: true,
             key_popup: true,
             key_sound: false,
+            key_sound_volume: KeySoundVolume::Medium,
+            key_sound_style: KeySoundStyle::Crisp,
             long_press: LongPress::Medium,
             ball: true,
             ball_side: Side::Right,
@@ -405,9 +511,11 @@ impl Default for SettingsModel {
             space_commits_first: true,
             fuzzy: [false; 7],
             fuzzy_supported: false,
+            fuzzy_status: Status::default(),
             shuangpin: ShuangpinScheme::Xiaohe,
             dictionary: Status::default(),
             user_words: None,
+            user_dict_status: Status::default(),
             voice_engine: VoiceEngineChoice::WeType,
             engines: VoiceEngines::default(),
             doubao_exe: String::new(),
@@ -455,6 +563,8 @@ pub enum SettingsAction {
     SetEditArea(bool),
     SetKeyPopup(bool),
     SetKeySound(bool),
+    SetKeySoundVolume(KeySoundVolume),
+    SetKeySoundStyle(KeySoundStyle),
     SetLongPress(LongPress),
     SetBall(bool),
     SetBallSide(Side),
@@ -521,6 +631,8 @@ impl SettingsModel {
             A::SetEditArea(v) => set(&mut self.edit_area, v),
             A::SetKeyPopup(v) => set(&mut self.key_popup, v),
             A::SetKeySound(v) => set(&mut self.key_sound, v),
+            A::SetKeySoundVolume(v) => set(&mut self.key_sound_volume, v),
+            A::SetKeySoundStyle(v) => set(&mut self.key_sound_style, v),
             A::SetLongPress(v) => set(&mut self.long_press, v),
             A::SetBall(v) => set(&mut self.ball, v),
             A::SetBallSide(v) => set(&mut self.ball_side, v),

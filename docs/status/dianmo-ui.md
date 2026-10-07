@@ -92,3 +92,10 @@
 - `KeyboardView::set_key_popup(bool)` / `key_popup()`（按键气泡开关），`set_long_press_ms(u64)` / `long_press_ms()`（长按出副字符的时间，150–1000ms；触控板的 450ms 不变）。
 - 「长按时长」的说明改为「长按按键输入上方小字、弹出更多字符所需的时间」。
 - 测试 92 个（新增 7 个：动作随 Response 返回、coming_soon 标签、toast、语音页 4 个引擎且没有回退行、按键气泡开关、长按时长、⚙ 键）。预览图 `docs/previews/onboarding-3*.png`、`settings-voice*.png`、`settings-keyboard*.png` 已更新；真机截图在 `docs/screenshots/`。
+
+## v0.2.0 设置接通（TODO #38，2026-10-07）
+- `KeyboardView`：`set_key_sound(bool)`（按下键时在 Response 最前面加 `UiAction::KeyClick(KeyClick::{Char, Func})`；字母 / 数字 / 标点 = Char，其余 = Func；工具栏不响）、`set_full_width_punct(bool)`（关掉后中文布局的标点键、长按副字符、宽屏数字行上档、九宫格标点列都换成半角；货币 ¥ 仍随中文）、`set_candidate_size(CandidateSize)`（候选 ×0.85/1/1.15/1.3，注释变化减半，栏高不变）、`set_shuangpin(ShuangpinScheme)`（键面韵母提示、空格键 / 布局菜单显示方案名；微软 / 搜狗：手机布局 a–l 行末加「；」键带 ing 小字，宽屏的「；」键加 ing 小字）。
+- `layout.rs`：`ZIRANMA` / `MSPY` / `SOGOU` 表（数据来自 rime-ice 各方案的 speller/algebra，见 dianmo-rime 状态文档），`shuangpin_table` / `shuangpin_hint`，`T9_PUNCT_HALF`，`BuildCtx { zh_punct, sp }`。
+- 设置模型：`ShuangpinScheme` 加 `Sogou`，`ALL` / `name()` / `short()` / `glyph()` / `uses_semicolon()`；`CandidateSize::scale()`；新 `KeySoundVolume {Low, Medium, High}`（`gain()` 0.3/0.6/1.0）、`KeySoundStyle {Crisp, Soft}`；`SettingsModel` 加 `key_sound_volume`、`key_sound_style`、`fuzzy_status`、`user_dict_status`；`SettingsAction::SetKeySoundVolume` / `SetKeySoundStyle`。
+- 页面：键盘页按键音开关 + 音量 / 音色两行（按键音关时禁用）；输入页双拼方案四选一、模糊音状态行（未加载词库时标签「词库加载后生效」）、用户词库状态行（进行中时导入 / 导出按钮禁用）；「默认布局」里「小鹤双拼」改为「双拼」，引导页同。
+- 测试 100 个（新增 8 个）。预览：`docs/previews/wide-candidates-xlarge.png`、`wide-candidate-grid-xlarge.png`、`portrait-candidates-large.png`、`wide-shuangpin-ziranma.png`、`wide-shuangpin-mspy.png`、`portrait-shuangpin-mspy.png`、`wide-half-width-punct.png`、`settings-input-applying.png`，更新了 `settings-input*.png`、`settings-keyboard*.png`、`onboarding-2*.png`。

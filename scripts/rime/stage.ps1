@@ -3,13 +3,16 @@
 
     powershell -ExecutionPolicy Bypass -File stage.ps1 -Out <dir> [-Data C:\dev\dianmo-data] [-Probe <probe.exe>] [-Verify]
 
-  Result (only runtime files; schema/dictionary sources are not shipped):
+  Result (only runtime files; dictionary sources are not shipped):
     <Out>\rime.dll
     <Out>\data\rime\build\        precompiled schemas + dictionaries (*.schema.yaml, *.bin, default.yaml)
     <Out>\data\rime\lua\          rime-ice Lua scripts + lunar.db
     <Out>\data\rime\opencc\       emoji + Simplified->Traditional
-    <Out>\data\rime\custom_phrase.txt, en_dicts\cn_en.txt, en_dicts\cn_en_flypy.txt
+    <Out>\data\rime\custom_phrase.txt, en_dicts\cn_en*.txt
                                   (plain-text dictionaries librime reads directly from the shared dir)
+    <Out>\data\rime\*.schema.yaml, default*.yaml, symbols_*.yaml
+                                  schema sources (~0.3 MB), only read when the user turns on fuzzy
+                                  pinyin (dianmo.exe --deploy-user rebuilds those schemas)
     <Out>\data\rime\RIME_ICE_COMMIT
 
   <Data> is what scripts\rime\fetch.ps1 produced. The precompiled set lives in <Data>\rime\build:
@@ -78,6 +81,10 @@ try {
   foreach ($f in 'custom_phrase.txt', 'RIME_ICE_COMMIT') {
     Copy-Item (Join-Path $shared $f) $outData
   }
+  # Schema sources for the per-user fuzzy pinyin build (not the *.dict.yaml dictionary sources:
+  # deploy_user reuses the precompiled tables).
+  Get-ChildItem $shared -File -Filter *.yaml | Where-Object { $_.Name -notlike '*.dict.yaml' } |
+    Copy-Item -Destination $outData
   Copy-Item (Join-Path $shared 'en_dicts\cn_en*.txt') (Join-Path $outData 'en_dicts')
 
   $files = Get-ChildItem $outData -Recurse -File

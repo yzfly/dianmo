@@ -16,6 +16,8 @@ use dianmo_ui::{KeyboardView, OnboardingView, Response, SettingsView, ThemeKind,
 use dianmo_win::{BallEdge, BallPos, HostControl, WindowId, WindowOptions, now_ms};
 
 use super::{DianmoApp, EngineStatus, ShowAgain, ball_wanted, disabled, merge};
+use crate::sound::KeySound;
+use dianmo_ui::settings::ShuangpinScheme;
 use crate::prefs::{self, SysState};
 use crate::update::{self, CheckOutcome, UpdateEvent};
 use crate::voice::VoiceEngine;
@@ -37,9 +39,8 @@ struct DoubaoPicked(Option<PathBuf>);
 /// 导出诊断包 finished (the zip, or why not).
 struct DiagExported(Result<PathBuf, String>);
 
-const SETTINGS_TITLE: &str = "点墨设置";
+pub(super) const SETTINGS_TITLE: &str = "点墨设置";
 const ONBOARDING_TITLE: &str = "欢迎使用点墨";
-const SOON: &str = "下个版本提供";
 
 fn settings_view(v: &mut dyn View) -> Option<&mut SettingsView> {
     v.as_any_mut().and_then(|a| a.downcast_mut::<SettingsView>())
@@ -92,6 +93,10 @@ impl DianmoApp {
             clip_count: self.clips.items().len(),
             pinned_clips: self.clips.items().iter().filter(|c| c.pinned).cloned().collect(),
             update: self.update.clone(),
+            fuzzy_supported: matches!(self.status, EngineStatus::Rime),
+            fuzzy_status: self.fuzzy_status.clone(),
+            user_words: self.user_words,
+            user_dict_status: self.user_dict_status.clone(),
         };
         prefs::model(&self.settings, &sys)
     }
@@ -122,7 +127,7 @@ impl DianmoApp {
     }
 
     /// A short message in the settings window (if it is open).
-    fn toast(&self, host: &mut HostControl, text: impl Into<String>) {
+    pub(super) fn toast(&self, host: &mut HostControl, text: impl Into<String>) {
         let text = text.into();
         log!("settings: {text}");
         if let Some(id) = self.settings_win {
@@ -165,6 +170,7 @@ impl DianmoApp {
         // Fresh system state for the window.
         self.check_admin_task(host);
         self.check_voice_engines(host);
+        self.refresh_user_words(host);
     }
 
     /// Opens the first-run onboarding (or brings it to the front).
@@ -348,8 +354,12 @@ impl DianmoApp {
                 }
                 Response::none()
             }
-            A::SetKeySound(_) => {
-                self.toast(host, format!("按键音{SOON}"));
+            A::SetKeySound(_) | A::SetKeySoundVolume(_) | A::SetKeySoundStyle(_) => {
+                self.apply_key_sound(view);
+                // Let the user hear what they picked.
+                if let Some(s) = &self.sound {
+                    s.play(dianmo_ui::KeyClick::Char);
+                }
                 Response::none()
             }
             A::SetBall(_) => {
@@ -362,13 +372,30 @@ impl DianmoApp {
                 host.set_ball_pos(BallPos { edge, y_frac });
                 Response::none()
             }
-            A::SetCandidateSize(_) | A::SetFullWidthPunct(_) | A::SetSpaceCommitsFirst(_) | A::SetFuzzy(..) => {
-                // Saved; the settings page says 「下个版本生效」.
+            A::SetCandidateSize(size) => repaint_if(keyboard_view(view).is_some_and(|kv| kv.set_candidate_size(size))),
+            A::SetFullWidthPunct(on) => {
+                self.ctl.set_full_width_punct(on);
+                repaint_if(keyboard_view(view).is_some_and(|kv| kv.set_full_width_punct(on)))
+            }
+            A::SetSpaceCommitsFirst(on) => {
+                self.ctl.set_space_commits_first(on);
                 Response::none()
             }
-            A::SetShuangpin(_) => Response::none(),
-            A::ExportUserDict | A::ImportUserDict | A::ClearUserDict => {
-                self.toast(host, format!("用户词库的导入、导出和清空{SOON}"));
+            A::SetFuzzy(..) => {
+                self.apply_fuzzy(host);
+                Response::none()
+            }
+            A::SetShuangpin(scheme) => self.apply_shuangpin(scheme, view),
+            A::ExportUserDict => {
+                self.pick_dict_file(super::rime_ui::DictFile::Export, host);
+                Response::none()
+            }
+            A::ImportUserDict => {
+                self.pick_dict_file(super::rime_ui::DictFile::Import, host);
+                Response::none()
+            }
+            A::ClearUserDict => {
+                self.clear_user_dict(host);
                 Response::none()
             }
             A::SetVoiceEngine(c) => match VoiceEngine::from_setting(c.key()) {
@@ -413,6 +440,7 @@ impl DianmoApp {
                 Response::none()
             }
             A::InstallUpdate => {
+                host.set_tray_badge(false);
                 self.install_update(host);
                 Response::none()
             }
@@ -497,6 +525,37 @@ impl DianmoApp {
         Response::none()
     }
 
+    /// 按键音: starts / stops the audio thread and tells the keyboard whether to send clicks.
+    pub(super) fn apply_key_sound(&mut self, view: &mut dyn View) {
+        let s = &self.settings;
+        let on = s.key_sound && !disabled("sound");
+        if let Some(kv) = keyboard_view(view) {
+            kv.set_key_sound(on);
+        }
+        match (&self.sound, on) {
+            (None, true) => {
+                self.sound = KeySound::start(s.key_sound_style, s.key_sound_volume.gain());
+                log!("key sound on ({:?}, {:?})", s.key_sound_style, s.key_sound_volume);
+            }
+            (Some(snd), true) => {
+                snd.set_style(s.key_sound_style);
+                snd.set_gain(s.key_sound_volume.gain());
+            }
+            (Some(_), false) => {
+                self.sound = None;
+                log!("key sound off");
+            }
+            (None, false) => {}
+        }
+    }
+
+    /// 双拼方案: key faces, the `；` final, and the engine's schema.
+    fn apply_shuangpin(&mut self, scheme: ShuangpinScheme, view: &mut dyn View) -> Response {
+        self.ctl.set_semicolon_input(scheme.uses_semicolon());
+        let r = repaint_if(keyboard_view(view).is_some_and(|kv| kv.set_shuangpin(scheme)));
+        merge(r, self.set_engine_shuangpin(scheme, view))
+    }
+
     /// After 恢复默认设置: everything the settings affect, at once.
     fn apply_all(&mut self, view: &mut dyn View, host: &mut HostControl) -> Response {
         let mut r = self.apply_theme(view, host);
@@ -504,7 +563,14 @@ impl DianmoApp {
             r.repaint |= kv.set_edit_area(self.settings.edit_area);
             kv.set_key_popup(self.settings.key_popup);
             kv.set_long_press_ms(self.settings.long_press.millis());
+            r.repaint |= kv.set_candidate_size(self.settings.candidate_size);
+            r.repaint |= kv.set_full_width_punct(self.settings.full_width_punct);
         }
+        self.ctl.set_full_width_punct(self.settings.full_width_punct);
+        self.ctl.set_space_commits_first(self.settings.space_commits_first);
+        self.apply_key_sound(view);
+        r = merge(r, self.apply_shuangpin(self.settings.shuangpin, view));
+        self.apply_fuzzy(host);
         host.set_appbar(self.settings.appbar);
         self.set_focus_watch(self.settings.auto_show && !disabled("focus"), host);
         r = merge(r, self.set_input_mode(self.settings.input_mode, view, host));
@@ -624,10 +690,13 @@ impl DianmoApp {
                 match outcome {
                     Ok(CheckOutcome::Available(r)) => {
                         log!("update {} available", r.version);
+                        // Red dot on the tray icon until updated.
+                        host.set_tray_badge(true);
                         self.update = UpdateState::Available { version: r.version.clone(), notes: r.notes.clone() };
                         self.release = Some(r);
                     }
                     Ok(CheckOutcome::UpToDate { .. } | CheckOutcome::NoRelease) => {
+                        host.set_tray_badge(false);
                         self.release = None;
                         self.update = UpdateState::UpToDate;
                     }

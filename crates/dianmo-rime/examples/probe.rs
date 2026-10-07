@@ -2,6 +2,10 @@
 //!
 //!   probe deploy <shared> [--dll <rime.dll>] [--log <dir>]
 //!   probe run [--shared <dir>] [--user <dir>] [--dll <rime.dll>] [--log <dir>] [--bench <n>]
+//!   probe deploy-user --shared <dir> --user <dir> [--log <dir>]     (fuzzy pinyin user build)
+//!   probe v2 --shared <dir> --user <dir> [--log <dir>]              (v0.2 features end to end)
+//!   probe dict --shared <dir> --user <dir> --file <txt>             (user dict, no engine)
+//!   probe fuzzy <bits> --shared <dir> --user <dir>                  (set_fuzzy, e.g. 1001000)
 //!
 //! `--dll` defaults to `rime.dll` next to the exe. `run` defaults: shared `<exe>\data\rime`,
 //! user = a fresh temp dir (so "empty user dir, no maintenance" is what gets tested).
@@ -26,7 +30,7 @@ mod win {
     use std::time::{Duration, Instant};
 
     use dianmo_core::{Candidate, Engine, Schema, Snapshot};
-    use dianmo_rime::{Options, RimeEngine, deploy};
+    use dianmo_rime::{FuzzyChange, Options, RimeEngine, ShuangpinScheme, deploy};
 
     type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -38,12 +42,13 @@ mod win {
         user: Option<PathBuf>,
         log: Option<PathBuf>,
         bench: usize,
+        file: Option<PathBuf>,
     }
 
     fn parse() -> Res<Args> {
         let mut it = std::env::args().skip(1);
-        let cmd = it.next().ok_or("usage: probe deploy <shared> | probe run [--shared D] [--user D]")?;
-        let mut a = Args { cmd, pos: vec![], dll: None, shared: None, user: None, log: None, bench: 20 };
+        let cmd = it.next().ok_or("usage: probe deploy <shared> | probe run [--shared D] [--user D] | probe deploy-user|v2|dict ...")?;
+        let mut a = Args { cmd, pos: vec![], dll: None, shared: None, user: None, log: None, bench: 20, file: None };
         while let Some(x) = it.next() {
             let mut val = || it.next().ok_or_else(|| format!("{x} needs a value"));
             match x.as_str() {
@@ -52,6 +57,7 @@ mod win {
                 "--user" => a.user = Some(val()?.into()),
                 "--log" => a.log = Some(val()?.into()),
                 "--bench" => a.bench = val()?.parse()?,
+                "--file" => a.file = Some(val()?.into()),
                 _ => a.pos.push(x),
             }
         }
@@ -90,6 +96,7 @@ mod win {
                     user_data_dir: std::env::temp_dir(),
                     log_dir: a.log.clone(),
                     min_log_level: if a.log.is_some() { 0 } else { 2 },
+                    shuangpin: ShuangpinScheme::Flypy,
                 };
                 let r = deploy(&opts)?;
                 println!("deploy: {} ms, build {:.1} MB", r.millis, r.build_bytes as f64 / 1048576.0);
@@ -101,6 +108,20 @@ mod win {
                 Ok(())
             }
             "run" => run(&a, dll),
+            "deploy-user" => deploy_user(&a, dll),
+            "v2" => v2(&a, dll),
+            "dict" => dict(&a, dll),
+            "fuzzy" => {
+                let opts = opts_for(&a, dll)?;
+                let bits = a.pos.first().ok_or("probe fuzzy <7 bits, e.g. 1001000>")?;
+                let mut f = [false; 7];
+                for (i, c) in bits.chars().take(7).enumerate() {
+                    f[i] = c == '1';
+                }
+                let c = dianmo_rime::set_fuzzy(&opts, f)?;
+                println!("set_fuzzy -> {c:?}; now {:?}; needs_user_deploy={}", dianmo_rime::fuzzy(&opts), dianmo_rime::needs_user_deploy(&opts));
+                Ok(())
+            }
             _ => Err("unknown command".into()),
         }
     }
@@ -173,13 +194,25 @@ mod win {
             let _ = std::fs::remove_dir_all(&d);
             d
         });
-        let opts = Options { dll, shared_data_dir: shared, user_data_dir: user.clone(), log_dir: a.log.clone(), min_log_level: if a.log.is_some() { 0 } else { 1 } };
+        let opts = Options {
+            dll,
+            shared_data_dir: shared,
+            user_data_dir: user.clone(),
+            log_dir: a.log.clone(),
+            min_log_level: if a.log.is_some() { 0 } else { 1 },
+            shuangpin: ShuangpinScheme::Flypy,
+        };
         let (p0, _) = mem();
         println!("before load: private {p0:.1} MB");
 
         let t = Instant::now();
         let mut e = RimeEngine::start(&opts, Schema::Pinyin)?;
-        println!("start (load+initialize+session+rime_ice): {:.1} ms  librime {}", ms(t.elapsed()), e.rime_version());
+        println!(
+            "start (load+initialize+session+rime_ice): {:.1} ms  librime {}  user build: {}",
+            ms(t.elapsed()),
+            e.rime_version(),
+            e.uses_user_build()
+        );
         let (p, w) = mem();
         println!("after start: private {p:.1} MB, working set {w:.1} MB");
 
@@ -335,6 +368,171 @@ mod win {
         if a.user.is_none() {
             let _ = std::fs::remove_dir_all(&user);
         }
+        Ok(())
+    }
+
+    fn opts_for(a: &Args, dll: PathBuf) -> Res<Options> {
+        Ok(Options {
+            dll,
+            shared_data_dir: a.shared.clone().ok_or("--shared needed")?,
+            user_data_dir: a.user.clone().ok_or("--user needed")?,
+            log_dir: a.log.clone(),
+            min_log_level: if a.log.is_some() { 0 } else { 1 },
+            shuangpin: ShuangpinScheme::Flypy,
+        })
+    }
+
+    fn list_dir(dir: &std::path::Path) {
+        let mut files: Vec<_> = std::fs::read_dir(dir).map(|r| r.flatten().collect()).unwrap_or_default();
+        files.sort_by_key(|e| e.file_name());
+        for e in files {
+            let len = e.metadata().map(|m| if m.is_dir() { 0 } else { m.len() }).unwrap_or(0);
+            println!("    {:>10}  {}", len, e.file_name().to_string_lossy());
+        }
+    }
+
+    fn deploy_user(a: &Args, dll: PathBuf) -> Res<()> {
+        let opts = opts_for(a, dll)?;
+        let r = dianmo_rime::deploy_user(&opts)?;
+        println!("deploy-user: {} ms, {:.1} KB", r.millis, r.build_bytes as f64 / 1024.0);
+        list_dir(&opts.user_data_dir.join("build.new"));
+        Ok(())
+    }
+
+    /// Top 3 + where `want` is among the first 100 candidates (position only).
+    fn probe_input(e: &mut RimeEngine, label: &str, keys: &str, want: &str) {
+        e.clear();
+        let t = Instant::now();
+        let s = type_str(e, keys, &mut Keys::default());
+        let d = ms(t.elapsed());
+        let all = e.candidates(0, 100);
+        let pos = all.iter().position(|c| c.text == want).map(|i| i.to_string()).unwrap_or_else(|| "-".into());
+        let top: Vec<String> = s.candidates.iter().take(3).map(fmt_cand).collect();
+        println!("  {label} {keys:?}: preedit={:?} top3=[{}] pos({want})={pos} ({d:.1} ms)", s.preedit, top.join(", "));
+        e.clear();
+    }
+
+    fn v2(a: &Args, dll: PathBuf) -> Res<()> {
+        let mut opts = opts_for(a, dll)?;
+        let t = Instant::now();
+        let mut e = RimeEngine::start(&opts, Schema::Pinyin)?;
+        println!("start: {:.1} ms, user build: {}", ms(t.elapsed()), e.uses_user_build());
+
+        println!("[模糊音 off]");
+        probe_input(&mut e, "全拼", "zi", "知");
+        probe_input(&mut e, "全拼", "lan", "南");
+        e.set_schema(Schema::T9);
+        probe_input(&mut e, "九宫格", "526", "南");
+        e.set_schema(Schema::Shuangpin);
+        probe_input(&mut e, "小鹤", "lj", "南");
+        e.set_schema(Schema::Pinyin);
+
+        println!("[模糊音 z/zh + n/l on]");
+        let fuzzy = [true, false, false, true, false, false, false];
+        let c = dianmo_rime::set_fuzzy(&opts, fuzzy)?;
+        println!("  set_fuzzy -> {c:?}, needs_user_deploy={}", dianmo_rime::needs_user_deploy(&opts));
+        if c == FuzzyChange::Deploy {
+            let exe = std::env::current_exe()?;
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("deploy-user").arg("--shared").arg(&opts.shared_data_dir).arg("--user").arg(&opts.user_data_dir);
+            cmd.arg("--dll").arg(&opts.dll);
+            if let Some(l) = &opts.log_dir {
+                cmd.arg("--log").arg(l);
+            }
+            let t = Instant::now();
+            let out = cmd.output()?;
+            println!("  deploy-user process: {:.0} ms, exit {:?}", ms(t.elapsed()), out.status.code());
+            for line in String::from_utf8_lossy(&out.stdout).lines().chain(String::from_utf8_lossy(&out.stderr).lines()) {
+                println!("  | {line}");
+            }
+        }
+        println!("  needs_user_deploy={}", dianmo_rime::needs_user_deploy(&opts));
+        let t = Instant::now();
+        e.reload(&opts)?;
+        println!("  reload: {:.1} ms, user build: {}", ms(t.elapsed()), e.uses_user_build());
+        probe_input(&mut e, "全拼", "zi", "知");
+        probe_input(&mut e, "全拼", "lan", "南");
+        e.set_schema(Schema::T9);
+        probe_input(&mut e, "九宫格", "526", "南");
+        e.set_schema(Schema::Shuangpin);
+        probe_input(&mut e, "小鹤", "zi", "知");
+        probe_input(&mut e, "小鹤", "lj", "南");
+        e.set_schema(Schema::Pinyin);
+        let s = type_str(&mut e, "nihao", &mut Keys::default());
+        show("全拼 nihao (fuzzy on)", &s);
+        e.clear();
+
+        println!("[双拼方案]");
+        e.set_schema(Schema::Shuangpin);
+        for (sp, codes) in [
+            (ShuangpinScheme::Flypy, ["nihc", "ulpb", "mktm"]),
+            (ShuangpinScheme::Ziranma, ["nihk", "udpn", "mytm"]),
+            (ShuangpinScheme::Mspy, ["nihk", "udpn", "m;tm"]),
+            (ShuangpinScheme::Sogou, ["nihk", "udpn", "m;tm"]),
+        ] {
+            let t = Instant::now();
+            e.set_shuangpin(sp);
+            println!(" {} ({}): set_shuangpin {:.1} ms", sp.name(), sp.schema_id(), ms(t.elapsed()));
+            for (code, want) in codes.iter().zip(["你好", "双拼", "明天"]) {
+                probe_input(&mut e, "  ", code, want);
+            }
+        }
+        e.set_shuangpin(ShuangpinScheme::Flypy);
+        e.set_schema(Schema::Pinyin);
+
+        println!("[用户词库]");
+        let t = Instant::now();
+        println!("  count: {:?} ({:.1} ms)", e.user_word_count(), ms(t.elapsed()));
+        for w in ["nihao", "jintian", "shurufa", "dianmo"] {
+            type_str(&mut e, w, &mut Keys::default());
+            let s = e.select(0);
+            println!("  learn {w}: commit={:?}", s.commit.is_some());
+            e.clear();
+        }
+        let t = Instant::now();
+        println!("  count after typing: {:?} ({:.1} ms)", e.user_word_count(), ms(t.elapsed()));
+        let file = a.file.clone().unwrap_or_else(|| opts.user_data_dir.join("..").join("dianmo-export.txt"));
+        let t = Instant::now();
+        let n = e.export_user_dict(&file)?;
+        let lines = std::fs::read_to_string(&file).map(|t| t.lines().count()).unwrap_or(0);
+        println!("  export: {n} entries, file {} lines, {} bytes ({:.1} ms)", lines, std::fs::metadata(&file)?.len(), ms(t.elapsed()));
+        let t = Instant::now();
+        e.clear_user_dict()?;
+        println!("  clear: {:.1} ms; count {:?}; userdb exists {}", ms(t.elapsed()), e.user_word_count(), opts.user_data_dir.join("rime_ice.userdb").exists());
+        let t = Instant::now();
+        let n = e.import_user_dict(&file)?;
+        println!("  import: {n} entries ({:.1} ms); count {:?}", ms(t.elapsed()), e.user_word_count());
+        let s = type_str(&mut e, "nihao", &mut Keys::default());
+        show("nihao after import", &s);
+        e.clear();
+
+        println!("[模糊音 all off]");
+        let c = dianmo_rime::set_fuzzy(&opts, [false; 7])?;
+        println!("  set_fuzzy -> {c:?}");
+        let t = Instant::now();
+        opts.shuangpin = ShuangpinScheme::Flypy;
+        e.reload(&opts)?;
+        println!("  reload: {:.1} ms, user build: {}", ms(t.elapsed()), e.uses_user_build());
+        probe_input(&mut e, "全拼", "zi", "知");
+        let (p, w) = mem();
+        println!("end: private {p:.1} MB, working set {w:.1} MB");
+        drop(e);
+        println!("user dir:");
+        list_dir(&opts.user_data_dir);
+        Ok(())
+    }
+
+    /// The free functions (no engine in this process).
+    fn dict(a: &Args, dll: PathBuf) -> Res<()> {
+        let opts = opts_for(a, dll)?;
+        let file = a.file.clone().ok_or("--file needed")?;
+        println!("count: {:?}", dianmo_rime::user_word_count(&opts));
+        let n = dianmo_rime::export_user_dict(&opts, &file)?;
+        println!("export: {n}");
+        dianmo_rime::clear_user_dict(&opts)?;
+        println!("clear ok; count: {:?}", dianmo_rime::user_word_count(&opts));
+        let n = dianmo_rime::import_user_dict(&opts, &file)?;
+        println!("import: {n}; count: {:?}", dianmo_rime::user_word_count(&opts));
         Ok(())
     }
 

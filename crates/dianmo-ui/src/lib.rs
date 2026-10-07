@@ -19,4 +19,4 @@ pub use keyboard::{KeyboardConfig, KeyboardView, MORE_BATCH};
 pub use layout::{Layout, SymTab};
 pub use settings::{OnboardingView, SettingsAction, SettingsModel, SettingsView};
 pub use theme::{SettingsTheme, Theme, ThemeKind};
-pub use view::{ClipItem, InputState, PointerEvent, PointerPhase, Response, UiAction, View};
+pub use view::{ClipItem, InputState, KeyClick, PointerEvent, PointerPhase, Response, UiAction, View};

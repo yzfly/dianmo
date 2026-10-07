@@ -37,11 +37,86 @@ pub struct InputController<E, S> {
     sink: S,
     chinese: bool,
     state: Snapshot,
+    /// 空格上屏首选 (setting, default on). Off: Space while composing commits the raw input and
+    /// then a space (DESIGN.md §2「空格规则」).
+    space_commits_first: bool,
+    /// 中文时用全角标点 (setting, default on): an ASCII punctuation `Char` in Chinese mode is
+    /// committed as its full-width form. (The keyboard's own punctuation keys follow the same
+    /// setting in dianmo-ui.)
+    full_width_punct: bool,
+    /// 微软 / 搜狗双拼 type the final「ing」 with `;`: while composing in Chinese 双拼, `;` (or the
+    /// key's full-width `；`) goes to the engine.
+    semicolon_input: bool,
+}
+
+/// Full-width form of an ASCII punctuation character in Chinese mode (`,` → `，`). Quotes are
+/// left alone (which of “ ” is meant depends on context).
+pub fn full_width(c: char) -> Option<&'static str> {
+    Some(match c {
+        ',' => "，",
+        '.' => "。",
+        '?' => "？",
+        '!' => "！",
+        ':' => "：",
+        ';' => "；",
+        '(' => "（",
+        ')' => "）",
+        '[' => "【",
+        ']' => "】",
+        '<' => "《",
+        '>' => "》",
+        '\\' => "、",
+        '~' => "～",
+        '^' => "……",
+        '_' => "——",
+        '$' => "￥",
+        _ => return None,
+    })
 }
 
 impl<E: Engine, S: TextSink> InputController<E, S> {
     pub fn new(engine: E, sink: S) -> Self {
-        Self { engine, sink, chinese: true, state: Snapshot::default() }
+        Self {
+            engine,
+            sink,
+            chinese: true,
+            state: Snapshot::default(),
+            space_commits_first: true,
+            full_width_punct: true,
+            semicolon_input: false,
+        }
+    }
+
+    /// 空格上屏首选 (see the field). Takes effect with the next key.
+    pub fn set_space_commits_first(&mut self, on: bool) {
+        self.space_commits_first = on;
+    }
+
+    pub fn space_commits_first(&self) -> bool {
+        self.space_commits_first
+    }
+
+    /// 中文时用全角标点 (see the field).
+    pub fn set_full_width_punct(&mut self, on: bool) {
+        self.full_width_punct = on;
+    }
+
+    pub fn full_width_punct(&self) -> bool {
+        self.full_width_punct
+    }
+
+    /// `;` is part of the 双拼 scheme (微软 / 搜狗: ing).
+    pub fn set_semicolon_input(&mut self, on: bool) {
+        self.semicolon_input = on;
+    }
+
+    /// `c` (or the semicolon key's text) goes to the engine as `;` right now.
+    fn semicolon_composes(&self, c: char) -> bool {
+        self.semicolon_input
+            && matches!(c, ';' | '；')
+            && self.chinese
+            && self.engine.schema() == Schema::Shuangpin
+            && self.is_composing()
     }
 
     /// What the candidate bar shows.
@@ -72,17 +147,30 @@ impl<E: Engine, S: TextSink> InputController<E, S> {
     pub fn handle(&mut self, action: Action) -> &Snapshot {
         match action {
             Action::Char(c) => {
-                if self.chinese && (self.engine.schema().accepts(c) || (c == '\'' && self.is_composing())) {
-                    let s = self.engine.input(c);
+                if (self.chinese && (self.engine.schema().accepts(c) || (c == '\'' && self.is_composing())))
+                    || self.semicolon_composes(c)
+                {
+                    let s = self.engine.input(if c == '；' { ';' } else { c });
                     self.apply(s);
                 } else {
                     self.commit_default();
-                    self.sink.commit_text(c.encode_utf8(&mut [0; 4]));
+                    match full_width(c).filter(|_| self.chinese && self.full_width_punct) {
+                        Some(fw) => self.sink.commit_text(fw),
+                        None => self.sink.commit_text(c.encode_utf8(&mut [0; 4])),
+                    }
                 }
             }
             Action::Text(text) => {
-                self.commit_default();
-                self.sink.commit_text(&text);
+                let mut chars = text.chars();
+                if let (Some(c), None) = (chars.next(), chars.next())
+                    && self.semicolon_composes(c)
+                {
+                    let s = self.engine.input(';');
+                    self.apply(s);
+                } else {
+                    self.commit_default();
+                    self.sink.commit_text(&text);
+                }
             }
             Action::Backspace => {
                 if self.is_composing() {
@@ -93,8 +181,14 @@ impl<E: Engine, S: TextSink> InputController<E, S> {
                 }
             }
             Action::Space => {
-                if self.is_composing() {
+                if self.is_composing() && self.space_commits_first {
                     self.commit_default();
+                } else if self.is_composing() {
+                    // 空格上屏首选 off: what was typed, as typed, then the space (mixed
+                    // Chinese / English typing).
+                    let s = self.engine.commit_raw();
+                    self.apply(s);
+                    self.sink.commit_text(" ");
                 } else {
                     self.sink.commit_text(" ");
                 }

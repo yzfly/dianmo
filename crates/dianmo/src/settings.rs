@@ -11,7 +11,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use dianmo_core::Schema;
-use dianmo_ui::settings::{CandidateSize, FuzzyPair, InputMode, LongPress, ShuangpinScheme, ThemeChoice};
+use dianmo_ui::settings::{
+    CandidateSize, FuzzyPair, InputMode, KeySoundStyle, KeySoundVolume, LongPress, ShuangpinScheme, ThemeChoice,
+};
 
 /// One registry DWORD as it was before Dianmo touched it (`None` = value absent).
 pub type SavedDword = Option<u32>;
@@ -51,17 +53,20 @@ pub struct Settings {
     pub show_ball: bool,
     /// Bubble above pressed keys.
     pub key_popup: bool,
-    /// Key click sound (not implemented yet; stored).
+    /// 按键音 (`sound.rs`).
     pub key_sound: bool,
+    pub key_sound_volume: KeySoundVolume,
+    pub key_sound_style: KeySoundStyle,
     pub long_press: LongPress,
-    /// Stored; takes effect in a later version.
+    /// 候选字号.
     pub candidate_size: CandidateSize,
-    /// Stored; takes effect in a later version.
+    /// 中文时用全角标点.
     pub full_width_punct: bool,
-    /// Stored; takes effect in a later version.
+    /// 空格上屏首选 (off: Space while composing types the raw input and a space).
     pub space_commits_first: bool,
-    /// 模糊音, indexed by `FuzzyPair::index` (stored; wired into the rime schema later).
+    /// 模糊音, indexed by `FuzzyPair::index` (applied by redeploying the user's Rime data).
     pub fuzzy: [bool; 7],
+    /// 双拼方案 (the 双拼 layout's Rime schema and key faces).
     pub shuangpin: ShuangpinScheme,
     /// Record clipboard history.
     pub clip_history: bool,
@@ -98,6 +103,8 @@ impl Default for Settings {
             show_ball: true,
             key_popup: true,
             key_sound: false,
+            key_sound_volume: KeySoundVolume::Medium,
+            key_sound_style: KeySoundStyle::Crisp,
             long_press: LongPress::Medium,
             candidate_size: CandidateSize::Standard,
             full_width_punct: true,
@@ -159,8 +166,15 @@ const CANDIDATE_SIZES: [(CandidateSize, &str); 4] = [
     (CandidateSize::Large, "large"),
     (CandidateSize::ExtraLarge, "xlarge"),
 ];
-const SHUANGPIN: [(ShuangpinScheme, &str); 3] =
-    [(ShuangpinScheme::Xiaohe, "xiaohe"), (ShuangpinScheme::Ziranma, "ziranma"), (ShuangpinScheme::Microsoft, "microsoft")];
+const SHUANGPIN: [(ShuangpinScheme, &str); 4] = [
+    (ShuangpinScheme::Xiaohe, "xiaohe"),
+    (ShuangpinScheme::Ziranma, "ziranma"),
+    (ShuangpinScheme::Microsoft, "microsoft"),
+    (ShuangpinScheme::Sogou, "sogou"),
+];
+const KEY_SOUND_VOLUMES: [(KeySoundVolume, &str); 3] =
+    [(KeySoundVolume::Low, "low"), (KeySoundVolume::Medium, "medium"), (KeySoundVolume::High, "high")];
+const KEY_SOUND_STYLES: [(KeySoundStyle, &str); 2] = [(KeySoundStyle::Crisp, "crisp"), (KeySoundStyle::Soft, "soft")];
 /// `fuzzy=` lists the enabled pairs by these names (`FuzzyPair::ALL` order).
 const FUZZY: [&str; 7] = ["z-zh", "c-ch", "s-sh", "n-l", "an-ang", "en-eng", "in-ing"];
 
@@ -215,6 +229,8 @@ impl Settings {
                 "show_ball" => s.show_ball = parse_bool(v).unwrap_or(s.show_ball),
                 "key_popup" => s.key_popup = parse_bool(v).unwrap_or(s.key_popup),
                 "key_sound" => s.key_sound = parse_bool(v).unwrap_or(s.key_sound),
+                "key_sound_volume" => s.key_sound_volume = lookup(&KEY_SOUND_VOLUMES, v).unwrap_or(s.key_sound_volume),
+                "key_sound_style" => s.key_sound_style = lookup(&KEY_SOUND_STYLES, v).unwrap_or(s.key_sound_style),
                 "long_press" => s.long_press = lookup(&LONG_PRESS, v).unwrap_or(s.long_press),
                 "candidate_size" => s.candidate_size = lookup(&CANDIDATE_SIZES, v).unwrap_or(s.candidate_size),
                 "full_width_punct" => s.full_width_punct = parse_bool(v).unwrap_or(s.full_width_punct),
@@ -288,6 +304,8 @@ impl Settings {
         let _ = writeln!(out, "show_ball={}", self.show_ball);
         let _ = writeln!(out, "key_popup={}", self.key_popup);
         let _ = writeln!(out, "key_sound={}", self.key_sound);
+        let _ = writeln!(out, "key_sound_volume={}", name_of(&KEY_SOUND_VOLUMES, self.key_sound_volume));
+        let _ = writeln!(out, "key_sound_style={}", name_of(&KEY_SOUND_STYLES, self.key_sound_style));
         let _ = writeln!(out, "long_press={}", name_of(&LONG_PRESS, self.long_press));
         let _ = writeln!(out, "candidate_size={}", name_of(&CANDIDATE_SIZES, self.candidate_size));
         let _ = writeln!(out, "full_width_punct={}", self.full_width_punct);
@@ -363,12 +381,14 @@ mod tests {
             show_ball: false,
             key_popup: false,
             key_sound: true,
+            key_sound_volume: KeySoundVolume::High,
+            key_sound_style: KeySoundStyle::Soft,
             long_press: LongPress::Long,
             candidate_size: CandidateSize::ExtraLarge,
             full_width_punct: false,
             space_commits_first: false,
             fuzzy: [true, false, false, true, false, false, true],
-            shuangpin: ShuangpinScheme::Microsoft,
+            shuangpin: ShuangpinScheme::Sogou,
             clip_history: false,
             clip_limit: 200,
             clip_skip_passwords: false,
@@ -412,6 +432,13 @@ mod tests {
         assert_eq!(Settings::parse("fuzzy=n-l, bogus ,IN-ING").fuzzy, [false, false, false, true, false, false, true]);
         assert_eq!(Settings::parse("clip_limit=0").clip_limit, 1);
         assert_eq!(Settings::parse("long_press=quick").long_press, LongPress::Medium);
+        assert_eq!(Settings::parse("shuangpin=Microsoft").shuangpin, ShuangpinScheme::Microsoft);
+        assert_eq!(Settings::parse("shuangpin=bogus").shuangpin, ShuangpinScheme::Xiaohe);
+        assert_eq!(Settings::parse("key_sound_volume=loud").key_sound_volume, KeySoundVolume::Medium);
+        for scheme in ShuangpinScheme::ALL {
+            let s = Settings { shuangpin: scheme, ..Settings::default() };
+            assert_eq!(Settings::parse(&s.serialize()).shuangpin, scheme);
+        }
     }
 
     #[test]

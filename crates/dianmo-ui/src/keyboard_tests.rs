@@ -1644,3 +1644,128 @@ fn toolbar_gear_opens_settings() {
     let h = H::with(st(true, Schema::Pinyin, "ni", NIHAO));
     assert!(h.v.key_center("settings").is_none());
 }
+
+// ---------------------------------------------------------------------------------------------
+// v0.2 settings: 按键音, 全角标点, 候选字号, 双拼方案
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn key_sound_sends_a_click_first_on_press() {
+    let mut h = H::new();
+    assert!(!h.v.key_sound(), "off by default");
+    assert!(h.down(1, h.at("g")).is_empty(), "no click while off");
+    h.up(1, h.at("g"));
+    assert!(h.v.set_key_sound(true));
+    assert!(!h.v.set_key_sound(true), "no change");
+    assert_eq!(h.down(1, h.at("g")), vec![UiAction::KeyClick(KeyClick::Char)], "on press, before the key fires");
+    assert_eq!(h.up(1, h.at("g")), vec![input(Action::Char('g'))], "release only types");
+    // Function keys sound different; press-fired keys get the click before their input.
+    assert_eq!(h.down(1, h.at("backspace")), vec![UiAction::KeyClick(KeyClick::Func), input(Action::Backspace)]);
+    h.up(1, h.at("backspace"));
+    assert_eq!(h.down(1, h.at("space"))[0], UiAction::KeyClick(KeyClick::Func));
+    h.up(1, h.at("space"));
+    assert_eq!(h.down(1, h.at("，"))[0], UiAction::KeyClick(KeyClick::Char));
+    h.up(1, h.at("，"));
+    // The toolbar is not a key.
+    assert!(h.down(1, h.at("settings")).is_empty());
+}
+
+#[test]
+fn full_width_punctuation_setting_switches_the_keys() {
+    for w in [W, WIDE] {
+        let mut h = H::sized(w, idle());
+        assert!(h.v.full_width_punct());
+        assert!(h.v.key_center("，").is_some(), "{w}");
+        assert!(h.v.set_full_width_punct(false));
+        assert!(!h.v.set_full_width_punct(false));
+        assert!(h.v.key_center("，").is_none(), "{w}: no full-width comma");
+        assert_eq!(h.tap(","), vec![text(",")], "{w}");
+        // English is ASCII either way; 中文 with the setting on is full-width again.
+        h.v.set_full_width_punct(true);
+        assert_eq!(h.tap("，"), vec![text("，")]);
+    }
+    // The 九宫格 punctuation column follows it too.
+    let mut h = H::with(st(true, Schema::T9, "", &[]));
+    assert_eq!(h.v.column_items()[0], "，");
+    h.v.set_full_width_punct(false);
+    assert_eq!(h.v.column_items()[0], ",");
+}
+
+#[test]
+fn candidate_size_scales_the_candidates() {
+    for w in [W, WIDE] {
+        let mut h = H::sized(w, st(true, Schema::Pinyin, "ni", NIHAO));
+        let size = |h: &H| h.v.cand_style().size;
+        let width = |h: &mut H| {
+            h.paint();
+            h.v.layout_cache.strip[0].1
+        };
+        let (s0, w0) = (size(&h), width(&mut h));
+        assert!(h.v.set_candidate_size(CandidateSize::ExtraLarge));
+        assert!(!h.v.set_candidate_size(CandidateSize::ExtraLarge));
+        assert!((size(&h) - s0 * 1.3).abs() < 0.01, "{w}");
+        let w1 = width(&mut h);
+        assert!(w1 > w0, "{w}: the strip was laid out again ({w1} vs {w0})");
+        // The text still fits the bar.
+        assert!(size(&h) < h.v.m.bar_h * 0.7, "{w}: {} in a {} bar", size(&h), h.v.m.bar_h);
+        h.v.set_candidate_size(CandidateSize::Small);
+        assert!(size(&h) < s0);
+        assert!(width(&mut h) <= w0);
+        let canvas = h.paint();
+        assert!(canvas.texts.iter().any(|(t, _)| t == "你好"));
+    }
+}
+
+#[test]
+fn every_shuangpin_scheme_labels_every_key() {
+    for scheme in ShuangpinScheme::ALL {
+        for c in 'a'..='z' {
+            assert!(layout::shuangpin_hint(scheme, c).is_some(), "{scheme:?} {c}");
+        }
+        assert_eq!(layout::shuangpin_hint(scheme, ';').is_some(), scheme.uses_semicolon(), "{scheme:?}");
+        // u / i / v are sh / ch / zh in all four.
+        assert_eq!(layout::shuangpin_hint(scheme, 'u'), Some("sh"));
+        assert_eq!(layout::shuangpin_hint(scheme, 'i'), Some("ch"));
+        assert!(layout::shuangpin_hint(scheme, 'v').unwrap().starts_with("zh"));
+    }
+    assert_eq!(layout::shuangpin_hint(ShuangpinScheme::Xiaohe, 'k'), Some("ing uai"));
+    assert_eq!(layout::shuangpin_hint(ShuangpinScheme::Ziranma, 'y'), Some("ing uai"));
+    assert_eq!(layout::shuangpin_hint(ShuangpinScheme::Microsoft, ';'), Some("ing"));
+    assert_eq!(layout::shuangpin_hint(ShuangpinScheme::Sogou, 'd'), Some("iang uang"));
+}
+
+#[test]
+fn shuangpin_scheme_changes_the_key_faces() {
+    let sub = |h: &H, c: char| h.v.keys.iter().find(|k| k.action == KeyAction::Letter(c)).and_then(|k| k.sub.clone());
+    let mut h = H::with(st(true, Schema::Shuangpin, "", &[]));
+    assert_eq!(h.v.shuangpin(), ShuangpinScheme::Xiaohe);
+    assert_eq!(sub(&h, 'k').as_deref(), Some("ing uai"));
+    assert!(h.v.key_center("；").is_none(), "小鹤 has no ； key");
+    assert!(h.v.set_shuangpin(ShuangpinScheme::Ziranma));
+    assert!(!h.v.set_shuangpin(ShuangpinScheme::Ziranma));
+    assert_eq!(sub(&h, 'k').as_deref(), Some("ao"));
+    assert!(h.v.keys.iter().any(|k| k.action == KeyAction::Space && k.label == "自然码双拼"), "space bar names the scheme");
+    // 微软: a tenth key in the a–l row types ； (the controller turns it into the final ing).
+    h.v.set_shuangpin(ShuangpinScheme::Microsoft);
+    let semi = h.v.keys.iter().find(|k| k.label == "；").expect("； key").clone();
+    assert_eq!(semi.sub.as_deref(), Some("ing"));
+    let a = h.v.keys.iter().find(|k| k.action == KeyAction::Letter('a')).unwrap().cell;
+    let l = h.v.keys.iter().find(|k| k.action == KeyAction::Letter('l')).unwrap().cell;
+    assert!((semi.cell.y - a.y).abs() < 0.1 && semi.cell.x > l.x, "after l in the a–l row");
+    assert!(a.x <= h.v.m.pad_x + 0.1, "the row starts at the left edge");
+    assert_eq!(h.tap("；"), vec![text("；")]);
+    // Other layouts never show it, nor the finals.
+    let mut p = H::new();
+    p.v.set_shuangpin(ShuangpinScheme::Microsoft);
+    assert!(p.v.key_center("；").is_none());
+    assert!(sub(&p, 'k').is_none());
+    // Wide layout: the ； key already exists and gets the hint.
+    let mut w = H::wide(st(true, Schema::Shuangpin, "", &[]));
+    w.v.set_shuangpin(ShuangpinScheme::Sogou);
+    let semi = w.v.keys.iter().find(|k| k.label == "；").unwrap();
+    assert_eq!(semi.sub.as_deref(), Some("ing"));
+    assert_eq!(w.v.keys.iter().filter(|k| k.label == "；").count(), 1);
+    // The layout menu names the scheme.
+    w.tap("layout");
+    assert!(w.v.keys.iter().any(|k| k.sub.as_deref() == Some("搜狗双拼")));
+}

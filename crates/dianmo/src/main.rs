@@ -10,6 +10,8 @@
 //!   dianmo.exe --register-task    (elevated) create/update the task `Dianmo` for this exe
 //!   dianmo.exe --unregister-task  (elevated) delete the task
 //!   dianmo.exe --deploy <dir>     precompile Rime data in <dir> into <dir>\build (packaging)
+//!   dianmo.exe --deploy-user      build the fuzzy pinyin customization in <data>\rime (started
+//!                                 by the running app; dianmo_rime::deploy_user)
 //!   dianmo.exe --quit             close the running 点墨 gracefully (installer; install.rs)
 //!   dianmo.exe --install [--quiet] [--no-run]   register this copy: shortcuts, 「应用和功能」,
 //!                                 task, start (run by DianmoSetup.exe; install.rs)
@@ -41,6 +43,7 @@ mod engine;
 mod log;
 mod prefs;
 mod settings;
+mod sound;
 
 #[cfg(windows)]
 mod app;
@@ -94,6 +97,7 @@ mod win {
         while let Some(a) = it.next() {
             match a.as_str() {
                 "--deploy" => return deploy(it.next().map(String::as_str)),
+                "--deploy-user" => return deploy_user(),
                 "--version" | "-V" => {
                     platform::attach_parent_console();
                     println!("点墨 Dianmo {VERSION}");
@@ -334,6 +338,34 @@ mod win {
     fn deploy(_: Option<&str>) -> i32 {
         platform::attach_parent_console();
         println!("deploy failed: built without the `rime` feature");
+        1
+    }
+
+    /// `--deploy-user`: build the user's fuzzy pinyin customization (`<data>\rime\build.new`,
+    /// see `dianmo_rime::deploy_user`). Started by the running app, which reloads its engine on
+    /// exit code 0.
+    #[cfg(feature = "rime")]
+    fn deploy_user() -> i32 {
+        platform::attach_parent_console();
+        let mut opts = dianmo_rime::Options::for_app();
+        opts.user_data_dir = platform::data_dir().join("rime");
+        match dianmo_rime::deploy_user(&opts) {
+            Ok(r) => {
+                let msg = format!("deploy-user ok: {} ms, {} bytes", r.millis, r.build_bytes);
+                log!("{msg}");
+                println!("{msg}");
+                0
+            }
+            Err(e) => {
+                log!("deploy-user failed: {e}");
+                println!("deploy-user failed: {e}");
+                1
+            }
+        }
+    }
+
+    #[cfg(not(feature = "rime"))]
+    fn deploy_user() -> i32 {
         1
     }
 }

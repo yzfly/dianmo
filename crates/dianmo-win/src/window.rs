@@ -12,18 +12,21 @@
 //! keys → [`View::key`]. Painting is on demand and timers are single-shot, like the keyboard, so
 //! an idle window costs no CPU.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use dianmo_ui::{PointerEvent, PointerPhase, Response, View};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+    DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE,
+    DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTOPRIMARY,
     MONITORINFO, MonitorFromPoint, PAINTSTRUCT, ScreenToClient,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::Controls::{FEEDBACK_TYPE, SetWindowFeedbackSetting};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI};
@@ -34,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetForegroundWindow, HICON, ICON_BIG, ICON_SMALL, IDC_ARROW, IMAGE_ICON, IsIconic, IsWindow,
     KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MINMAXINFO, POINTER_INPUT_TYPE, PT_MOUSE, PT_PEN,
     PostMessageW, RegisterClassW, SM_CXICON, SM_CXSMICON, SPI_GETWHEELSCROLLLINES, SW_RESTORE, SW_SHOWNORMAL,
-    SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetForegroundWindow, SetTimer,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, WINDOW_EX_STYLE,
     WINDOW_STYLE, WM_APP, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
     WM_MOUSEWHEEL, WM_NCACTIVATE, WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERLEAVE, WM_POINTERUP,
@@ -42,7 +45,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_TIMER, WNDCLASSW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP, WS_MINIMIZEBOX, WS_OVERLAPPED,
     WS_OVERLAPPEDWINDOW, WS_SYSMENU,
 };
-use windows::core::{HSTRING, PCWSTR, Result, w};
+use windows::core::{HSTRING, PCWSTR, Result, s, w};
 
 use crate::canvas::Renderer;
 use crate::clock::now_ms;
@@ -133,6 +136,8 @@ pub(crate) struct AppWindow {
     hovering: bool,
     icons: [HICON; 2],
     paint_failures: u32,
+    /// The title-bar theme last applied (dark?), so repeated theme notifications don't repaint.
+    title_dark: bool,
 }
 
 impl Drop for AppWindow {
@@ -198,7 +203,8 @@ fn outer_size(opts: &WindowOptions, w: f32, h: f32, dpi: u32) -> (i32, i32) {
 pub(crate) fn open(p: PendingWindow) {
     let PendingWindow { id, view, opts } = p;
     let Some(hardware) = with(|h| h.opts.hardware_gpu) else { return };
-    let hwnd = match create_hwnd(&opts) {
+    let dark = opts.dark.unwrap_or_else(system_dark_mode);
+    let hwnd = match create_hwnd(&opts, dark) {
         Ok(hwnd) => hwnd,
         Err(_) => {
             drop(view);
@@ -219,19 +225,6 @@ pub(crate) fn open(p: PendingWindow) {
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, id.0 as isize);
     }
-    let dark = opts.dark.unwrap_or_else(system_dark_mode);
-    set_dark_title(hwnd, dark);
-    if opts.mica {
-        let backdrop = DWMSBT_MAINWINDOW;
-        unsafe {
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                &backdrop as *const _ as *const _,
-                size_of_val(&backdrop) as u32,
-            );
-        }
-    }
     let mut win = AppWindow {
         id,
         hwnd,
@@ -244,6 +237,7 @@ pub(crate) fn open(p: PendingWindow) {
         hovering: false,
         icons: [HICON::default(); 2],
         paint_failures: 0,
+        title_dark: dark,
     };
     if win.opts.icon {
         win.load_icons();
@@ -263,7 +257,7 @@ pub(crate) fn open(p: PendingWindow) {
     }
 }
 
-fn create_hwnd(opts: &WindowOptions) -> Result<HWND> {
+fn create_hwnd(opts: &WindowOptions, dark: bool) -> Result<HWND> {
     register_class();
     unsafe {
         // On the monitor of the last pointer position (where the user just tapped), centred in
@@ -298,6 +292,18 @@ fn create_hwnd(opts: &WindowOptions) -> Result<HWND> {
             Some(module.into()),
             None,
         )?;
+        // Title-bar theme before the window is first shown: Windows 10 picks it up when the
+        // frame is first drawn, later changes need `repaint_caption`.
+        set_dark_title(hwnd, dark);
+        if opts.mica {
+            let backdrop = DWMSBT_MAINWINDOW;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                &backdrop as *const _ as *const _,
+                size_of_val(&backdrop) as u32,
+            );
+        }
         // No press-and-hold right click / ring (views use long press themselves); keep the
         // normal touch contact feedback.
         let off = windows::Win32::Foundation::FALSE;
@@ -314,17 +320,74 @@ fn create_hwnd(opts: &WindowOptions) -> Result<HWND> {
     }
 }
 
+/// Windows build number (19044 = Windows 10 21H2, 22000+ = Windows 11), from `RtlGetVersion`
+/// (`GetVersionEx` lies without a compatibility manifest). 0 if unknown.
+fn windows_build() -> u32 {
+    static BUILD: OnceLock<u32> = OnceLock::new();
+    *BUILD.get_or_init(|| unsafe {
+        type RtlGetVersion = unsafe extern "system" fn(*mut OSVERSIONINFOW) -> i32;
+        let Ok(ntdll) = GetModuleHandleW(w!("ntdll.dll")) else { return 0 };
+        let Some(f) = GetProcAddress(ntdll, s!("RtlGetVersion")) else { return 0 };
+        let f = std::mem::transmute::<unsafe extern "system" fn() -> isize, RtlGetVersion>(f);
+        let mut info = OSVERSIONINFOW { dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32, ..Default::default() };
+        if f(&mut info) == 0 { info.dwBuildNumber } else { 0 }
+    })
+}
+
+/// `DWMWA_USE_IMMERSIVE_DARK_MODE` is 20 from Windows 10 20H1 (build 19041; 18985 in Insider
+/// builds); 1809–1909 used the undocumented 19. Before 1809 there is no dark title bar.
+const DARK_MODE_ATTR_BEFORE_20H1: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(19);
+const BUILD_20H1: u32 = 19041;
+const BUILD_1809: u32 = 17763;
+const BUILD_1903: u32 = 18362;
+const BUILD_WIN11: u32 = 22000;
+
 fn set_dark_title(hwnd: HWND, dark: bool) {
+    let build = windows_build();
+    if build != 0 && build < BUILD_1809 {
+        return;
+    }
     let value = windows::core::BOOL::from(dark);
-    unsafe {
-        if DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &value as *const _ as *const _, 4).is_err() {
-            // Windows 10 before 20H1 used attribute 19.
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(19),
-                &value as *const _ as *const _,
-                4,
-            );
+    let set = |attr: DWMWINDOWATTRIBUTE| unsafe {
+        DwmSetWindowAttribute(hwnd, attr, &value as *const _ as *const _, size_of_val(&value) as u32).is_ok()
+    };
+    let (first, second) = if build == 0 || build >= BUILD_20H1 {
+        (DWMWA_USE_IMMERSIVE_DARK_MODE, DARK_MODE_ATTR_BEFORE_20H1)
+    } else {
+        (DARK_MODE_ATTR_BEFORE_20H1, DWMWA_USE_IMMERSIVE_DARK_MODE)
+    };
+    if !set(first) {
+        let _ = set(second);
+    }
+    // Windows 10 1903+: the same switch through user32 (what Explorer and winit use); makes sure
+    // the frame's own idea of the theme matches the DWM attribute.
+    if (BUILD_1903..BUILD_WIN11).contains(&build) {
+        set_dark_composition(hwnd, dark);
+    }
+}
+
+/// `SetWindowCompositionAttribute(WCA_USEDARKMODECOLORS)` (undocumented, user32).
+fn set_dark_composition(hwnd: HWND, dark: bool) {
+    #[repr(C)]
+    struct Data {
+        attrib: u32,
+        data: *mut std::ffi::c_void,
+        size: usize,
+    }
+    type SetWindowCompositionAttribute = unsafe extern "system" fn(HWND, *mut Data) -> windows::core::BOOL;
+    const WCA_USEDARKMODECOLORS: u32 = 26;
+    static FUNC: OnceLock<Option<SetWindowCompositionAttribute>> = OnceLock::new();
+    let f = FUNC.get_or_init(|| unsafe {
+        let user32 = GetModuleHandleW(w!("user32.dll")).ok()?;
+        let f = GetProcAddress(user32, s!("SetWindowCompositionAttribute"))?;
+        Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, SetWindowCompositionAttribute>(f))
+    });
+    if let Some(f) = f {
+        let mut value = windows::core::BOOL::from(dark);
+        let mut data =
+            Data { attrib: WCA_USEDARKMODECOLORS, data: &mut value as *mut _ as *mut _, size: size_of_val(&value) };
+        unsafe {
+            let _ = f(hwnd, &mut data);
         }
     }
 }
@@ -357,18 +420,44 @@ pub(crate) fn set_title(hwnd: HWND, title: &str) {
 
 pub(crate) fn set_dark(hwnd: HWND, dark: Option<bool>) {
     let Some(()) = with_window(hwnd, |h, i| h.windows[i].opts.dark = dark) else { return };
-    set_dark_title(hwnd, dark.unwrap_or_else(system_dark_mode));
+    update_dark_title(hwnd, dark.unwrap_or_else(system_dark_mode));
+}
+
+/// Applies a title-bar theme change to an open window and redraws the caption (nothing if the
+/// window already has that theme).
+fn update_dark_title(hwnd: HWND, dark: bool) {
+    if with_window(hwnd, |h, i| std::mem::replace(&mut h.windows[i].title_dark, dark)) == Some(dark) {
+        return;
+    }
+    set_dark_title(hwnd, dark);
     repaint_caption(hwnd);
 }
 
-/// Windows 10 applies a changed title-bar theme only when the caption is next drawn for an
-/// activation change (seen on the Surface: the attribute was set, the bar stayed light): toggle
-/// the non-client activation state once.
+/// Windows 10 applies a changed title-bar theme only when the frame is next drawn (seen on the
+/// Surface: the attribute read back as set, the bar stayed light until the window was
+/// deactivated). Windows 11 redraws by itself.
+/// - `SWP_FRAMECHANGED` makes the frame recalculate and redraw (no move, size or activation).
+/// - Toggling the caption's activation state (`WM_NCACTIVATE` to `DefWindowProc`, the same
+///   path as a real deactivate / reactivate, minus the focus change) makes DWM redraw the
+///   caption with the new colours. Focus and the foreground window do not change.
 fn repaint_caption(hwnd: HWND) {
     unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
+        );
+        let build = windows_build();
+        if build != 0 && build >= BUILD_WIN11 {
+            return;
+        }
         let active = GetForegroundWindow() == hwnd;
-        SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(!active as usize)), Some(LPARAM(0)));
-        SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(active as usize)), Some(LPARAM(0)));
+        let _ = DefWindowProcW(hwnd, WM_NCACTIVATE, WPARAM(!active as usize), LPARAM(0));
+        let _ = DefWindowProcW(hwnd, WM_NCACTIVATE, WPARAM(active as usize), LPARAM(0));
     }
 }
 
@@ -683,8 +772,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     if name.to_string().is_ok_and(|s| s == "ImmersiveColorSet")
                         && with_window(hwnd, |h, i| h.windows[i].opts.dark) == Some(None)
                     {
-                        set_dark_title(hwnd, system_dark_mode());
-                        repaint_caption(hwnd);
+                        update_dark_title(hwnd, system_dark_mode());
                     }
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)

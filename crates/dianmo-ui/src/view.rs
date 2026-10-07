@@ -64,9 +64,21 @@ pub enum UiAction {
     CheckCopied,
     /// The ⚙ toolbar button: open the settings window.
     OpenSettings,
+    /// A key was pressed (only with 按键音 on, `KeyboardView::set_key_sound`): play the click.
+    /// Comes first in the response, before the key's input.
+    KeyClick(KeyClick),
     /// From [`crate::SettingsView`] / [`crate::OnboardingView`]: a setting changed (already
     /// applied to the view's own model) or a command for the host.
     Settings(crate::settings::SettingsAction),
+}
+
+/// The 按键音 a key press makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyClick {
+    /// Letters, digits, punctuation.
+    Char,
+    /// Space, delete, enter, shift and the other function keys.
+    Func,
 }
 
 /// One clipboard history entry, as the host passes it to the view (most recent first).

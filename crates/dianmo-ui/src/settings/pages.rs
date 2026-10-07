@@ -1,8 +1,8 @@
 //! Content of each settings page (PRODUCT.md §3), built from the model as [`Block`]s.
 
 use super::model::{
-    CandidateSize, FuzzyPair, LayoutChoice, Level, LongPress, Page, SettingsAction as A, SettingsModel, ShuangpinScheme,
-    Side, Status, ThemeChoice, VoiceEngineChoice, CLIP_LIMITS,
+    CandidateSize, FuzzyPair, KeySoundStyle, KeySoundVolume, LayoutChoice, Level, LongPress, Page, SettingsAction as A,
+    SettingsModel, ShuangpinScheme, Side, Status, ThemeChoice, VoiceEngineChoice, CLIP_LIMITS,
 };
 use super::model::InputMode;
 use super::widgets::{Art, Block, Button, ButtonKind, Card, Chip, Control, Row, SliderSpec, TagKind};
@@ -46,7 +46,7 @@ fn layout_row(m: &SettingsModel) -> Row {
     let (opts, sel) = seg(
         &[
             ("全拼", LayoutChoice::Pinyin),
-            ("小鹤双拼", LayoutChoice::Shuangpin),
+            ("双拼", LayoutChoice::Shuangpin),
             ("九宫格", LayoutChoice::T9),
             ("English", LayoutChoice::English),
         ],
@@ -158,13 +158,21 @@ fn keyboard(m: &SettingsModel) -> Vec<Block> {
             "按键",
             vec![
                 Row::new("key_popup", "按键气泡").desc("按下时在手指上方放大显示字母，确认没按错").switch(m.key_popup, A::SetKeyPopup),
+                Row::new("key_sound", "按键音").desc("按下按键时发出轻微的声音，确认按到了").switch(m.key_sound, A::SetKeySound),
                 {
-                    let mut r = Row::new("key_sound", "按键音")
-                        .desc("按键时发出轻微的声音")
-                        .tag("即将推出", TagKind::Neutral)
-                        .control(Control::Switch { on: m.key_sound });
-                    r.enabled = false;
-                    r
+                    let (opts, sel) = seg(
+                        &[("小", KeySoundVolume::Low), ("中", KeySoundVolume::Medium), ("大", KeySoundVolume::High)],
+                        m.key_sound_volume,
+                        A::SetKeySoundVolume,
+                    );
+                    let r = Row::new("key_sound_volume", "按键音音量").desc("只影响点墨的按键音，不改变系统音量").segmented(opts, sel);
+                    if m.key_sound { r } else { r.disabled() }
+                },
+                {
+                    let (opts, sel) =
+                        seg(&[("清脆", KeySoundStyle::Crisp), ("柔和", KeySoundStyle::Soft)], m.key_sound_style, A::SetKeySoundStyle);
+                    let r = Row::new("key_sound_style", "按键音音色").desc("字母键和功能键（空格、删除、回车）的声音略有不同").segmented(opts, sel);
+                    if m.key_sound { r } else { r.disabled() }
                 },
                 Row::new("long_press", "长按时长").desc("长按按键输入上方小字、弹出更多字符所需的时间").segmented(lp_opts, lp_sel),
             ],
@@ -196,20 +204,16 @@ fn input(m: &SettingsModel) -> Vec<Block> {
         .collect();
     let mut fuzzy = Row::new("fuzzy", "模糊音").desc("分不清平翘舌或前后鼻音时打开，例如输入 zi 也能出「知」").chips(chips);
     if !m.fuzzy_supported {
-        fuzzy = fuzzy.tag("下个版本生效", TagKind::Warning);
+        fuzzy = fuzzy.tag("词库加载后生效", TagKind::Warning);
     }
-    let sp = Row::new("shuangpin", "双拼方案").desc("选择「小鹤双拼」布局时使用；自然码、微软双拼即将支持").control(Control::Segmented {
-        options: vec![
-            ("小鹤".into(), A::SetShuangpin(ShuangpinScheme::Xiaohe), true),
-            ("自然码".into(), A::SetShuangpin(ShuangpinScheme::Ziranma), false),
-            ("微软".into(), A::SetShuangpin(ShuangpinScheme::Microsoft), false),
-        ],
-        selected: Some(match m.shuangpin {
-            ShuangpinScheme::Xiaohe => 0,
-            ShuangpinScheme::Ziranma => 1,
-            ShuangpinScheme::Microsoft => 2,
-        }),
-    });
+    if !m.fuzzy_status.text.is_empty() {
+        fuzzy = fuzzy.status(m.fuzzy_status.clone());
+    }
+    let sp_items: Vec<(&str, ShuangpinScheme)> = ShuangpinScheme::ALL.iter().map(|&s| (s.short(), s)).collect();
+    let (sp_opts, sp_sel) = seg(&sp_items, m.shuangpin, A::SetShuangpin);
+    let sp = Row::new("shuangpin", "双拼方案")
+        .desc("选择「双拼」布局时使用，键盘上的韵母提示随方案变化；微软、搜狗方案用「；」键打 ing")
+        .segmented(sp_opts, sp_sel);
     let dict_status =
         if m.dictionary.text.is_empty() { Status::new(Level::Unknown, "正在加载词库…") } else { m.dictionary.clone() };
     let words = match m.user_words {
@@ -222,7 +226,7 @@ fn input(m: &SettingsModel) -> Vec<Block> {
             vec![
                 Row::new("candidate_size", "候选字号").desc("候选栏里文字的大小").segmented(cs_opts, cs_sel),
                 Row::new("space_first", "空格上屏首选")
-                    .desc("按空格输入第一个候选；关闭后空格只输入空格")
+                    .desc("按空格输入第一个候选；关闭后空格先上屏打出的字母，再输入一个空格")
                     .switch(m.space_commits_first, A::SetSpaceCommitsFirst),
                 Row::new("full_width", "中文时用全角标点")
                     .desc("中文状态下输入，。？！等中文标点")
@@ -234,10 +238,20 @@ fn input(m: &SettingsModel) -> Vec<Block> {
             "词库",
             vec![
                 Row::new("dictionary", "系统词库").desc("雾凇拼音词库，覆盖常用词、网络用语和成语").status(dict_status),
-                Row::new("user_dict", "用户词库").desc(words).control(Control::Buttons(vec![
-                    Button::new("导入", ButtonKind::Secondary, A::ImportUserDict),
-                    Button::new("导出", ButtonKind::Secondary, A::ExportUserDict),
-                ])),
+                {
+                    let busy = m.user_dict_status.level == Level::Unknown && !m.user_dict_status.text.is_empty();
+                    let button = |label: &str, act: A| {
+                        let b = Button::new(label, ButtonKind::Secondary, act);
+                        if busy { b.disabled() } else { b }
+                    };
+                    let mut r = Row::new("user_dict", "用户词库")
+                        .desc(words)
+                        .control(Control::Buttons(vec![button("导入", A::ImportUserDict), button("导出", A::ExportUserDict)]));
+                    if !m.user_dict_status.text.is_empty() {
+                        r = r.status(m.user_dict_status.clone());
+                    }
+                    r
+                },
                 Row::new("clear_dict", "清空用户词库").desc("忘掉所有学到的词，系统词库不受影响").control(Control::Confirm {
                     id: "clear_dict",
                     label: "清空".into(),

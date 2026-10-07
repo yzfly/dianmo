@@ -27,8 +27,11 @@ version = "0.62.2"
 features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    # sound.rs: 按键音 through WASAPI (IMMDevice::Activate needs StructuredStorage).
+    "Win32_Media_Audio",
     "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_Diagnostics_ToolHelp",

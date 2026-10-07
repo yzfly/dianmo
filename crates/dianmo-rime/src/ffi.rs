@@ -164,7 +164,7 @@ pub struct RimeApi {
     pub config_end: Unused,
     pub simulate_key_sequence: Option<unsafe extern "C" fn(RimeSessionId, *const c_char) -> Bool>,
     pub register_module: Unused,
-    pub find_module: Unused,
+    pub find_module: Option<unsafe extern "C" fn(*const c_char) -> *mut RimeModule>,
     pub run_task: Option<unsafe extern "C" fn(*const c_char) -> Bool>,
     pub get_shared_data_dir: Unused,
     pub get_user_data_dir: Unused,
@@ -217,6 +217,67 @@ pub struct RimeApi {
     pub change_page: Unused,
 }
 
+/// `RimeModule` (`rime_api.h`); `get_api` returns the module's own API table.
+#[repr(C)]
+pub struct RimeModule {
+    pub data_size: c_int,
+    pub module_name: *const c_char,
+    pub initialize: Option<unsafe extern "C" fn()>,
+    pub finalize: Option<unsafe extern "C" fn()>,
+    pub get_api: Option<unsafe extern "C" fn() -> *mut c_void>,
+}
+
+/// `RimeUserDictIterator` (`rime_levers_api.h`).
+#[repr(C)]
+pub struct RimeUserDictIterator {
+    pub ptr: *mut c_void,
+    pub i: usize,
+}
+
+/// `RimeLeversApi` of librime 1.17.0 (`rime_levers_api.h`, module "levers"): `data_size` + 32
+/// function pointers, in header order. Only the user-dictionary slots are typed.
+#[repr(C)]
+pub struct RimeLeversApi {
+    pub data_size: c_int,
+    // custom settings (11)
+    pub custom_settings_init: Unused,
+    pub custom_settings_destroy: Unused,
+    pub load_settings: Unused,
+    pub save_settings: Unused,
+    pub customize_bool: Unused,
+    pub customize_int: Unused,
+    pub customize_double: Unused,
+    pub customize_string: Unused,
+    pub is_first_run: Unused,
+    pub settings_is_modified: Unused,
+    pub settings_get_config: Unused,
+    // switcher settings (13)
+    pub switcher_settings_init: Unused,
+    pub get_available_schema_list: Unused,
+    pub get_selected_schema_list: Unused,
+    pub schema_list_destroy: Unused,
+    pub get_schema_id: Unused,
+    pub get_schema_name: Unused,
+    pub get_schema_version: Unused,
+    pub get_schema_author: Unused,
+    pub get_schema_description: Unused,
+    pub get_schema_file_path: Unused,
+    pub select_schemas: Unused,
+    pub get_hotkeys: Unused,
+    pub set_hotkeys: Unused,
+    // user dictionaries (7)
+    pub user_dict_iterator_init: Option<unsafe extern "C" fn(*mut RimeUserDictIterator) -> Bool>,
+    pub user_dict_iterator_destroy: Option<unsafe extern "C" fn(*mut RimeUserDictIterator)>,
+    pub next_user_dict: Option<unsafe extern "C" fn(*mut RimeUserDictIterator) -> *const c_char>,
+    pub backup_user_dict: Option<unsafe extern "C" fn(*const c_char) -> Bool>,
+    pub restore_user_dict: Option<unsafe extern "C" fn(*const c_char) -> Bool>,
+    /// Number of entries written, or -1.
+    pub export_user_dict: Option<unsafe extern "C" fn(*const c_char, *const c_char) -> c_int>,
+    /// Number of entries read, or -1.
+    pub import_user_dict: Option<unsafe extern "C" fn(*const c_char, *const c_char) -> c_int>,
+    pub customize_item: Unused,
+}
+
 /// A zeroed struct with `data_size` set per `RIME_STRUCT_INIT`.
 ///
 /// # Safety
@@ -265,6 +326,13 @@ mod tests {
         assert_eq!(offset_of!(RimeApi, get_input), 8 + 69 * 8);
         assert_eq!(offset_of!(RimeApi, set_input), 8 + 89 * 8);
         assert_eq!(offset_of!(RimeApi, change_page), 8 + 97 * 8);
+        assert_eq!(offset_of!(RimeApi, find_module), 8 + 49 * 8);
+        assert_eq!(size_of::<RimeModule>(), 8 + 4 * 8);
+        // data_size + 32 function pointers
+        assert_eq!(size_of::<RimeLeversApi>(), 8 + 32 * 8);
+        assert_eq!(offset_of!(RimeLeversApi, user_dict_iterator_init), 8 + 24 * 8);
+        assert_eq!(offset_of!(RimeLeversApi, export_user_dict), 8 + 29 * 8);
+        assert_eq!(offset_of!(RimeLeversApi, customize_item), 8 + 31 * 8);
     }
 
     #[test]

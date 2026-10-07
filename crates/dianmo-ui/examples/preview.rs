@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont as _};
 use dianmo_core::{Action, Candidate, Schema, Snapshot};
 use dianmo_ui::settings::{
-    EngineStatus, LayoutChoice, Level, OnboardingView, Page, SettingsModel, SettingsView, Status, UpdateState,
-    VoiceEngines,
+    CandidateSize, EngineStatus, LayoutChoice, Level, OnboardingView, Page, SettingsModel, SettingsView, ShuangpinScheme,
+    Status, UpdateState, VoiceEngines,
 };
 use dianmo_ui::{
     Align, Canvas, ClipItem, Color, Font, InputState, KeyboardConfig, KeyboardView, PointerEvent, PointerPhase, Rect,
@@ -790,6 +790,34 @@ fn main() {
     s.tap("clipclose");
     s.tap("select");
     s.render(&fonts, &out, "53-portrait-select-bar");
+
+    // v0.2 settings (TODO #38): 候选字号, 双拼方案, 全角标点.
+    let mut s = Scene::new(light, w, state(true, Schema::Pinyin, "ni hao", NIHAO));
+    s.view.set_candidate_size(CandidateSize::ExtraLarge);
+    s.render(&fonts, &out, "60-wide-candidates-xlarge");
+    s.tap("expand");
+    s.render(&fonts, &out, "61-wide-candidate-grid-xlarge");
+    let mut s = Scene::new(light, 960.0, state(true, Schema::Pinyin, "ni hao", NIHAO));
+    s.view.set_candidate_size(CandidateSize::Large);
+    s.render(&fonts, &out, "62-portrait-candidates-large");
+    let mut s = Scene::new(light, w, state(true, Schema::Pinyin, "ni hao", NIHAO));
+    s.view.set_candidate_size(CandidateSize::Small);
+    s.render(&fonts, &out, "63-wide-candidates-small");
+    for (scheme, name) in [
+        (ShuangpinScheme::Ziranma, "64-wide-shuangpin-ziranma"),
+        (ShuangpinScheme::Microsoft, "65-wide-shuangpin-mspy"),
+        (ShuangpinScheme::Sogou, "66-wide-shuangpin-sogou"),
+    ] {
+        let mut s = Scene::new(light, w, state(true, Schema::Shuangpin, "", &[]));
+        s.view.set_shuangpin(scheme);
+        s.render(&fonts, &out, name);
+    }
+    let mut s = Scene::new(light, 960.0, state(true, Schema::Shuangpin, "", &[]));
+    s.view.set_shuangpin(ShuangpinScheme::Microsoft);
+    s.render(&fonts, &out, "67-portrait-shuangpin-mspy");
+    let mut s = Scene::new(light, w, state(true, Schema::Pinyin, "", &[]));
+    s.view.set_full_width_punct(false);
+    s.render(&fonts, &out, "68-wide-half-width-punct");
 }
 
 
@@ -811,6 +839,9 @@ fn demo_model() -> SettingsModel {
         admin_task: Status::ok("已注册，管理员窗口里也能打字"),
         dictionary: Status::ok("雾凇拼音 2026.09 · 已加载 · 约 50 万词"),
         user_words: Some(1284),
+        key_sound: true,
+        fuzzy_supported: true,
+        fuzzy: [false, false, false, true, false, false, true],
         engines: VoiceEngines {
             wetype: EngineStatus {
                 available: true,
@@ -866,6 +897,15 @@ fn settings_scenes(fonts: &Fonts, out: &Path) {
         v.wheel(600.0, 400.0, 10000.0);
         render_view(&mut v, w, h, fonts, out, name);
     }
+
+    // 模糊音 being applied, a user dictionary export finished.
+    let mut m = demo_model();
+    m.fuzzy_status = Status::new(Level::Unknown, "正在应用模糊音…（约半分钟）");
+    m.user_dict_status = Status::ok("已导出 1284 个词");
+    m.shuangpin = ShuangpinScheme::Microsoft;
+    let mut v = page(Page::Input, light, m);
+    v.wheel(600.0, 400.0, 150.0);
+    render_view(&mut v, w, h, fonts, out, "settings-input-applying");
 
     // States: admin task missing (fix button), inline confirmation, update available, download.
     let mut m = demo_model();

@@ -21,8 +21,8 @@ pub fn build_date() -> &'static str {
 }
 
 /// Settings that are saved but only take effect in a later version (shown with a
-/// 「下个版本生效」 tag). Row keys of dianmo-ui's settings pages.
-pub const COMING_SOON: [&str; 3] = ["candidate_size", "space_first", "full_width"];
+/// 「下个版本生效」 tag). Row keys of dianmo-ui's settings pages. None in 0.2.
+pub const COMING_SOON: [&str; 0] = [];
 
 /// Where to get a missing voice engine.
 pub const WETYPE_URL: &str = "https://z.weixin.qq.com/";
@@ -40,6 +40,14 @@ pub struct SysState {
     pub clip_count: usize,
     pub pinned_clips: Vec<ClipItem>,
     pub update: UpdateState,
+    /// 模糊音 can be applied (librime is running).
+    pub fuzzy_supported: bool,
+    /// Applying 模糊音 / its failure (empty: nothing to say).
+    pub fuzzy_status: Status,
+    /// Words in the user dictionary (`None` = not counted).
+    pub user_words: Option<u32>,
+    /// Import / export / clear of the user dictionary in progress or done.
+    pub user_dict_status: Status,
 }
 
 pub fn layout_choice(s: &Settings) -> LayoutChoice {
@@ -98,6 +106,8 @@ pub fn model(s: &Settings, sys: &SysState) -> SettingsModel {
         edit_area: s.edit_area,
         key_popup: s.key_popup,
         key_sound: s.key_sound,
+        key_sound_volume: s.key_sound_volume,
+        key_sound_style: s.key_sound_style,
         long_press: s.long_press,
         ball: s.show_ball,
         ball_side: if s.ball.is_some_and(|(right, _)| right) { Side::Right } else { Side::Left },
@@ -105,10 +115,12 @@ pub fn model(s: &Settings, sys: &SysState) -> SettingsModel {
         full_width_punct: s.full_width_punct,
         space_commits_first: s.space_commits_first,
         fuzzy: s.fuzzy,
-        fuzzy_supported: false,
+        fuzzy_supported: sys.fuzzy_supported,
+        fuzzy_status: sys.fuzzy_status.clone(),
         shuangpin: s.shuangpin,
         dictionary: sys.dictionary.clone(),
-        user_words: None,
+        user_words: sys.user_words,
+        user_dict_status: sys.user_dict_status.clone(),
         voice_engine: voice_choice(&s.voice_engine),
         engines: sys.engines.clone(),
         doubao_exe: s.voice_doubao_exe.clone(),
@@ -152,6 +164,8 @@ pub fn apply(s: &mut Settings, a: &SettingsAction) -> bool {
         A::SetEditArea(v) => set(&mut s.edit_area, *v),
         A::SetKeyPopup(v) => set(&mut s.key_popup, *v),
         A::SetKeySound(v) => set(&mut s.key_sound, *v),
+        A::SetKeySoundVolume(v) => set(&mut s.key_sound_volume, *v),
+        A::SetKeySoundStyle(v) => set(&mut s.key_sound_style, *v),
         A::SetLongPress(v) => set(&mut s.long_press, *v),
         A::SetBall(v) => set(&mut s.show_ball, *v),
         A::SetBallSide(side) => {
@@ -211,7 +225,7 @@ pub fn engine_status(e: VoiceEngineChoice, check: Option<Option<&str>>) -> Engin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dianmo_ui::settings::{CandidateSize, FuzzyPair, InputMode, LongPress};
+    use dianmo_ui::settings::{CandidateSize, FuzzyPair, InputMode, KeySoundStyle, KeySoundVolume, LongPress, ShuangpinScheme};
 
     #[test]
     fn model_reflects_settings_and_system() {
@@ -235,7 +249,7 @@ mod tests {
         assert_eq!(m.clip_count, 7);
         assert_eq!(m.admin_task, Status::ok("x"));
         assert_eq!(m.version, VERSION);
-        assert!(m.coming_soon.iter().any(|k| k == "candidate_size"));
+        assert!(m.coming_soon.is_empty(), "everything takes effect in 0.2");
         let english = Settings { chinese: false, ..s };
         assert_eq!(model(&english, &sys).layout, LayoutChoice::English);
         assert_eq!(model(&Settings::default(), &sys).ball_side, Side::Left, "the ball starts on the left");
@@ -264,6 +278,9 @@ mod tests {
             A::SetKeyboardHeight(1.25),
             A::SetEditArea(false),
             A::SetKeyPopup(false),
+            A::SetKeySound(true),
+            A::SetKeySoundVolume(KeySoundVolume::Low),
+            A::SetKeySoundStyle(KeySoundStyle::Soft),
             A::SetLongPress(LongPress::Short),
             A::SetBall(false),
             A::SetBallSide(Side::Right),
@@ -271,6 +288,7 @@ mod tests {
             A::SetFullWidthPunct(false),
             A::SetSpaceCommitsFirst(false),
             A::SetFuzzy(FuzzyPair::NL, true),
+            A::SetShuangpin(ShuangpinScheme::Ziranma),
             A::SetClipHistory(false),
             A::SetClipLimit(100),
             A::SetClipSkipPasswords(false),

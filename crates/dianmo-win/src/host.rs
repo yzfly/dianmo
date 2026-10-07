@@ -65,6 +65,9 @@ const CMD_APPBAR_TOGGLE: usize = 7;
 const CMD_REPAINT: usize = 8;
 /// Drop app windows destroyed while the host was busy (`window::reap`).
 const CMD_REAP: usize = 9;
+/// [`HostProxy::set_tray_badge`].
+const CMD_TRAY_BADGE_ON: usize = 10;
+const CMD_TRAY_BADGE_OFF: usize = 11;
 
 const TIMER_ID: usize = 1;
 /// Fires once the keyboard has been hidden for [`TRIM_AFTER_MS`]: the renderer's device and
@@ -221,6 +224,8 @@ pub(crate) struct Requests {
     ball_enabled: Option<bool>,
     /// Applied by `Host::process` itself (no window operations involved).
     tray_menu: Option<Vec<TrayItem>>,
+    /// Also applied by `Host::process` itself.
+    tray_badge: Option<bool>,
     keyboard_updates: Vec<ViewUpdate>,
     window_updates: Vec<(WindowId, ViewUpdate)>,
     /// App windows (applied outside the borrow, in this order).
@@ -303,6 +308,13 @@ impl HostControl {
     /// Replaces the app's tray menu items (shown above the built-in ones).
     pub fn set_tray_menu(&mut self, items: Vec<TrayItem>) {
         self.req.tray_menu = Some(items);
+    }
+
+    /// Shows (`true`) or removes the red dot in the tray icon's top-right corner, e.g. while a
+    /// new version is available. The state survives DPI changes and Explorer restarts; no effect
+    /// without a tray icon ([`HostOptions::tray`]).
+    pub fn set_tray_badge(&mut self, on: bool) {
+        self.req.tray_badge = Some(on);
     }
 
     /// A full-screen app (video, game, F11 browser, slideshow) is in the foreground, as reported
@@ -436,6 +448,11 @@ impl HostProxy {
 
     pub fn quit(&self) -> bool {
         self.cmd(CMD_QUIT)
+    }
+
+    /// [`HostControl::set_tray_badge`] from any thread (e.g. an update check).
+    pub fn set_tray_badge(&self, on: bool) -> bool {
+        self.cmd(if on { CMD_TRAY_BADGE_ON } else { CMD_TRAY_BADGE_OFF })
     }
 
     /// The keyboard window handle (e.g. to exclude it from focus tracking).
@@ -671,6 +688,12 @@ impl Host {
         self.dpi as f32 / 96.0
     }
 
+    fn set_tray_badge(&mut self, on: bool) {
+        if let Some(t) = &mut self.tray {
+            t.set_badge(on);
+        }
+    }
+
     pub(crate) fn control(&self) -> HostControl {
         HostControl {
             visible: self.visible,
@@ -716,6 +739,9 @@ impl Host {
         }
         if let Some(menu) = ctl.req.tray_menu.take() {
             self.tray_menu = menu;
+        }
+        if let Some(on) = ctl.req.tray_badge.take() {
+            self.set_tray_badge(on);
         }
         ctl.req
     }
@@ -1177,6 +1203,9 @@ fn command(hwnd: HWND, cmd: usize) {
             let _ = InvalidateRect(Some(hwnd), None, false);
         },
         CMD_REAP => window::reap(),
+        CMD_TRAY_BADGE_ON | CMD_TRAY_BADGE_OFF => {
+            with(|h| h.set_tray_badge(cmd == CMD_TRAY_BADGE_ON));
+        }
         _ => {}
     }
 }

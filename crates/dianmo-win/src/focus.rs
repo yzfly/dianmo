@@ -46,7 +46,7 @@ use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId}
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VariantClear};
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationElement,
+    CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationElement, IUIAutomationTreeWalker,
     IUIAutomationFocusChangedEventHandler, IUIAutomationFocusChangedEventHandler_Impl, IUIAutomationTextPattern,
     UIA_AriaRolePropertyId, UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_CONTROLTYPE_ID,
     UIA_ClassNamePropertyId, UIA_ComboBoxControlTypeId, UIA_ControlTypePropertyId, UIA_CustomControlTypeId,
@@ -488,6 +488,17 @@ impl Shared {
             Some(kind) => FocusEvent::Editable { kind, by_touch },
             None => FocusEvent::NotEditable { by_touch },
         };
+        // Chromium/Electron editors (VS Code's `native-edit-context`) report an empty rect: use the
+        // nearest ancestor with a real one, so a tap into the already-focused editor re-shows us.
+        let field_rect = match console {
+            Some(rc) => rc,
+            None if kind.is_some() && is_empty(&p.rect) => {
+                let rc = ancestor_rect(el).unwrap_or(p.rect);
+                self.log(format_args!("empty field rect, using ancestor ({},{})-({},{})", rc.left, rc.top, rc.right, rc.bottom));
+                rc
+            }
+            None => p.rect,
+        };
         let id = runtime_id(el);
         let seq = TOUCH_SEQ.load(Ordering::Relaxed);
         {
@@ -502,7 +513,7 @@ impl Shared {
             st.last_id = id;
             st.last = Some(ev);
             st.last_seq = seq;
-            st.field = kind.map(|k| (console.unwrap_or(p.rect), k));
+            st.field = kind.map(|k| (field_rect, k));
             st.taskbar = (kind.is_none() && is_taskbar_class(&p.class)).then_some(p.rect);
         }
         if self.log.is_some() {
@@ -760,6 +771,34 @@ fn win_class(hwnd: HWND) -> String {
 
 /// Whether the element's caret (first selection range) is in writable text. `None` when it
 /// can't tell (no text pattern, attribute not supported). No selection → not editable.
+fn is_empty(rc: &RECT) -> bool {
+    rc.right <= rc.left || rc.bottom <= rc.top
+}
+
+/// Bounding rect of the nearest ancestor (control view) that has a non-empty one.
+fn ancestor_rect(el: &IUIAutomationElement) -> Option<RECT> {
+    thread_local! {
+        static WALKER: std::cell::RefCell<Option<IUIAutomationTreeWalker>> = const { std::cell::RefCell::new(None) };
+    }
+    WALKER.with(|cell| unsafe {
+        let mut cell = cell.borrow_mut();
+        if cell.is_none() {
+            let uia: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+            *cell = uia.ControlViewWalker().ok();
+        }
+        let walker = cell.as_ref()?;
+        let mut cur = el.clone();
+        for _ in 0..8 {
+            cur = walker.GetParentElement(&cur).ok()?;
+            let rc = cur.CurrentBoundingRectangle().ok()?;
+            if !is_empty(&rc) {
+                return Some(rc);
+            }
+        }
+        None
+    })
+}
+
 fn caret_writable(el: &IUIAutomationElement) -> Option<bool> {
     unsafe {
         let tp: IUIAutomationTextPattern = el.GetCurrentPatternAs(UIA_TextPatternId).ok()?;

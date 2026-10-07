@@ -26,8 +26,10 @@ use crate::log;
 use crate::platform;
 use crate::prefs;
 use crate::settings::Settings;
+use crate::sound::KeySound;
 use crate::voice::{Voice, VoiceEngine, VoiceState};
 
+mod rime_ui;
 mod settings_ui;
 
 /// The floating ball shows while the keyboard is hidden: the 显示悬浮球 setting, and always in
@@ -94,6 +96,25 @@ pub struct DianmoApp {
     release: Option<crate::update::Release>,
     /// Windows apps use the dark theme (for 主题「跟随系统」).
     system_dark: bool,
+    /// 按键音: the audio thread, only while the setting is on (`sound.rs`).
+    sound: Option<KeySound>,
+    /// librime options (user directory, 双拼方案) for 模糊音 and engine reloads (`rime_ui.rs`).
+    #[cfg(feature = "rime")]
+    rime_options: Option<dianmo_rime::Options>,
+    /// The engine is away on a job thread (`rime_ui.rs`).
+    #[cfg(feature = "rime")]
+    rime_busy: bool,
+    #[cfg(feature = "rime")]
+    rime_jobs: std::collections::VecDeque<rime_ui::RimeJob>,
+    /// `dianmo.exe --deploy-user` is running; `fuzzy_again`: 模糊音 changed meanwhile.
+    #[cfg(feature = "rime")]
+    fuzzy_deploying: bool,
+    #[cfg(feature = "rime")]
+    fuzzy_again: bool,
+    /// What the settings page says about 模糊音 and the user dictionary.
+    fuzzy_status: Status,
+    user_words: Option<u32>,
+    user_dict_status: Status,
 }
 
 const ENGINES: usize = VoiceEngine::ALL.len();
@@ -174,9 +195,20 @@ impl DianmoApp {
     /// `rime`: librime options to start in the background (the window comes up with the stand-in
     /// engine first; librime takes 150–700 ms to start), or why it can't be used.
     pub fn new(engine: AnyEngine, rime: RimeSetup, settings: Settings, settings_path: PathBuf) -> Self {
+        #[cfg(feature = "rime")]
+        let rime = match rime {
+            RimeSetup::Start(mut o) => {
+                o.shuangpin = rime_ui::rime_scheme(settings.shuangpin);
+                RimeSetup::Start(o)
+            }
+            other => other,
+        };
         // The data directory (`--instance` aware): clips.txt lives next to settings.ini.
         let clips_path = settings_path.with_file_name("clips.txt");
         let mut ctl = InputController::new(engine, SendInputSink::new());
+        ctl.set_space_commits_first(settings.space_commits_first);
+        ctl.set_full_width_punct(settings.full_width_punct);
+        ctl.set_semicolon_input(settings.shuangpin.uses_semicolon());
         ctl.handle(Action::SetSchema(settings.schema));
         if !settings.chinese {
             ctl.handle(Action::ToggleChinese);
@@ -229,6 +261,20 @@ impl DianmoApp {
             update: UpdateState::Unknown,
             release: None,
             system_dark: dianmo_win::system_dark_mode(),
+            sound: None,
+            #[cfg(feature = "rime")]
+            rime_options: None,
+            #[cfg(feature = "rime")]
+            rime_busy: false,
+            #[cfg(feature = "rime")]
+            rime_jobs: Default::default(),
+            #[cfg(feature = "rime")]
+            fuzzy_deploying: false,
+            #[cfg(feature = "rime")]
+            fuzzy_again: false,
+            fuzzy_status: Status::default(),
+            user_words: None,
+            user_dict_status: Status::default(),
         }
     }
 
@@ -405,12 +451,20 @@ impl DianmoApp {
     #[cfg(feature = "rime")]
     fn start_rime(&mut self, host: &mut HostControl) {
         let Some(opts) = self.rime_opts.take() else { return };
+        self.rime_options = Some(opts.clone());
         let schema = self.ctl.schema();
         let proxy = host.proxy();
+        let fuzzy = self.settings.fuzzy;
         let spawned = std::thread::Builder::new().name("dianmo-rime-start".into()).spawn(move || {
             // Let the window come up first: loading rime.dll holds the loader lock, which would
             // stall the UI thread's Direct2D/DirectWrite DLL loads.
             std::thread::sleep(std::time::Duration::from_millis(RIME_START_DELAY_MS));
+            // 模糊音: settings.ini is the source of truth; write the customization before
+            // librime starts so that a matching user build is used right away (a missing one is
+            // deployed after the start, `apply_fuzzy`).
+            if let Err(e) = dianmo_rime::set_fuzzy(&opts, fuzzy) {
+                log!("fuzzy: writing the customization failed: {e}");
+            }
             let t = Instant::now();
             let r = dianmo_rime::RimeEngine::start(&opts, schema);
             proxy.post(RimeReady(r, t.elapsed().as_millis()));
@@ -448,7 +502,9 @@ impl DianmoApp {
         if self.ctl.is_composing() {
             return Response::none();
         }
-        let Some(engine) = self.pending_rime.take() else { return Response::none() };
+        let Some(mut engine) = self.pending_rime.take() else { return Response::none() };
+        // The 双拼方案 may have changed while the engine was starting or away on a job.
+        engine.set_shuangpin(rime_ui::rime_scheme(self.settings.shuangpin));
         let schema = self.ctl.schema();
         let needs_schema = engine.schema() != schema;
         *self.ctl.engine_mut() = AnyEngine::Rime(engine);
@@ -483,7 +539,11 @@ impl App for DianmoApp {
             kv.set_voice_mode(self.voice_mode());
             kv.set_key_popup(self.settings.key_popup);
             kv.set_long_press_ms(self.settings.long_press.millis());
+            kv.set_candidate_size(self.settings.candidate_size);
+            kv.set_full_width_punct(self.settings.full_width_punct);
+            kv.set_shuangpin(self.settings.shuangpin);
         }
+        self.apply_key_sound(view);
         self.clips.set_limit(self.settings.clip_limit as usize);
         if let Some(kv) = view.as_any_mut().and_then(|a| a.downcast_mut::<KeyboardView>()) {
             kv.set_clips(self.clips.items().to_vec());
@@ -510,7 +570,16 @@ impl App for DianmoApp {
     }
 
     fn on_action(&mut self, action: UiAction, view: &mut dyn View, host: &mut HostControl) -> Response {
+        if let UiAction::KeyClick(click) = action {
+            // Every key press with 按键音 on: just wake the audio thread.
+            if let Some(s) = &self.sound {
+                s.play(click);
+            }
+            return Response::none();
+        }
         let r = self.action(action, view, host);
+        #[cfg(feature = "rime")]
+        self.next_rime_job(host);
         self.refresh_tray(host);
         self.sync_windows(host);
         if keymap_wanted() && host.is_visible() {
@@ -521,6 +590,8 @@ impl App for DianmoApp {
 
     fn on_event(&mut self, event: Box<dyn Any + Send>, view: &mut dyn View, host: &mut HostControl) -> Response {
         let r = self.event(event, view, host);
+        #[cfg(feature = "rime")]
+        self.next_rime_job(host);
         self.refresh_tray(host);
         self.sync_windows(host);
         if keymap_wanted() && host.is_visible() {
@@ -834,7 +905,17 @@ impl DianmoApp {
         }
         #[cfg(feature = "rime")]
         let event = match event.downcast::<RimeReady>() {
-            Ok(ready) => return self.on_rime_ready(*ready, view),
+            Ok(ready) => {
+                let r = self.on_rime_ready(*ready, view);
+                // 模糊音: a customization without a matching user build (first start after an
+                // update, or changed while 点墨 was not running) is built now.
+                self.apply_fuzzy(host);
+                return r;
+            }
+            Err(e) => e,
+        };
+        let event = match self.rime_event(event, view, host) {
+            Ok(r) => return r,
             Err(e) => e,
         };
         if let Some(h) = event.downcast_ref::<HideLater>() {
@@ -889,6 +970,8 @@ impl DianmoApp {
             }
             // Only app windows send these (`on_window_action`).
             UiAction::Settings(_) => Response::none(),
+            // Handled in `on_action`.
+            UiAction::KeyClick(_) => Response::none(),
             UiAction::Paste(text) => self.paste(text, view),
             UiAction::PinClip { id, pinned } => {
                 if self.clips.pin(id, pinned) {
@@ -951,6 +1034,7 @@ fn dump_keymap(view: &mut dyn View) {
 
 impl Drop for DianmoApp {
     fn drop(&mut self) {
+        self.sound = None;
         if self.voice.state().is_active() {
             // Don't leave the engine listening after 点墨 is gone.
             self.voice.cancel();
@@ -1012,7 +1096,7 @@ impl DianmoApp {
         let keyboard = self.settings.input_mode != InputMode::PcKeyboard;
         let layouts = [
             (tray_id::PINYIN, "全拼", LayoutChoice::Pinyin),
-            (tray_id::SHUANGPIN, "小鹤双拼", LayoutChoice::Shuangpin),
+            (tray_id::SHUANGPIN, self.settings.shuangpin.name(), LayoutChoice::Shuangpin),
             (tray_id::T9, "九宫格", LayoutChoice::T9),
             (tray_id::ENGLISH, "English", LayoutChoice::English),
         ]
@@ -1164,6 +1248,8 @@ impl DianmoApp {
                 Response::none()
             }
             tray_id::ABOUT => {
+                // The new version has been seen: the tray icon's red dot goes.
+                host.set_tray_badge(false);
                 self.open_settings(Some(Page::About), host);
                 Response::none()
             }

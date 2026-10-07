@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "dianmo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dianmo-core",
  "dianmo-rime",
@@ -76,11 +76,11 @@ dependencies = [
 
 [[package]]
 name = "dianmo-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "dianmo-rime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dianmo-core",
  "windows",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "dianmo-setup"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "miniz_oxide 0.8.9",
  "windows",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "dianmo-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "dianmo-core",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "dianmo-win"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dianmo-core",
  "dianmo-ui",

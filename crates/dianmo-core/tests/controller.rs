@@ -248,3 +248,70 @@ fn chords_commit_composition_first() {
     assert_eq!(log(&mut c), ["你", "<Shift↓>", "<Char('a')↓>", "<Char('a')↑>", "<Shift↑>"]);
     assert!(!KeyChord::key(KeyCode::F(1)).has_modifier());
 }
+
+#[test]
+fn space_without_commit_first_types_the_raw_input_and_a_space() {
+    let mut c = controller();
+    assert!(c.space_commits_first(), "default on");
+    c.set_space_commits_first(false);
+    type_str(&mut c, "nihao");
+    c.handle(Action::Space);
+    assert_eq!(log(&mut c), ["nihao", " "]);
+    assert!(!c.is_composing());
+    // Idle: a plain space either way.
+    c.handle(Action::Space);
+    assert_eq!(log(&mut c), ["nihao", " ", " "]);
+    // Back on: the first candidate.
+    c.set_space_commits_first(true);
+    type_str(&mut c, "ni");
+    c.handle(Action::Space);
+    assert_eq!(log(&mut c).last().map(String::as_str), Some("你"));
+}
+
+#[test]
+fn full_width_punctuation_follows_the_setting() {
+    let mut c = controller();
+    assert!(c.full_width_punct(), "default on");
+    type_str(&mut c, "hao");
+    c.handle(Action::Char(','));
+    c.handle(Action::Char('.'));
+    c.handle(Action::Char('"'));
+    assert_eq!(log(&mut c), ["好", "，", "。", "\""], "quotes are left alone");
+    c.set_full_width_punct(false);
+    c.handle(Action::Char(','));
+    // Text keys (the keyboard's own punctuation, the symbol panel) are never converted.
+    c.handle(Action::Text("，".into()));
+    assert_eq!(log(&mut c)[4..], [",", "，"]);
+    // English mode: always ASCII.
+    c.set_full_width_punct(true);
+    c.handle(Action::ToggleChinese);
+    c.handle(Action::Char('?'));
+    assert_eq!(log(&mut c).last().map(String::as_str), Some("?"));
+    assert_eq!(dianmo_core::full_width('\\'), Some("、"));
+    assert_eq!(dianmo_core::full_width('a'), None);
+}
+
+#[test]
+fn semicolon_is_a_final_only_where_the_scheme_says_so() {
+    let mut c = controller();
+    c.handle(Action::SetSchema(Schema::Shuangpin));
+    c.handle(Action::Char('x'));
+    c.handle(Action::Text("；".into()));
+    // Off (小鹤 / 自然码): punctuation, the composition is committed first.
+    assert_eq!(log(&mut c), ["x", "；"]);
+    c.set_semicolon_input(true);
+    c.handle(Action::Char('x'));
+    c.handle(Action::Text("；".into()));
+    assert_eq!(c.state().preedit, "x;", "微软 / 搜狗: x; = xing");
+    c.handle(Action::Char(';'));
+    assert_eq!(c.state().preedit, "x;;");
+    c.handle(Action::ClearComposition);
+    // Not composing: still punctuation.
+    c.handle(Action::Text("；".into()));
+    assert_eq!(log(&mut c).last().map(String::as_str), Some("；"));
+    // 全拼 never takes it.
+    c.handle(Action::SetSchema(Schema::Pinyin));
+    type_str(&mut c, "ni");
+    c.handle(Action::Text("；".into()));
+    assert!(!c.is_composing());
+}

@@ -491,3 +491,68 @@ fn voice_page_lists_four_engines_without_fallback() {
     }
     assert!(!keys.iter().any(|k| k == "voice_fallback"), "no Win+H fallback (TODO #37)");
 }
+
+#[test]
+fn key_sound_rows_follow_the_switch() {
+    let mut t = T::new(960.0, 680.0);
+    t.v.set_page(Page::Keyboard);
+    assert!(!t.v.scroll_into_view("key_sound_volume/大"), "volume is disabled while the sound is off");
+    t.tap("key_sound");
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetKeySound(true)]);
+    t.run_timers();
+    t.tap("key_sound_volume/大");
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetKeySoundVolume(KeySoundVolume::High)]);
+    t.tap("key_sound_style/柔和");
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetKeySoundStyle(KeySoundStyle::Soft)]);
+    let m = t.v.model();
+    assert!(m.key_sound && m.key_sound_volume == KeySoundVolume::High && m.key_sound_style == KeySoundStyle::Soft);
+}
+
+#[test]
+fn input_page_offers_four_shuangpin_schemes_and_no_coming_soon_tags() {
+    let mut t = T::new(960.0, 680.0);
+    t.v.set_page(Page::Input);
+    for s in ShuangpinScheme::ALL {
+        t.tap(&format!("shuangpin/{}", s.short()));
+        assert_eq!(t.take_actions(), vec![SettingsAction::SetShuangpin(s)], "{s:?}");
+    }
+    assert_eq!(t.v.model().shuangpin, ShuangpinScheme::Sogou);
+    let model = SettingsModel { fuzzy_supported: true, ..SettingsModel::default() };
+    let blocks = pages::build(Page::Input, &model);
+    let tagged: Vec<String> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Group { rows, .. } => Some(rows.iter().filter(|r| r.tag.is_some()).map(|r| r.key.clone())),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(tagged.is_empty(), "{tagged:?}");
+}
+
+#[test]
+fn fuzzy_and_user_dict_show_progress() {
+    let mut t = T::new(960.0, 680.0);
+    t.v.set_page(Page::Input);
+    let busy = SettingsModel {
+        fuzzy_supported: true,
+        fuzzy_status: Status::new(Level::Unknown, "正在应用模糊音…"),
+        user_dict_status: Status::new(Level::Unknown, "正在导入…"),
+        ..SettingsModel::default()
+    };
+    t.v.set_model(busy);
+    assert!(!t.v.scroll_into_view("导入") && !t.v.scroll_into_view("导出"), "buttons wait for the running job");
+    let blocks = pages::build(Page::Input, t.v.model());
+    let status = |key: &str| {
+        blocks.iter().find_map(|b| match b {
+            Block::Group { rows, .. } => rows.iter().find(|r| r.key == key).and_then(|r| r.status.clone()),
+            _ => None,
+        })
+    };
+    assert_eq!(status("fuzzy").map(|s| s.text).as_deref(), Some("正在应用模糊音…"));
+    assert_eq!(status("user_dict").map(|s| s.text).as_deref(), Some("正在导入…"));
+    // Done: the buttons work again.
+    t.v.set_model(SettingsModel { user_dict_status: Status::ok("已导入 12 个词"), ..t.v.model().clone() });
+    t.tap("导出");
+    assert_eq!(t.take_actions(), vec![SettingsAction::ExportUserDict]);
+}

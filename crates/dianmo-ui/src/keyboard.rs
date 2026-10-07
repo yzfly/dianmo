@@ -24,8 +24,9 @@ use crate::layout::{
     self, BuildCtx, ColumnKind, Key, KeyAction, Latch, Layout, Metrics, Modifier, Mods, SelAct, SymTab, Tone,
 };
 use crate::scroll::{FRAME_MS, Scroller, VelocityTracker};
+use crate::settings::{CandidateSize, ShuangpinScheme};
 use crate::theme::{Theme, ThemeKind};
-use crate::view::{ClipItem, InputState, PointerEvent, PointerPhase, Response, UiAction, View};
+use crate::view::{ClipItem, InputState, KeyClick, PointerEvent, PointerPhase, Response, UiAction, View};
 
 pub(crate) const LONG_PRESS_MS: u64 = 350;
 /// Holding the space bar this long turns the keyboard into a trackpad.
@@ -223,6 +224,14 @@ pub struct KeyboardView {
     pub(crate) key_popup: bool,
     /// Long-press delay in ms (user setting).
     pub(crate) long_ms: u64,
+    /// 按键音 (user setting): key presses send [`UiAction::KeyClick`].
+    pub(crate) key_sound: bool,
+    /// 中文时用全角标点 (user setting): Chinese punctuation keys are full-width.
+    pub(crate) full_width_punct: bool,
+    /// 候选字号 (user setting).
+    pub(crate) cand_size: CandidateSize,
+    /// 双拼方案 (user setting): key-face finals and the `；` key.
+    pub(crate) shuangpin: ShuangpinScheme,
 }
 
 impl Default for KeyboardView {
@@ -279,6 +288,10 @@ impl KeyboardView {
             voice_mode: false,
             key_popup: true,
             long_ms: LONG_PRESS_MS,
+            key_sound: false,
+            full_width_punct: true,
+            cand_size: CandidateSize::Standard,
+            shuangpin: ShuangpinScheme::Xiaohe,
         };
         v.rebuild();
         v
@@ -307,6 +320,60 @@ impl KeyboardView {
 
     pub fn long_press_ms(&self) -> u64 {
         self.long_ms
+    }
+
+    /// 按键音: each key press also sends [`UiAction::KeyClick`] (first in the response, so the
+    /// host can start the sound before doing the work). Returns whether it changed.
+    pub fn set_key_sound(&mut self, on: bool) -> bool {
+        std::mem::replace(&mut self.key_sound, on) != on
+    }
+
+    pub fn key_sound(&self) -> bool {
+        self.key_sound
+    }
+
+    /// 中文时用全角标点: off = the Chinese layouts show ASCII punctuation (, . ? …). Returns
+    /// whether it changed (repaint).
+    pub fn set_full_width_punct(&mut self, on: bool) -> bool {
+        let changed = std::mem::replace(&mut self.full_width_punct, on) != on;
+        if changed {
+            self.rebuild();
+        }
+        changed
+    }
+
+    pub fn full_width_punct(&self) -> bool {
+        self.full_width_punct
+    }
+
+    /// 候选字号: candidate text size in the bar and the expanded grid. Returns whether it
+    /// changed (repaint).
+    pub fn set_candidate_size(&mut self, size: CandidateSize) -> bool {
+        let changed = std::mem::replace(&mut self.cand_size, size) != size;
+        if changed {
+            // Re-measure the candidates with the new size.
+            self.cand_ver += 1;
+            self.ensure_cand_layout_estimated();
+        }
+        changed
+    }
+
+    pub fn candidate_size(&self) -> CandidateSize {
+        self.cand_size
+    }
+
+    /// 双拼方案: the finals under the letters, the `；` key of 微软 / 搜狗, the layout's name.
+    /// Returns whether it changed (repaint).
+    pub fn set_shuangpin(&mut self, scheme: ShuangpinScheme) -> bool {
+        let changed = std::mem::replace(&mut self.shuangpin, scheme) != scheme;
+        if changed {
+            self.rebuild();
+        }
+        changed
+    }
+
+    pub fn shuangpin(&self) -> ShuangpinScheme {
+        self.shuangpin
     }
 
     /// Switches the colour theme. The caller repaints.
@@ -587,6 +654,8 @@ impl KeyboardView {
         let ctx = BuildCtx {
             layout: self.layout(),
             chinese: self.chinese,
+            zh_punct: self.chinese && self.full_width_punct,
+            sp: self.shuangpin,
             composing: self.composing(),
             mods: self.mods(),
             edit_area: self.edit_area,
@@ -599,7 +668,7 @@ impl KeyboardView {
             Panel::Numbers => layout::build_numbers(&self.m, &ctx),
             Panel::Symbols(tab) => layout::build_symbols(&self.m, tab),
             Panel::Candidates => layout::build_candidate_grid(&self.m),
-            Panel::Menu => layout::build_menu(&self.m, ctx.layout, self.theme_kind == ThemeKind::Dark, self.voice_mode),
+            Panel::Menu => layout::build_menu(&self.m, ctx.layout, self.shuangpin, self.theme_kind == ThemeKind::Dark, self.voice_mode),
             Panel::PcKeys => layout::build_pc_keys(&self.m, &ctx),
             Panel::Clipboard => layout::build_clipboard_panel(&self.m),
         };
@@ -773,12 +842,14 @@ impl KeyboardView {
     }
 
     pub(crate) fn cand_style(&self) -> TextStyle {
-        let size = if self.m.wide { 24.0 * self.bar_s() } else { 21.0 * self.m.s };
+        let size = if self.m.wide { 24.0 * self.bar_s() } else { 21.0 * self.m.s } * self.cand_size.scale();
         TextStyle { size, color: self.theme.text, align: crate::Align::Start, bold: false, font: crate::Font::Ui }
     }
 
     pub(crate) fn comment_style(&self) -> TextStyle {
-        let size = if self.m.wide { 14.0 * self.bar_s() } else { 12.5 * self.m.s };
+        // Comments grow half as much as the candidates.
+        let scale = 1.0 + (self.cand_size.scale() - 1.0) * 0.5;
+        let size = if self.m.wide { 14.0 * self.bar_s() } else { 12.5 * self.m.s } * scale;
         TextStyle { size, color: self.theme.text_faint, ..self.cand_style() }
     }
 
@@ -800,7 +871,10 @@ impl KeyboardView {
     pub(crate) fn column_items(&self) -> Vec<String> {
         match self.column {
             Some((_, ColumnKind::T9)) if self.composing() && !self.spellings.is_empty() => self.spellings.clone(),
-            Some((_, ColumnKind::T9)) => layout::T9_PUNCT.iter().map(|s| s.to_string()).collect(),
+            Some((_, ColumnKind::T9)) => {
+                let list = if self.chinese && self.full_width_punct { layout::T9_PUNCT } else { layout::T9_PUNCT_HALF };
+                list.iter().map(|s| s.to_string()).collect()
+            }
             Some((_, ColumnKind::Numbers)) => layout::NUM_COLUMN.iter().map(|s| s.to_string()).collect(),
             None => Vec::new(),
         }
@@ -977,6 +1051,12 @@ impl KeyboardView {
         }
         let target = self.hit(e.x, e.y);
         r.repaint = true;
+        if self.key_sound
+            && let Target::Key(k) = &target
+        {
+            // First, so the host starts the sound before the input work.
+            r.actions.push(UiAction::KeyClick(key_click(k)));
+        }
         if self.clip_menu.is_some() && !matches!(target, Target::ClipBtn { .. } | Target::ClipGrid(_)) {
             self.clip_menu = None;
         }
@@ -1598,6 +1678,16 @@ fn expand(r: Rect, dx: f32, dy: f32) -> Rect {
 }
 
 /// Text width estimate used before the first paint has measured real widths.
+/// Which 按键音 a key makes: character keys click, the others (space, delete, enter, shift …)
+/// thud.
+fn key_click(k: &Key) -> KeyClick {
+    match &k.action {
+        KeyAction::Letter(_) | KeyAction::Char(_) | KeyAction::Text(_) | KeyAction::T9One => KeyClick::Char,
+        KeyAction::Raw(KeyCode::Char(c)) if *c != ' ' => KeyClick::Char,
+        _ => KeyClick::Func,
+    }
+}
+
 pub(crate) fn estimate_width(text: &str, size: f32) -> f32 {
     text.chars()
         .map(|c| if c.is_ascii() { if c.is_ascii_uppercase() { 0.62 } else { 0.52 } } else { 1.0 })
