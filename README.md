@@ -353,6 +353,12 @@ cargo run -p dianmo-ui --example preview -- /tmp/dianmo-preview
 - 更多双拼方案（自然码、微软双拼等）
 - 安装包代码签名
 
+## 社区改动参考
+
+- [可选双击输入框唤起键盘](https://github.com/Enderlessss/dianmo-branch-doubleclickfeaturetest)：由 [@Enderlessss](https://github.com/Enderlessss) 在 [issue #1](https://github.com/yzfly/dianmo/issues/1) 分享。增加「单击 / 双击」设置，默认保持单击；双击模式要求同一输入框内两次触摸，键盘已经显示时仍可单击切换输入框。包含设置读写、焦点事件与双击判定的源码修改。
+
+这是独立的社区修改版本，尚未并入本仓库或官方安装包。作者报告已在自己的 Surface 上验证；维护者目前仅审阅了源码差异，未完成独立的 Windows / Surface 回归测试。该分支自述没有程序签名。
+
 ## 致谢
 
 点墨站在这些开源项目的肩膀上：
