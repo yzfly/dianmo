@@ -41,7 +41,7 @@ pub use clock::now_ms;
 #[cfg(windows)]
 pub use handle::{BallEdge, BallEvent, BallPos, BallState};
 #[cfg(windows)]
-pub use focus::{FieldKind, FocusEvent, FocusWatcher, start_focus_watcher};
+pub use focus::{FieldKind, FocusEvent, FocusWatcher, Tap, double_click_ms, start_focus_watcher};
 #[cfg(windows)]
 pub use host::{App, HostControl, HostOptions, HostProxy, enable_per_monitor_dpi, run, run_with};
 #[cfg(windows)]

@@ -12,7 +12,8 @@ use std::path::Path;
 
 use dianmo_core::Schema;
 use dianmo_ui::settings::{
-    CandidateSize, FuzzyPair, InputMode, KeySoundStyle, KeySoundVolume, LongPress, ShuangpinScheme, ThemeChoice,
+    AutoShowClick, CandidateSize, FuzzyPair, InputMode, KeySoundStyle, KeySoundVolume, LongPress, ShuangpinScheme,
+    ThemeChoice,
 };
 
 /// One registry DWORD as it was before Dianmo touched it (`None` = value absent).
@@ -34,6 +35,8 @@ pub struct Settings {
     pub height: f32,
     /// Pop up on touch in an edit field / hide when touching elsewhere.
     pub auto_show: bool,
+    /// 单击 / 双击 the field to pop up (双击 is harder to trigger by accident).
+    pub auto_show_click: AutoShowClick,
     /// Wide (landscape) layout: two-column edit area on the right (撤销、复制、粘贴 …).
     pub edit_area: bool,
     /// 键盘 / 语音球 (the floating ball starts/stops voice input; the keyboard doesn't pop up for
@@ -95,6 +98,7 @@ impl Default for Settings {
             autostart: false,
             height: 1.0,
             auto_show: true,
+            auto_show_click: AutoShowClick::Single,
             edit_area: true,
             input_mode: InputMode::Keyboard,
             voice_engine: "wetype".to_owned(),
@@ -159,6 +163,8 @@ fn fmt_saved(v: SavedDword) -> String {
 const THEMES: [(ThemeChoice, &str); 3] = [(ThemeChoice::System, "system"), (ThemeChoice::Light, "light"), (ThemeChoice::Dark, "dark")];
 const MODES: [(InputMode, &str); 3] =
     [(InputMode::Keyboard, "keyboard"), (InputMode::VoiceBall, "voice"), (InputMode::PcKeyboard, "pc")];
+const AUTO_SHOW_CLICKS: [(AutoShowClick, &str); 2] =
+    [(AutoShowClick::Single, "single"), (AutoShowClick::Double, "double")];
 const LONG_PRESS: [(LongPress, &str); 3] = [(LongPress::Short, "short"), (LongPress::Medium, "medium"), (LongPress::Long, "long")];
 const CANDIDATE_SIZES: [(CandidateSize, &str); 4] = [
     (CandidateSize::Small, "small"),
@@ -207,6 +213,7 @@ impl Settings {
                 "appbar" => s.appbar = parse_bool(v).unwrap_or(s.appbar),
                 "autostart" => s.autostart = parse_bool(v).unwrap_or(s.autostart),
                 "auto_show" => s.auto_show = parse_bool(v).unwrap_or(s.auto_show),
+                "auto_show_click" => s.auto_show_click = lookup(&AUTO_SHOW_CLICKS, v).unwrap_or(s.auto_show_click),
                 "edit_area" => s.edit_area = parse_bool(v).unwrap_or(s.edit_area),
                 "input_mode" => mode = lookup(&MODES, v),
                 "pc_keyboard" => pc_keyboard = parse_bool(v).unwrap_or(false),
@@ -290,6 +297,7 @@ impl Settings {
         let _ = writeln!(out, "appbar={}", self.appbar);
         let _ = writeln!(out, "autostart={}", self.autostart);
         let _ = writeln!(out, "auto_show={}", self.auto_show);
+        let _ = writeln!(out, "auto_show_click={}", name_of(&AUTO_SHOW_CLICKS, self.auto_show_click));
         let _ = writeln!(out, "edit_area={}", self.edit_area);
         let _ = writeln!(out, "input_mode={}", name_of(&MODES, self.input_mode));
         let _ = writeln!(out, "height={}", self.height);
@@ -373,6 +381,7 @@ mod tests {
             autostart: true,
             height: 1.25,
             auto_show: false,
+            auto_show_click: AutoShowClick::Double,
             edit_area: false,
             input_mode: InputMode::PcKeyboard,
             voice_engine: "doubao".to_owned(),
@@ -404,6 +413,10 @@ mod tests {
             let s = Settings { input_mode: mode, ..Settings::default() };
             assert_eq!(Settings::parse(&s.serialize()).input_mode, mode);
         }
+        for click in [AutoShowClick::Single, AutoShowClick::Double] {
+            let s = Settings { auto_show_click: click, ..Settings::default() };
+            assert_eq!(Settings::parse(&s.serialize()).auto_show_click, click);
+        }
     }
 
     #[test]
@@ -415,6 +428,10 @@ mod tests {
         assert_eq!(Settings::parse("theme=light").theme, ThemeChoice::Light);
         assert_eq!(s.height, 1.5);
         assert!(!s.chinese);
+        assert_eq!(s.auto_show_click, AutoShowClick::Single, "default: one tap");
+        assert_eq!(Settings::parse("auto_show_click=double").auto_show_click, AutoShowClick::Double);
+        assert_eq!(Settings::parse("auto_show_click=single").auto_show_click, AutoShowClick::Single);
+        assert_eq!(Settings::parse("auto_show_click=bogus").auto_show_click, AutoShowClick::Single);
         assert!(s.edit_area, "default on");
         assert!(!Settings::parse("edit_area=off").edit_area);
         assert_eq!(s.saved_tabtip, None);
@@ -450,6 +467,27 @@ mod tests {
         assert_eq!(Settings::parse("voice_mode=true\ninput_mode=pc").input_mode, InputMode::PcKeyboard, "new key wins");
         let text = Settings::parse("voice_mode=true").serialize();
         assert!(text.contains("input_mode=voice") && !text.contains("voice_mode"));
+    }
+
+    #[test]
+    fn auto_show_click_from_an_older_settings_file() {
+        // v0.2.2 wrote no auto_show_click: keep 单击 and everything else as it was.
+        let old = "onboarded=true\nauto_show=true\ninput_mode=keyboard\nschema=double_pinyin_flypy\n";
+        let s = Settings::parse(old);
+        assert_eq!(s.auto_show_click, AutoShowClick::Single);
+        assert!(s.auto_show && s.onboarded);
+        assert_eq!(s.input_mode, InputMode::Keyboard);
+        // Saved once, the choice is written out and survives the next start.
+        let text = s.serialize();
+        assert!(text.contains("auto_show_click=single"), "{text}");
+        let s = Settings { auto_show_click: AutoShowClick::Double, ..s };
+        let again = Settings::parse(&s.serialize());
+        assert_eq!(again.auto_show_click, AutoShowClick::Double);
+        assert!(again.auto_show);
+        // 双击 is kept while auto show is off, for when it is turned back on.
+        let off = Settings::parse("auto_show=false\nauto_show_click=double");
+        assert!(!off.auto_show);
+        assert_eq!(Settings::parse(&off.serialize()).auto_show_click, AutoShowClick::Double);
     }
 
     #[test]

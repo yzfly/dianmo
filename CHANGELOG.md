@@ -2,6 +2,16 @@
 
 点墨 Dianmo 的版本变化都记在这里。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.3] - 2026-10-31
+
+### 新增
+
+- **单击 / 双击输入框弹出键盘**（设置「常规 › 点几下弹出」，TODO #45）：默认仍是单击。选「双击」后，键盘收起时要在同一个输入框上快速点两下才弹出，减少误触；键盘已经显示时点一下就能换输入框，网址 / 邮箱 / 数字提示照常跟着变。旧的设置文件里没有这一项，读出来就是单击；选择会保存，重启后保留。参考并感谢社区 [@Enderlessss](https://github.com/Enderlessss) 在 [issue #1](https://github.com/yzfly/dianmo/issues/1) 分享的修改版。
+
+### 改进
+
+- 判断「一次触摸」更可靠：同一次触摸的合成鼠标事件和 Raw Input 不再按位置比对，旋转校准前也只算一次触摸；去掉了重发事件的 250ms 防抖（它会吞掉双击的第二下），改为每个触点只重发一次。
+
 ## [0.2.2] - 2026-10-07
 
 把 0.2.1 实机验证时剩下的问题修完，没验证过的流程都在 Surface 上走了一遍。
@@ -132,6 +142,7 @@
 - 管理员窗口里无法使用微信输入法、豆包输入法的语音（Windows 权限隔离）。
 - 设置里的按键音、模糊音、候选字号、全角标点、空格上屏首选、用户词库导入导出还没有接通，会在后续版本提供。
 
+[0.2.3]: https://github.com/yzfly/dianmo/releases/tag/v0.2.3
 [0.2.2]: https://github.com/yzfly/dianmo/releases/tag/v0.2.2
 [0.2.1]: https://github.com/yzfly/dianmo/releases/tag/v0.2.1
 [0.2.0]: https://github.com/yzfly/dianmo/releases/tag/v0.2.0

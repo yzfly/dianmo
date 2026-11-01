@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>点墨双击测试</title>
+<!-- doubletap.ps1: every target sits in the top strip, so it stays reachable even when two
+     keyboards (an installed 点墨 and the test copy) are docked one above the other. -->
+<style>
+  body { font: 14px "Microsoft YaHei UI", sans-serif; margin: 4px; }
+  .row { display: flex; gap: 8px; margin-bottom: 6px; }
+  input, textarea, button { font: inherit; width: 200px; height: 30px; box-sizing: border-box; }
+  textarea { height: 30px; }
+</style>
+</head>
+<body>
+  <div class="row"><input id="txt" type="text"><input id="url" type="url"><button id="btn">按钮</button></div>
+  <div class="row"><textarea id="area"></textarea></div>
+</body>
+</html>

@@ -108,6 +108,20 @@ fn segmented_choice_sends_action_and_updates_theme() {
 }
 
 #[test]
+fn auto_show_click_chooses_single_or_double_and_needs_auto_show() {
+    let mut t = T::new(960.0, 680.0);
+    t.tap("auto_show_click/双击");
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetAutoShowClick(AutoShowClick::Double)]);
+    assert_eq!(t.v.model().auto_show_click, AutoShowClick::Double);
+    t.tap("auto_show_click/单击");
+    assert_eq!(t.take_actions(), vec![SettingsAction::SetAutoShowClick(AutoShowClick::Single)]);
+    // Off: the choice does nothing, so it is disabled.
+    t.tap("auto_show");
+    t.take_actions();
+    assert!(!t.v.scroll_into_view("auto_show_click/双击"));
+}
+
+#[test]
 fn nav_switches_pages() {
     let mut t = T::new(960.0, 680.0);
     let (x, y) = t.v.element_center("键盘").unwrap();

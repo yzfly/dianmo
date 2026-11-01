@@ -97,6 +97,7 @@ pub fn model(s: &Settings, sys: &SysState) -> SettingsModel {
     SettingsModel {
         autostart: s.autostart,
         auto_show: s.auto_show,
+        auto_show_click: s.auto_show_click,
         input_mode: s.input_mode,
         theme: s.theme,
         admin_task: sys.admin_task.clone(),
@@ -153,6 +154,7 @@ pub fn apply(s: &mut Settings, a: &SettingsAction) -> bool {
     }
     match a {
         A::SetAutoShow(v) => set(&mut s.auto_show, *v),
+        A::SetAutoShowClick(v) => set(&mut s.auto_show_click, *v),
         A::SetInputMode(v) => set(&mut s.input_mode, *v),
         A::SetTheme(v) => set(&mut s.theme, *v),
         A::SetReserveSpace(v) => set(&mut s.appbar, *v),
@@ -225,7 +227,9 @@ pub fn engine_status(e: VoiceEngineChoice, check: Option<Option<&str>>) -> Engin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dianmo_ui::settings::{CandidateSize, FuzzyPair, InputMode, KeySoundStyle, KeySoundVolume, LongPress, ShuangpinScheme};
+    use dianmo_ui::settings::{
+        AutoShowClick, CandidateSize, FuzzyPair, InputMode, KeySoundStyle, KeySoundVolume, LongPress, ShuangpinScheme,
+    };
 
     #[test]
     fn model_reflects_settings_and_system() {
@@ -271,6 +275,7 @@ mod tests {
         use SettingsAction as A;
         let actions = [
             A::SetAutoShow(false),
+            A::SetAutoShowClick(AutoShowClick::Double),
             A::SetInputMode(InputMode::PcKeyboard),
             A::SetTheme(ThemeChoice::Light),
             A::SetReserveSpace(false),

@@ -340,6 +340,11 @@ impl DianmoApp {
                 self.set_focus_watch(on && !disabled("focus"), host);
                 Response::none()
             }
+            A::SetAutoShowClick(_) => {
+                // A tap from before the change is not the first tap of a double tap.
+                self.autoshow.reset();
+                Response::none()
+            }
             A::SetInputMode(mode) => self.set_input_mode(mode, view, host),
             A::SetTheme(_) => self.apply_theme(view, host),
             A::SetReserveSpace(on) => {

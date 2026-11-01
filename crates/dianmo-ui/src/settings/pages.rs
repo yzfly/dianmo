@@ -1,8 +1,8 @@
 //! Content of each settings page (PRODUCT.md §3), built from the model as [`Block`]s.
 
 use super::model::{
-    CandidateSize, FuzzyPair, KeySoundStyle, KeySoundVolume, LayoutChoice, Level, LongPress, Page, SettingsAction as A,
-    SettingsModel, ShuangpinScheme, Side, Status, ThemeChoice, VoiceEngineChoice, CLIP_LIMITS,
+    AutoShowClick, CandidateSize, FuzzyPair, KeySoundStyle, KeySoundVolume, LayoutChoice, Level, LongPress, Page,
+    SettingsAction as A, SettingsModel, ShuangpinScheme, Side, Status, ThemeChoice, VoiceEngineChoice, CLIP_LIMITS,
 };
 use super::model::InputMode;
 use super::widgets::{Art, Block, Button, ButtonKind, Card, Chip, Control, Row, SliderSpec, TagKind};
@@ -90,6 +90,17 @@ fn general(m: &SettingsModel) -> Vec<Block> {
                 Row::new("auto_show", "点输入框时自动弹出键盘")
                     .desc("手指点到可以打字的地方就弹出，点别处自动收起")
                     .switch(m.auto_show, A::SetAutoShow),
+                {
+                    let (opts, sel) = seg(
+                        &[("单击", AutoShowClick::Single), ("双击", AutoShowClick::Double)],
+                        m.auto_show_click,
+                        A::SetAutoShowClick,
+                    );
+                    let r = Row::new("auto_show_click", "点几下弹出")
+                        .desc("双击：同一个输入框快速点两下才弹出，减少误触；键盘显示时点一下照常换框")
+                        .segmented(opts, sel);
+                    if m.auto_show { r } else { r.disabled() }
+                },
             ],
             note: Some("也可以在托盘菜单、键盘工具栏和语音球上切换模式：长按语音球展开键盘，键盘上点「语音球」缩回去。".into()),
         },

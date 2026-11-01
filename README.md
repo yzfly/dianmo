@@ -129,7 +129,7 @@ Surface 拆掉键盘后只剩触屏，而 Windows 上的中文输入是为实体
 ### 悬浮球、不抢焦点、不遮挡
 
 - **不抢焦点**：点键盘不会让正在打字的应用失去焦点和光标。
-- **点输入框自动弹出**：手指点到可以打字的地方就弹出，点别处自动收起（用鼠标点不会弹出）。
+- **点输入框自动弹出**：手指点到可以打字的地方就弹出，点别处自动收起（用鼠标点不会弹出）。在设置「常规 › 点几下弹出」里可以改成**双击**：在同一个输入框上快速点两下才弹出，翻页、滚动时碰到输入框不会误弹；键盘已经出来时，点一下就能换到别的输入框。默认仍是单击。
 - **不遮挡**：键盘显示时占用屏幕底部，最大化的窗口会自动缩上去，就像手机把页面顶上去；有应用全屏时，键盘自动退到它后面。
 - **管理员窗口也能用**：点墨通过「以最高权限运行」的计划任务启动，在管理员 PowerShell 等窗口里也能自动弹出、正常打字（需要安装时同意一次管理员权限）。
 - **悬浮球**：键盘收起后，屏幕边缘有一个小球，点一下呼出键盘；可以拖到左边或右边；闲置时缩小变淡，并且离屏幕边缘留一点距离，从边上拖它不会误触系统的边缘手势。
@@ -355,9 +355,9 @@ cargo run -p dianmo-ui --example preview -- /tmp/dianmo-preview
 
 ## 社区改动参考
 
-- [可选双击输入框唤起键盘](https://github.com/Enderlessss/dianmo-branch-doubleclickfeaturetest)：由 [@Enderlessss](https://github.com/Enderlessss) 在 [issue #1](https://github.com/yzfly/dianmo/issues/1) 分享。增加「单击 / 双击」设置，默认保持单击；双击模式要求同一输入框内两次触摸，键盘已经显示时仍可单击切换输入框。包含设置读写、焦点事件与双击判定的源码修改。
+- [可选双击输入框唤起键盘](https://github.com/Enderlessss/dianmo-branch-doubleclickfeaturetest)：由 [@Enderlessss](https://github.com/Enderlessss) 在 [issue #1](https://github.com/yzfly/dianmo/issues/1) 分享。增加「单击 / 双击」设置，默认保持单击；双击模式要求同一输入框内两次触摸，键盘已经显示时仍可单击切换输入框。
 
-这是独立的社区修改版本，尚未并入本仓库或官方安装包。作者报告已在自己的 Surface 上验证；维护者目前仅审阅了源码差异，未完成独立的 Windows / Surface 回归测试。该分支自述没有程序签名。
+  这个功能已经参考该分支并入主仓库（设置项、`auto_show_click` 配置、输入框 id 与触点序号、重新计数的时机都沿用了它的做法），并在判定上做了加固：按触点的按下时间计算间隔、跟随系统双击时间，一次触摸被合成鼠标和 Raw Input 各报一次时不会误算成双击。感谢 @Enderlessss！从 [v0.2.3](https://github.com/yzfly/dianmo/releases/tag/v0.2.3) 起随官方安装包发布。
 
 ## 致谢
 

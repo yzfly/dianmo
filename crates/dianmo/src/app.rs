@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 
 use dianmo_core::{Action, Engine, InputController};
 use dianmo_ui::settings::{InputMode, LayoutChoice, Page, SettingsModel, Status, ThemeChoice, UpdateState};
+use dianmo_ui::autoshow::{AutoShowGate, double_tap_window};
 use dianmo_ui::{FieldHint, InputState, KeyboardView, Response, ThemeKind, UiAction, View};
 use dianmo_win::tabtip::SystemKeyboardSettings;
 use dianmo_win::{
-    App, BallEdge, BallEvent, BallState, FieldKind, FocusEvent, FocusWatcher, HostControl, HostProxy,
+    App, BallEdge, BallEvent, BallState, FieldKind, FocusEvent, FocusWatcher, HostControl, HostProxy, double_click_ms,
     SendInputSink, TrayItem, WindowId, now_ms, start_focus_watcher,
 };
 use windows::Win32::Foundation::HWND;
@@ -52,6 +53,8 @@ pub struct DianmoApp {
     /// Debounce for auto-hide: a pending hide only fires if no newer focus event arrived.
     focus_seq: u64,
     focus: Option<FocusWatcher>,
+    /// 单击 / 双击打开键盘: counts taps on a field while the keyboard is hidden.
+    autoshow: AutoShowGate,
     /// The number pad was opened because a numeric field got focus.
     numbers_for_field: bool,
     /// The next "shown" notification is the result of a focus event (not a manual show).
@@ -244,6 +247,7 @@ impl DianmoApp {
             pending_rime: None,
             focus_seq: 0,
             focus: None,
+            autoshow: AutoShowGate::default(),
             numbers_for_field: false,
             showing_for_focus: false,
             manual_show_at: None,
@@ -427,6 +431,7 @@ impl DianmoApp {
 
     /// 键盘 / 语音球 / 电脑键盘 (settings, tray, the keyboard's 语音球 / 电脑键盘 tiles).
     fn set_input_mode(&mut self, mode: InputMode, view: &mut dyn View, host: &mut HostControl) -> Response {
+        self.autoshow.reset();
         let was = self.settings.input_mode;
         let pc = mode == InputMode::PcKeyboard;
         let mut r = Response::none();
@@ -614,6 +619,8 @@ impl App for DianmoApp {
     }
 
     fn on_visibility_changed(&mut self, visible: bool, view: &mut dyn View, host: &mut HostControl) -> Response {
+        // A tap before the keyboard was shown / hidden is not the first of a double tap.
+        self.autoshow.reset();
         let mut voice = Response::none();
         if !visible && !self.voice_mode() && self.voice_running() {
             // The mic key belongs to the keyboard: collapsing it ends the session, no result.
@@ -1183,6 +1190,7 @@ impl DianmoApp {
     }
 
     fn set_focus_watch(&mut self, on: bool, host: &mut HostControl) {
+        self.autoshow.reset();
         if !on {
             self.focus = None;
             return;
@@ -1216,7 +1224,7 @@ impl DianmoApp {
             return Response::none();
         }
         match ev {
-            FocusEvent::Editable { kind, by_touch } => {
+            FocusEvent::Editable { kind, by_touch, field, tap } => {
                 if !by_touch && !host.is_visible() {
                     return Response::none();
                 }
@@ -1238,13 +1246,24 @@ impl DianmoApp {
                     }
                 }
                 // Voice mode: only the ball; the keyboard comes from a long press or the tray.
+                // 单击 opens on this tap, 双击 on a second tap on the same field (while the keyboard
+                // is shown, taps only move focus and update the hints above).
                 if by_touch && !host.is_visible() && !self.voice_mode() {
-                    self.showing_for_focus = true;
-                    host.show();
+                    let mode = self.settings.auto_show_click;
+                    if self.autoshow.tap(mode, field, tap, double_tap_window(double_click_ms())) {
+                        self.showing_for_focus = true;
+                        host.show();
+                    } else {
+                        log!("auto show: first tap {tap:?} on field {field:x}, waiting for a second");
+                    }
                 }
                 Response { repaint, ..Response::none() }
             }
             FocusEvent::NotEditable { by_touch } => {
+                if by_touch {
+                    // A tap outside any text field ends a pending double tap.
+                    self.autoshow.reset();
+                }
                 // The quick keys of a web address / email field don't outlive it.
                 let repaint = view
                     .as_any_mut()

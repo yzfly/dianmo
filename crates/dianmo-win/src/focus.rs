@@ -18,6 +18,11 @@
 //! inside the focused editable element re-sends `Editable { by_touch }`; one released on the
 //! taskbar while the taskbar already has focus re-sends `NotEditable { by_touch }`.
 //!
+//! Every editable event names its field (a stable id within this run) and the touch contact
+//! behind it ([`Tap`]: one sequence number per finger down, shared by the focus event, the hook's
+//! re-tap and raw input's re-tap of that contact), so the app can tell a double tap on one field
+//! from one tap reported twice (`dianmo_ui::autoshow`).
+//!
 //! Interacting with our own tray icon moves focus to the taskbar; that focus change is not
 //! reported (it is the 点墨 UI, like our own windows), so opening the tray menu doesn't hide the
 //! keyboard.
@@ -43,7 +48,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::SafeArrayDestroy;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VariantClear};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationElement, IUIAutomationTreeWalker,
@@ -65,6 +70,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WindowFromPoint,
 };
 use windows::core::{BSTR, Interface, Ref, Result, implement, w};
+
+pub use dianmo_ui::autoshow::Tap;
 
 use crate::clock::now_ms;
 use crate::host::HostProxy;
@@ -90,9 +97,22 @@ pub enum FocusEvent {
     /// An editable field got focus, or a field that already had focus was tapped again.
     /// `by_touch`: a touch/pen contact happened within about 500ms (only then should the keyboard
     /// pop up automatically, like the system touch keyboard).
-    Editable { kind: FieldKind, by_touch: bool },
+    Editable {
+        kind: FieldKind,
+        by_touch: bool,
+        /// Stable id of the field within this run (UIA runtime id; a console window counts as one
+        /// field), to tell a double tap on one field from taps on two.
+        field: u64,
+        /// The touch contact behind the event (`None` when not `by_touch` or no contact was seen).
+        tap: Option<Tap>,
+    },
     /// Focus moved to something that isn't editable (or the focused window isn't a text field).
     NotEditable { by_touch: bool },
+}
+
+/// The system double-click time (ms), for 双击打开键盘 (`dianmo_ui::autoshow::double_tap_window`).
+pub fn double_click_ms() -> u32 {
+    unsafe { GetDoubleClickTime() }
 }
 
 /// Recent-touch window for `by_touch`.
@@ -160,13 +180,30 @@ static LAST_MOUSE_MS: AtomicU64 = AtomicU64::new(0);
 /// button, touch or pen contact), to tell what a focus change on the taskbar was about.
 static LAST_DOWN_PT: AtomicU64 = AtomicU64::new(0);
 static LAST_DOWN_MS: AtomicU64 = AtomicU64::new(0);
-/// `now_ms()` of the last re-sent event (a touch reaches us through the hook *and* raw input).
-static LAST_RETAP_MS: AtomicU64 = AtomicU64::new(0);
 /// `GetTickCount()` when the watcher started: input from before that never counts as a touch.
 static START_TICK: AtomicU32 = AtomicU32::new(0);
-/// Incremented on every touch down (one per tap), so a repeated focus event after a new tap is
-/// not swallowed by the de-duplication.
-static TOUCH_SEQ: AtomicU32 = AtomicU32::new(0);
+/// The last touch contact: sequence number (high 32 bits, incremented on every touch down, one per
+/// tap) and `now_ms()` of its down (low 32 bits, wrapping). A repeated focus event after a new
+/// tap is not swallowed by the de-duplication, and the app counts double taps by it.
+static TOUCH_TAP: AtomicU64 = AtomicU64::new(0);
+
+/// The last touch contact (`None` before the first).
+fn last_tap() -> Option<Tap> {
+    let v = TOUCH_TAP.load(Ordering::Relaxed);
+    let seq = (v >> 32) as u32;
+    (seq != 0).then_some(Tap { seq, down_ms: v as u32 })
+}
+
+/// Sequence number of the last touch contact (0 before the first).
+fn touch_seq() -> u32 {
+    last_tap().map_or(0, |t| t.seq)
+}
+
+/// A new touch contact went down at `now` (`now_ms()`).
+fn new_tap(now: u64) {
+    let seq = touch_seq().wrapping_add(1).max(1);
+    TOUCH_TAP.store(((seq as u64) << 32) | (now as u32 as u64), Ordering::Relaxed);
+}
 /// Context for the hook (the hook procedure has no user data).
 static HOOK_CTX: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
 
@@ -208,6 +245,9 @@ fn own_window_at(pt: POINT, own_pid: u32) -> bool {
 static LAST_RAW_DOWN_PT: AtomicU64 = AtomicU64::new(0);
 static LAST_RAW_DOWN_MS: AtomicU64 = AtomicU64::new(0);
 
+/// How long after raw input's down the synthesized mouse press of the same contact may come.
+const SYNTH_LAG_MS: u64 = 600;
+
 /// A touch/pen contact went down at `pt`, seen by raw input (`raw`) or the hook.
 fn touch_down(pt: POINT, raw: bool) {
     if own_window_at(pt, unsafe { GetCurrentProcessId() }) {
@@ -221,14 +261,20 @@ fn touch_down(pt: POINT, raw: bool) {
         LAST_RAW_DOWN_MS.store(now, Ordering::Relaxed);
     } else {
         // The mouse press Windows synthesizes for a touch comes up to a few hundred ms after
-        // raw input reported the contact: same tap, not a new one.
-        let r = unpack(LAST_RAW_DOWN_PT.load(Ordering::Relaxed));
+        // raw input reported the contact: same tap, not a new one. Not compared by position:
+        // until the raw rotation is calibrated (or with a digitizer mapped differently) the two
+        // positions can disagree, and counting one contact twice would look like a double tap.
+        // Raw input sees every contact, so a press it hasn't seen within the window is a new one.
         let t = LAST_RAW_DOWN_MS.load(Ordering::Relaxed);
-        if t != 0 && now - t.min(now) <= 600 && (r.x - pt.x).abs() <= 24 && (r.y - pt.y).abs() <= 24 {
+        if t != 0 && now - t.min(now) <= SYNTH_LAG_MS {
+            if log_enabled() {
+                let r = unpack(LAST_RAW_DOWN_PT.load(Ordering::Relaxed));
+                log_line(format_args!("hook down ({},{}) = raw down ({},{}) {} ms ago", pt.x, pt.y, r.x, r.y, now - t.min(now)));
+            }
             return;
         }
     }
-    TOUCH_SEQ.fetch_add(1, Ordering::Relaxed);
+    new_tap(now);
     record_down(pt);
 }
 
@@ -243,6 +289,11 @@ fn touch_up(pt: POINT, source: &str) {
         LAST_TOUCH_MS.store(now_ms().max(1), Ordering::Relaxed);
         shared.touch_up(pt, source);
     }
+}
+
+/// Whether `DIANMO_FOCUS_LOG` is on (skip formatting otherwise).
+fn log_enabled() -> bool {
+    HOOK_CTX.try_lock().is_ok_and(|g| g.as_ref().is_some_and(|s| s.log.is_some()))
 }
 
 /// Writes to the focus log from the watcher thread (never blocks).
@@ -390,11 +441,12 @@ fn on_own_tray_icon(pt: POINT) -> bool {
 
 #[derive(Default)]
 struct State {
-    last_id: Vec<i32>,
+    /// Field id (see [`field_key`]) of the last reported element.
+    last_field: u64,
     last: Option<FocusEvent>,
     last_seq: u32,
-    /// Bounding rectangle (screen px) and kind of the focused editable element.
-    field: Option<(RECT, FieldKind)>,
+    /// Bounding rectangle (screen px), kind and id of the focused editable element.
+    field: Option<(RECT, FieldKind, u64)>,
     /// Bounding rectangle of the taskbar when it has focus (tapping it again re-sends
     /// `NotEditable`: the focus doesn't change, but the user tapped outside any text field).
     taskbar: Option<RECT>,
@@ -424,22 +476,21 @@ impl Shared {
     fn touch_up(&self, pt: POINT, source: &str) {
         let inside = |rc: &RECT| pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
         let Ok(mut st) = self.state.try_lock() else { return };
+        let tap = last_tap();
+        let seq = tap.map_or(0, |t| t.seq);
         let ev = match (st.field, st.taskbar) {
-            (Some((rc, kind)), _) if inside(&rc) => FocusEvent::Editable { kind, by_touch: true },
+            (Some((rc, kind, field)), _) if inside(&rc) => FocusEvent::Editable { kind, by_touch: true, field, tap },
             // Not the notification area: our tray icon (and the menu it opens) must not hide us.
             (None, Some(rc)) if inside(&rc) && notification_area_at(pt).is_none() => {
                 FocusEvent::NotEditable { by_touch: true }
             }
             _ => return,
         };
-        // The focus event for this very tap already said so (a tap that moved focus).
-        let seq = TOUCH_SEQ.load(Ordering::Relaxed);
-        if st.last == Some(ev) && st.last_seq == seq {
-            return;
-        }
-        // The same release often arrives twice (synthesized mouse and raw input).
-        let now = now_ms();
-        if now.saturating_sub(LAST_RETAP_MS.swap(now, Ordering::Relaxed)) < 250 {
+        // The focus event for this very tap already said so (a tap that moved focus), or the
+        // same release arrived twice (synthesized mouse and raw input): one event per contact.
+        // (This used to be a 250 ms debounce, which would swallow the second tap of a double
+        // tap; `touch_down` makes sure one contact gets one sequence number.)
+        if st.last_seq == seq && st.last.is_some_and(|l| same_kind(l, ev)) {
             return;
         }
         st.last = Some(ev);
@@ -487,10 +538,6 @@ impl Shared {
                 ));
             }
         }
-        let ev = match kind {
-            Some(kind) => FocusEvent::Editable { kind, by_touch },
-            None => FocusEvent::NotEditable { by_touch },
-        };
         // Chromium/Electron editors (VS Code's `native-edit-context`) report an empty rect, and
         // xterm.js terminals (VS Code's terminal) a caret-sized helper textarea: use the nearest
         // ancestor with a real one, so a tap into the already-focused editor re-shows us.
@@ -503,21 +550,29 @@ impl Shared {
             }
             None => p.rect,
         };
-        let id = runtime_id(el);
-        let seq = TOUCH_SEQ.load(Ordering::Relaxed);
+        let field = match console {
+            Some(rc) => console_key(p.pid, rc),
+            None => field_key(&p, &runtime_id(el), field_rect),
+        };
+        let tap = if by_touch { last_tap() } else { None };
+        let seq = touch_seq();
+        let ev = match kind {
+            Some(kind) => FocusEvent::Editable { kind, by_touch, field, tap },
+            None => FocusEvent::NotEditable { by_touch },
+        };
         {
             let Ok(mut st) = self.state.lock() else { return };
-            let same_target = st.last_id == id || matches!(ev, FocusEvent::NotEditable { .. });
+            let same_target = st.last_field == field || matches!(ev, FocusEvent::NotEditable { .. });
             let fresh_tap = by_touch && seq != st.last_seq;
-            if same_target && st.last == Some(ev) && !fresh_tap {
+            if same_target && st.last.is_some_and(|l| same_kind(l, ev)) && !fresh_tap {
                 drop(st);
                 self.log(format_args!("dup {ev:?} {}", p.describe()));
                 return;
             }
-            st.last_id = id;
+            st.last_field = field;
             st.last = Some(ev);
             st.last_seq = seq;
-            st.field = kind.map(|k| (field_rect, k));
+            st.field = kind.map(|k| (field_rect, k, field));
             st.taskbar = (kind.is_none() && is_taskbar_class(&p.class)).then_some(p.rect);
         }
         if self.log.is_some() {
@@ -918,6 +973,46 @@ fn caret_writable(el: &IUIAutomationElement) -> Option<bool> {
         let v = range.GetAttributeValue(UIA_IsReadOnlyAttributeId).ok()?;
         variant_bool(v).map(|ro| !ro)
     }
+}
+
+/// Whether two events say the same thing about the same target (the contact aside).
+fn same_kind(a: FocusEvent, b: FocusEvent) -> bool {
+    match (a, b) {
+        (
+            FocusEvent::Editable { kind: k1, by_touch: t1, field: f1, .. },
+            FocusEvent::Editable { kind: k2, by_touch: t2, field: f2, .. },
+        ) => k1 == k2 && t1 == t2 && f1 == f2,
+        (FocusEvent::NotEditable { by_touch: t1 }, FocusEvent::NotEditable { by_touch: t2 }) => t1 == t2,
+        _ => false,
+    }
+}
+
+/// FNV-1a over `values`.
+fn fnv(values: impl IntoIterator<Item = u64>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in values {
+        h ^= v;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// A stable id for a focus target within this run: its UIA runtime id, else enough properties to
+/// tell fields apart (from the community version, issue #1). Never 0.
+fn field_key(p: &Props, rid: &[i32], rect: RECT) -> u64 {
+    let h = if rid.is_empty() {
+        fnv([p.pid as u64, p.hwnd as u64, p.control_type as u32 as u64]
+            .into_iter()
+            .chain([rect.left, rect.top, rect.right, rect.bottom].map(|v| v as u32 as u64)))
+    } else {
+        fnv(rid.iter().map(|&v| v as u32 as u64))
+    };
+    h.max(1)
+}
+
+/// Consoles report their text area and their window in turn: one id for the whole window.
+fn console_key(pid: u32, rc: RECT) -> u64 {
+    fnv([u64::MAX, pid as u64].into_iter().chain([rc.left, rc.top, rc.right, rc.bottom].map(|v| v as u32 as u64))).max(1)
 }
 
 fn runtime_id(el: &IUIAutomationElement) -> Vec<i32> {

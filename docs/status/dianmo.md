@@ -506,3 +506,16 @@ Surface（Win10 LTSC 21H2，2880×1920，200%）空出来后，对已安装的 v
 - 网址 / 邮箱框里不会自动切到英文（有意的：可能要打中文备注）；要不要像手机那样自动切，可以再定。
 - 更新线程每小时醒一次（只比较时间），算不上负担，没改成按到期时间睡。
 - 安装包覆盖安装时如果安装目录被占用（rename 失败）会退回逐个复制，结果正确，但目录里的旧文件不会删掉。
+
+## 单击 / 双击打开键盘（TODO #45，issue #1，2026-10-31，v0.2.3）
+
+参考社区分支 [Enderlessss/dianmo-branch-doubleclickfeaturetest](https://github.com/Enderlessss/dianmo-branch-doubleclickfeaturetest)（设置项、`auto_show_click`、输入框 id、触点序号、重置时机），按需合入，没有整仓覆盖。设计见 DESIGN.md「单击 / 双击弹出」「双击判定」。
+
+- **代码**：判定在 `dianmo-ui/src/autoshow.rs`（纯逻辑）；`dianmo-win/src/focus.rs` 给 `FocusEvent::Editable` 加 `field`、`tap: Option<Tap>`，合成鼠标按下只按时间（600ms）并入 Raw Input 的触点、去掉重发的 250ms 防抖；`app.rs` 只在键盘收起、非语音模式时计数，键盘显示 / 收起、切模式、改设置、点到输入框外、焦点监听开关都重置；`settings.rs` 读写 `auto_show_click=single|double`（缺省 / 不认识的值 = 单击）。
+- **构建与单测（T9）**：`cargo test -p dianmo-ui -p dianmo-core -p dianmo-win -p dianmo` 全过（dianmo-ui 119，含 autoshow 10 个、设置页 1 个；dianmo 28，含旧配置兼容、prefs 往返）；`cargo check --target x86_64-pc-windows-gnu --workspace --all-targets` 无警告；`cargo zigbuild --release --target x86_64-pc-windows-gnu -p dianmo` 出 1.37MB exe（T9 用 TokenSSH 的 zig 工具链 `~/.local/share/tokenssh-build/link-toolchain`；T9 没有 windres，exe **不带图标和 app-icon 资源**，只用于测试，正式打包仍要走带 llvm-windres 的流程）。T9 没装 clippy，没跑 clippy。
+- **Surface 实机（注入触摸，`crates/dianmo/tests/surface/run-doubletap.sh`，经 `ssh surface` + TokenSSH 桌面任务，约 80 秒）**：19/19 通过。记事本（每次触摸 = Raw Input + 晚 72–82ms 的合成鼠标，日志 `hook down = raw down`，只算一个触点）：单击不弹、慢的第二下不弹、双击（两次按下相隔约 190ms）弹出。Edge：点按钮收起；单击不弹；两个输入框各点一下不弹；同一 textarea 双击弹出；显示时单击网址框保持显示且出现 `.com` 快捷键、单击回文本框快捷键消失；点输入框外照常收起；「框、框外、框」不弹；设置页点「单击」后 `settings.ini` 写入 `auto_show_click=single`，不重启即按单击工作（单击弹出、点外收起、换框弹出）。测试实例用 `--instance Test` 和自带数据目录，结束后原有 `Dianmo-Test` 数据已恢复、测试目录已删。
+- **测试环境的坑**：Surface 上装好的点墨（最高权限，测试任务以普通权限运行时看不到它的进程路径）也会对注入的触摸弹出；两个键盘作为 AppBar 叠着停靠时覆盖屏幕下 2/3，点不到下方的元素，所以测试页把目标都放在最上面一条。
+- **没验证的**：真实手指（远程只能注入触摸，走 `VIRTUAL_DIGITIZER`）；笔；控制台 / VS Code 终端 / 管理员窗口里的双击；UIA 焦点事件很慢的应用里第一下的焦点事件晚于第二下抬起的情形（判定会保守地不弹，再点一下）；Win11。
+- **v0.2.3 发布（2026-10-31）**：第一次在 T9 上打正式安装包，不再用 Surface 编译。`build.rs`（dianmo、dianmo-setup）在没有 windres 时改用 `zig rc` 直接出 COFF 资源，所以交叉构建的 exe 也带图标、app-icon、版本信息，安装程序带 asInvoker / PerMonitorV2 清单（pefile 检查过，导入表只有系统 DLL）。Rime 部分（rime.dll + data，66 个文件）原样取自官方 DianmoSetup-0.2.2.exe 的载荷（Rime 没有改动），只换 dianmo.exe，用 Linux 版 dianmo-pack 打包：DianmoSetup-0.2.3.exe 22,076,000 字节，sha256 `cd5b9576c0844aa851f75ca15f907b0b296c339db7565e0b8321397c463bba23`。
+  - 步骤（T9，`~/build/dianmo-dbltap` 为同步的代码）：`cargo zigbuild --release --target x86_64-pc-windows-gnu -p dianmo -p dianmo-setup`；`cargo build --release -p dianmo-setup --bin dianmo-pack`；解出上一版安装包的载荷（`dianmo_setup::payload::extract`）、替换 dianmo.exe；`dianmo-pack <dianmo-setup.exe> <dist> DianmoSetup-<ver>.exe --version <ver>`。PATH 需含 `~/.local/share/tokenssh-build/link-toolchain/bin`（zig）。
+  - Surface 上用 `--instance RelTest` + `DIANMO_INSTALL_ROOT` 静默安装 / 卸载到单独目录：67 个文件、版本 0.2.3、「应用和功能」条目，卸载后不留文件、数据、条目、快捷方式；用户的点墨未受影响。从 SSH 会话安装时注册计划任务失败（0x80070534，SSH 网络登录的账号映射问题），用 0.2.2 安装包对照完全一样，不是回归；桌面会话里的注册代码没改。没有在用户桌面会话里实测从 0.2.2 自动更新到 0.2.3。

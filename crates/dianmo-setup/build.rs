@@ -1,7 +1,7 @@
 //! Embeds the icon, the manifest (asInvoker, per-monitor DPI aware, common controls v6) and version
 //! info into dianmo-setup.exe on Windows targets (llvm-windres from llvm-mingw, on PATH in
-//! `scripts/surface/build.sh`). Without a resource compiler (e.g. `cargo check` on Linux) the exe
-//! simply has none.
+//! `scripts/surface/build.sh`; else `zig rc` for cross builds on Linux). Without a resource
+//! compiler (e.g. `cargo check` on Linux) the exe simply has none.
 
 use std::env;
 use std::path::PathBuf;
@@ -42,7 +42,44 @@ fn main() {
             Err(_) => continue,
         }
     }
+    if zig_rc(&dir, "setup.rc", &out, (major, minor, patch), &ver) {
+        println!("cargo:rustc-link-arg-bin=dianmo-setup={}", out.display());
+        return;
+    }
     if env::var("HOST").is_ok_and(|h| h.contains("windows")) {
         println!("cargo:warning=no windres found; dianmo-setup.exe will have no icon/manifest");
     }
 }
+
+/// Fallback when no windres is around (cross builds with cargo-zigbuild on Linux): Zig's resource
+/// compiler (`zig rc`, Zig 0.14+), as `zig` or the `ziglang` Python package cargo-zigbuild can use.
+/// Writes a COFF object to `out`; true on success.
+fn zig_rc(dir: &std::path::Path, rc: &str, out: &std::path::Path, ver: (u16, u16, u16), ver_str: &str) -> bool {
+    let args = [
+        "/:auto-includes".to_owned(),
+        "none".to_owned(),
+        "/c".to_owned(),
+        "65001".to_owned(),
+        "/d".to_owned(),
+        format!("DIANMO_VER_MAJOR={}", ver.0),
+        "/d".to_owned(),
+        format!("DIANMO_VER_MINOR={}", ver.1),
+        "/d".to_owned(),
+        format!("DIANMO_VER_PATCH={}", ver.2),
+        "/d".to_owned(),
+        format!("DIANMO_VER_STR=\"{ver_str}\""),
+        "/:output-format".to_owned(),
+        "coff".to_owned(),
+        "/:target".to_owned(),
+        "x86_64".to_owned(),
+        "/fo".to_owned(),
+    ];
+    for (prog, pre) in [("zig", &["rc"][..]), ("python3", &["-m", "ziglang", "rc"][..])] {
+        let status = Command::new(prog).current_dir(dir).args(pre).args(&args).arg(out).arg(rc).status();
+        if status.is_ok_and(|s| s.success()) {
+            return true;
+        }
+    }
+    false
+}
+

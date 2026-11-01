@@ -1,6 +1,7 @@
 //! Keyboard UI of 点墨 Dianmo. Platform-independent: draws through [`canvas::Canvas`] and is
 //! driven through [`view::View`]. [`KeyboardView`] is the phone-style keyboard.
 
+pub mod autoshow;
 pub mod canvas;
 pub mod view;
 

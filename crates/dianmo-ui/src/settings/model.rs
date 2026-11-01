@@ -132,6 +132,16 @@ impl InputMode {
     }
 }
 
+/// 点输入框几下弹出键盘 (设置 › 常规 ›「点几下弹出」).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AutoShowClick {
+    /// 单击: the original behaviour, one tap opens the keyboard.
+    #[default]
+    Single,
+    /// 双击: two taps on the same field open it, so a stray touch does not.
+    Double,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LongPress {
     /// 250 ms
@@ -417,6 +427,8 @@ pub struct SettingsModel {
     pub autostart: bool,
     /// Pop up when an edit field is tapped.
     pub auto_show: bool,
+    /// How many taps open it: 单击 (default) or 双击.
+    pub auto_show_click: AutoShowClick,
     /// 键盘 / 语音球 / 电脑键盘.
     pub input_mode: InputMode,
     pub theme: ThemeChoice,
@@ -492,6 +504,7 @@ impl Default for SettingsModel {
         Self {
             autostart: true,
             auto_show: true,
+            auto_show_click: AutoShowClick::Single,
             input_mode: InputMode::Keyboard,
             theme: ThemeChoice::System,
             admin_task: Status::default(),
@@ -550,6 +563,7 @@ pub enum SettingsAction {
     // 常规
     SetAutostart(bool),
     SetAutoShow(bool),
+    SetAutoShowClick(AutoShowClick),
     SetInputMode(InputMode),
     SetTheme(ThemeChoice),
     SetReserveSpace(bool),
@@ -627,6 +641,7 @@ impl SettingsModel {
         match a.clone() {
             A::SetAutostart(v) => set(&mut self.autostart, v),
             A::SetAutoShow(v) => set(&mut self.auto_show, v),
+            A::SetAutoShowClick(v) => set(&mut self.auto_show_click, v),
             A::SetInputMode(v) => set(&mut self.input_mode, v),
             A::SetTheme(v) => set(&mut self.theme, v),
             A::SetReserveSpace(v) => set(&mut self.reserve_space, v),
